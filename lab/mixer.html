@@ -109,6 +109,10 @@ const ACTIVE=[
  {id:'wall',dir:'beweg',ic:'🧱',n:'Liegestütz an der Wand',d:'10× im Takt · 1 Min.'},
  {id:'march',dir:'beweg',ic:'🚶',n:'Auf der Stelle gehen',d:'Oder Treppe · 1 Min.'},
  {id:'shoulder',dir:'beweg',ic:'🔄',n:'Schultern kreisen',d:'Sanft · 1 Min.'},
+ {id:'diff',dir:'denk',ic:'👀',n:'Was hat sich verändert?',d:'Bild merken, Änderung finden · 1–2 Min.'},
+ {id:'delta',dir:'denk',ic:'⚖️',n:'Welche Änderung zählt?',d:'Nur ein Stein versperrt den Weg · 1–2 Min.'},
+ {id:'follow',dir:'denk',ic:'🟢',n:'Folge dem Punkt',d:'Mit den Augen folgen, Weg nachtippen · 1 Min.'},
+ {id:'case',dir:'denk',ic:'🕵️',n:'Mini-Fall',d:'Hinweise lesen, Täter finden · 1–2 Min.'},
  {id:'nums',dir:'denk',ic:'🔢',n:'Zahlen tippen',d:'1 bis 16 der Reihe nach'},
  {id:'maze',dir:'spiel',ic:'🌀',n:'Labyrinth',d:'Mit dem Finger zum grünen Feld'},
  {id:'simon',dir:'spiel',ic:'🟩',n:'Muster nachtippen',d:'Farben merken und nachtippen'},
@@ -171,7 +175,7 @@ function endRound(text){const act=document.createElement('div');stage.querySelec
   stage.appendChild(act);$('e1').onclick=()=>{stage.innerHTML='<div class="big" style="margin:auto">Okay. Gut, dass du hier warst.</div>'};$('e2').onclick=showMenu;$('e3').onclick=()=>run(cur)}
 function head(t,s){stage.innerHTML=`<h1>${t}</h1><p class="sub">${s}</p>`}
 let timers=[];const clearT=()=>{timers.forEach(clearTimeout);timers=[];duck(false)};
-function run(id){clearT();cur=id;({nums,maze,simon,red,ttt,stop,sense,body,count,watch,press,chair,wall,march,shoulder})[id]()}
+function run(id){clearT();cur=id;({nums,maze,simon,red,ttt,diff,delta,follow,case:caseG,stop,sense,body,count,watch,press,chair,wall,march,shoulder})[id]()}
 function steps(list,endText){/* list: [{t,s,sec?}] – sec: auto weiter, sonst Knopf */let i=0;const box=document.createElement('div');box.className='step';stage.appendChild(box);
   const m=document.createElement('div');m.className='big';const act=document.createElement('div');act.className='actions';act.innerHTML='<button class="pri" id="nx">Weiter</button>';stage.appendChild(m);stage.appendChild(act);
   const show=()=>{clearT();if(i>=list.length){act.remove();box.innerHTML='';return endRound(endText)}const st=list[i];if(st.duck)duck(true);
@@ -233,6 +237,112 @@ function red(){const colors=['rote','blaue','grüne','runde','eckige'];const c=c
   const g=document.createElement('div');g.className='list';let n=0;
   [1,2,3].forEach(k=>{const b=document.createElement('button');b.className='card';b.innerHTML=`<span class="ic">○</span><span>Ding ${k}</span>`;b.onclick=()=>{if(b.dataset.ok)return;b.dataset.ok=1;b.querySelector('.ic').textContent='✓';if(++n===3)endRound('Alle drei gefunden.')};g.appendChild(b)});
   stage.appendChild(g);const m=document.createElement('div');m.className='big';stage.appendChild(m)}
+/* ===== DENKAUFGABEN (Rätsel-Delta) ===== */
+const LV={diff:1,delta:1,follow:1,case:1};const streak={};
+function adapt(id,ok){const s=streak[id]||{w:0,l:0};if(ok){s.w++;s.l=0;if(s.w>=2){LV[id]=Math.min(5,LV[id]+1);s.w=0}}else{s.l++;s.w=0;if(s.l>=2){LV[id]=Math.max(1,LV[id]-1);s.l=0}}streak[id]=s}
+const R=n=>Math.floor(Math.random()*n),pick=a=>a[R(a.length)],shuffle=a=>{for(let i=a.length-1;i>0;i--){const j=R(i+1);[a[i],a[j]]=[a[j],a[i]]}return a};
+function series(id,title,sub,n,one){head(title,sub);const area=document.createElement('div');area.className='stage';stage.appendChild(area);
+  const m=document.createElement('div');m.className='big';stage.appendChild(m);let k=0;
+  const next=()=>{if(k>=n){area.remove();return endRound('Runde geschafft.')}k++;area.innerHTML='';m.textContent='';one(area,m,ok=>{adapt(id,ok);timers.push(setTimeout(next,ok?900:1600))})};next()}
+const css=document.createElement('style');css.textContent=`
+.dg{display:grid;gap:6px;width:100%;margin:0 auto}.dc{aspect-ratio:1;border:0;border-radius:12px;background:var(--surface);box-shadow:inset 0 0 0 1.5px var(--line);display:flex;align-items:center;justify-content:center;padding:6px;position:relative}
+.dc svg{width:78%;height:78%}.dc.hit{background:var(--lime)}.dc.miss{background:#f3d9cf}.dc.wall{background:var(--primary);box-shadow:none}.dc.s,.dc.z{font-size:22px}
+.dc .badge{position:absolute;inset:16%;border-radius:50%;background:#d9b44a;color:#fff;font-weight:700;font-size:20px;display:flex;align-items:center;justify-content:center}
+.dc.dot::after{content:"";position:absolute;inset:24%;border-radius:50%;background:var(--primary)}
+.dc.path{background:#e9f1dc}.dc.stone{background:#8a8f86}
+.sus{display:grid;gap:8px}.susc{display:flex;align-items:center;gap:12px;border:0;border-radius:16px;background:var(--surface);box-shadow:inset 0 0 0 1.5px var(--line);padding:12px;font-size:17px;text-align:left;color:var(--ink)}
+.susc .an{font-size:34px}.susc .at{font-size:22px;letter-spacing:4px}.clue{background:var(--surface);border-radius:14px;padding:10px 12px;margin:0 0 8px;box-shadow:inset 0 0 0 1.5px var(--line);font-size:16px}`;document.head.appendChild(css);
+
+/* --- A: Was hat sich verändert? (inkl. Drehen/Spiegeln) --- */
+const COLS=['#3f8f6b','#d9b44a','#c96a5a','#5a7fc9'];
+const SH={circle:'<circle cx="50" cy="50" r="38"/>',square:'<rect x="14" y="14" width="72" height="72" rx="8"/>',tri:'<polygon points="50,10 90,88 10,88"/>',
+  L:'<polygon points="14,10 40,10 40,64 86,64 86,90 14,90"/>',flag:'<polygon points="18,8 34,8 34,40 84,40 70,58 84,76 34,76 34,92 18,92"/>'};
+const ASYM=['L','flag'];
+const svgOf=o=>`<svg viewBox="0 0 100 100"><g fill="${COLS[o.c]}" transform="rotate(${o.r} 50 50) ${o.m?'translate(100 0) scale(-1 1)':''}">${SH[o.s]}</g></svg>`;
+function diff(){series('diff','Was hat sich verändert?','Schau dir das Bild an. Gleich ändert sich eine Sache.',3,(area,m,done)=>{
+  const L=LV.diff,size=L>=3?4:3,N=Math.min(size*size-2,3+L),cells=shuffle([...Array(size*size).keys()]).slice(0,N);
+  const objs={};cells.forEach(i=>{const s=pick(L>=3?Object.keys(SH):['circle','square','tri','L']);objs[i]={s,c:R(4),r:ASYM.includes(s)?pick([0,90,180,270]):0,m:0}});
+  const types=['color','shape'];if(L>=2)types.push('move');if(L>=3)types.push('rotate');if(L>=4)types.push('mirror','rotate');
+  let t=pick(types),target=pick(cells),after=JSON.parse(JSON.stringify(objs));
+  const asymCells=cells.filter(i=>ASYM.includes(objs[i].s));
+  if((t==='rotate'||t==='mirror')&&!asymCells.length)t='color';
+  if(t==='color')after[target].c=(objs[target].c+1+R(3))%4;
+  if(t==='shape')after[target].s=pick(Object.keys(SH).filter(x=>x!==objs[target].s&&!ASYM.includes(x))),after[target].r=0;
+  if(t==='rotate'){target=pick(asymCells);after[target].r=(objs[target].r+pick([90,180,270]))%360}
+  if(t==='mirror'){target=pick(asymCells);after[target].m=1}
+  if(t==='move'){const empty=[...Array(size*size).keys()].filter(i=>!(i in objs));const to=pick(empty);after[to]=after[target];delete after[target];target=to}
+  const g=document.createElement('div');g.className='dg';g.style.gridTemplateColumns=`repeat(${size},1fr)`;area.appendChild(g);
+  const draw=(o,click)=>{g.innerHTML='';for(let i=0;i<size*size;i++){const b=document.createElement('button');b.className='dc';b.dataset.i=i;if(o&&o[i])b.innerHTML=svgOf(o[i]);if(click)b.onclick=()=>click(i,b);g.appendChild(b)}};
+  draw(objs);m.textContent='Merk es dir …';const show=Math.max(2200,4200-L*350);
+  timers.push(setTimeout(()=>{draw(null);m.textContent=''},show));
+  timers.push(setTimeout(()=>{m.textContent='Was ist anders? Tippe es an.';let answered=false;draw(after,(i,b)=>{if(answered)return;answered=true;const ok=i===target;
+    b.classList.add(ok?'hit':'miss');if(!ok)g.children[target].classList.add('hit');
+    m.textContent=ok?'Genau.':{color:'Die Farbe war anders.',shape:'Die Form war anders.',move:'Das ist neu hierher gewandert.',rotate:'Die Form wurde gedreht.',mirror:'Die Form wurde gespiegelt.'}[t];done(ok)})},show+700))})}
+
+/* --- B: Welche Änderung zählt? (Decision Delta) --- */
+function reach(W,H,wall,s,z){const seen=new Set([s]),q=[s];while(q.length){const c=q.shift();if(c===z)return true;const x=c%W,y=(c/W)|0;
+  for(const[dx,dy]of[[1,0],[-1,0],[0,1],[0,-1]]){const nx=x+dx,ny=y+dy,n=ny*W+nx;if(nx<0||ny<0||nx>=W||ny>=H||wall.has(n)||seen.has(n))continue;seen.add(n);q.push(n)}}return false}
+function shortest(W,H,wall,s,z){const prev={[s]:-1},q=[s];while(q.length){const c=q.shift();if(c===z)break;const x=c%W,y=(c/W)|0;
+  for(const[dx,dy]of[[1,0],[-1,0],[0,1],[0,-1]]){const nx=x+dx,ny=y+dy,n=ny*W+nx;if(nx<0||ny<0||nx>=W||ny>=H||wall.has(n)||n in prev)continue;prev[n]=c;q.push(n)}}
+  const p=[];if(!(z in prev))return p;for(let c=z;c!==-1;c=prev[c])p.unshift(c);return p}
+function delta(){series('delta','Welche Änderung zählt?','Der Punkt 🟢 will zum Ziel 🏁 – nur über helle Felder. Auf eins der Felder 1, 2, 3 kommt ein Stein. Welcher Stein versperrt den Weg?',3,(area,m,done)=>{
+  const L=LV.delta,W=L>=3?6:5,H=L>=4?7:6;let wall,s=0,z=W*H-1,cut,decoys;
+  for(let tries=0;tries<500;tries++){wall=new Set();for(let i=0;i<W*H;i++)if(i!==s&&i!==z&&Math.random()<0.28+L*0.02)wall.add(i);
+    if(!reach(W,H,wall,s,z))continue;const free=[...Array(W*H).keys()].filter(i=>i!==s&&i!==z&&!wall.has(i));
+    const cuts=free.filter(i=>!reach(W,H,new Set([...wall,i]),s,z)),non=free.filter(i=>!cuts.includes(i));if(!cuts.length||non.length<2)continue;
+    const path=shortest(W,H,wall,s,z),onPath=shuffle(non.filter(i=>path.includes(i))),off=shuffle(non.filter(i=>!path.includes(i)));
+    // ab Stufe 2: Täuschungen liegen AUF dem kürzesten Weg – sehen wichtig aus, ändern aber nichts
+    if(L>=2&&onPath.length<Math.min(2,L-1))continue;
+    cut=pick(cuts);decoys=(L>=2?onPath.concat(off):off.concat(onPath)).slice(0,2);break}
+  const opts=shuffle([cut,...decoys]);
+  const g=document.createElement('div');g.className='dg';g.style.gridTemplateColumns=`repeat(${W},1fr)`;g.style.gap='4px';area.appendChild(g);
+  for(let i=0;i<W*H;i++){const b=document.createElement('button');b.className='dc'+(wall.has(i)?' wall':'');if(i===s)b.textContent='🟢';if(i===z)b.textContent='🏁';
+    const k=opts.indexOf(i);if(k>=0){b.innerHTML=`<span class="badge">${k+1}</span>`;b.onclick=()=>answer(i,b)}g.appendChild(b)}
+  let answered=false;function answer(i,b){if(answered)return;answered=true;const ok=i===cut;b.classList.add(ok?'hit':'miss');
+    g.children[cut].classList.add('stone');g.children[cut].innerHTML='';
+    if(!ok){const p=shortest(W,H,new Set([...wall,i]),s,z);p.forEach(c=>{if(c!==s&&c!==z)g.children[c].classList.add('path')})}
+    m.textContent=ok?'Genau – ohne dieses Feld gibt es keinen Weg mehr.':`Stein ${opts.indexOf(cut)+1} war es. Um ${opts.indexOf(i)+1} kommt man herum.`;done(ok)}})}
+
+/* --- D+E: Folge dem Punkt --- */
+function follow(){series('follow','Folge dem Punkt','Folge dem Punkt mit den Augen. Dann tippst du seinen Weg nach.',3,(area,m,done)=>{
+  const L=LV.follow,S=4,len=2+L+(L>=3?1:0),speed=Math.max(380,760-L*70),twist=L>=4;
+  const seq=[];while(seq.length<len){const c=R(S*S);if(c!==seq[seq.length-1])seq.push(c)}
+  const g=document.createElement('div');g.className='dg';g.style.gridTemplateColumns=`repeat(${S},1fr)`;area.appendChild(g);
+  for(let i=0;i<S*S;i++){const b=document.createElement('button');b.className='dc';g.appendChild(b)}
+  const play=(sq,cb)=>{let k=0;const step=()=>{[...g.children].forEach(c=>c.classList.remove('dot'));if(k>=sq.length)return timers.push(setTimeout(cb,300));g.children[sq[k]].classList.add('dot');k++;timers.push(setTimeout(step,speed))};step()};
+  m.textContent='Schau zu …';
+  if(!twist){play(seq,()=>{m.textContent='Jetzt du: tippe den Weg nach.';let k=0,over=false;[...g.children].forEach((b,i)=>b.onclick=()=>{if(over)return;
+      if(i===seq[k]){b.classList.add('hit');timers.push(setTimeout(()=>b.classList.remove('hit'),250));if(++k===seq.length){over=true;m.textContent='Genau so.';done(true)}}
+      else{over=true;b.classList.add('miss');g.children[seq[k]].classList.add('hit');m.textContent='Hier wäre es weitergegangen.';done(false)}})})}
+  else{const wrongAt=1+R(seq.length-1),alt=seq.slice();let c;do{c=R(S*S)}while(c===seq[wrongAt]||c===seq[wrongAt-1]||c===seq[wrongAt+1]);alt[wrongAt]=c;
+    play(seq,()=>{m.textContent='Noch einmal – diesmal ist EIN Schritt falsch.';timers.push(setTimeout(()=>play(alt,()=>{m.textContent='Wo war der falsche Schritt? Tippe das Feld.';let over=false;
+      [...g.children].forEach((b,i)=>b.onclick=()=>{if(over)return;over=true;const ok=i===c;b.classList.add(ok?'hit':'miss');if(!ok)g.children[c].classList.add('hit');m.textContent=ok?'Erwischt.':'Dieser Schritt war neu.';done(ok)})}),900))})}})}
+
+/* --- G: Mini-Fall --- */
+const CASES=['Wer hat den letzten Keks gegessen?','Wer hat die Fernbedienung versteckt?','Wer hat die Pflanze umgeworfen?','Wer hat das Lied auf Dauerschleife gestellt?','Wer hat den Kuchen angeknabbert?','Wer hat die Socken vertauscht?'];
+const ANIMALS=['🦊 Fuchs','🐻 Bär','🐸 Frosch','🐼 Panda','🦉 Eule','🐱 Katze'];
+const ATTR=[{k:'hut',vals:[['🎩','mit Hut'],['','ohne Hut']]},{k:'farbe',vals:[['🔴','Rot'],['🔵','Blau'],['🟢','Grün']]},{k:'ding',vals:[['☂️','Schirm'],['👜','Tasche'],['','nichts in der Hand']]}];
+function clueText(a,v,neg){const t=ATTR[a].vals[v][1];if(a===0)return neg?(v===0?'Der Täter trug keinen Hut.':'Der Täter trug einen Hut.'):(v===0?'Der Täter trug einen Hut.':'Der Täter trug keinen Hut.');
+  if(a===1)return neg?`Der Täter trug nichts ${t==='Rot'?'Rotes':t==='Blau'?'Blaues':'Grünes'}.`:`Der Täter trug ${t==='Rot'?'Rot':t==='Blau'?'Blau':'Grün'}.`;
+  return neg?(v===2?'Der Täter hatte etwas in der Hand.':`Der Täter hatte keine${v===0?'n Schirm':' Tasche'}.`):(v===2?'Der Täter hatte nichts in der Hand.':`Der Täter hatte ${v===0?'einen Schirm':'eine Tasche'} dabei.`)}
+function caseG(){series('case','Mini-Fall','Lies die Hinweise und tippe auf den Täter.',2,(area,m,done)=>{
+  const L=LV.case,n=L>=3?4:3,nc=L>=4?3:2;let sus,clues,culprit;
+  for(let t=0;t<800;t++){sus=shuffle(ANIMALS.slice()).slice(0,n).map(a=>({a,v:ATTR.map(x=>R(x.vals.length))}));
+    const keys=sus.map(s=>s.v.join());if(new Set(keys).size<n)continue;
+    const all=[];ATTR.forEach((x,a)=>x.vals.forEach((_,v)=>{all.push({a,v,neg:false});if(L>=2)all.push({a,v,neg:true})}));
+    const fits=(s,c)=>c.neg?s.v[c.a]!==c.v:s.v[c.a]===c.v;
+    const cand=shuffle(all).filter(c=>{const k=sus.filter(s=>fits(s,c)).length;return k>=1&&k<n});
+    let found=null;const combos=k=>{const out=[];const rec=(st,acc)=>{if(acc.length===k){out.push(acc);return}for(let i=st;i<cand.length&&out.length<400;i++)rec(i+1,acc.concat([cand[i]]))};rec(0,[]);return out};
+    for(const cs of combos(nc)){const left=sus.filter(s=>cs.every(c=>fits(s,c)));if(left.length!==1)continue;
+      const needed=cs.every((_,i)=>sus.filter(s=>cs.filter((__,j)=>j!==i).every(c=>fits(s,c))).length>1);if(needed){found=cs;culprit=left[0];break}}
+    if(found){clues=found;break}}
+  if(!clues){m.textContent='';return done(true)}
+  const q=document.createElement('div');q.innerHTML=`<div class="clue" style="background:var(--lime);box-shadow:none"><b>${pick(CASES)}</b></div>`+clues.map(c=>`<div class="clue">🔎 ${clueText(c.a,c.v,c.neg)}</div>`).join('');area.appendChild(q);
+  const list=document.createElement('div');list.className='sus';area.appendChild(list);let over=false;
+  sus.forEach(s=>{const b=document.createElement('button');b.className='susc';const icons=s.v.map((v,a)=>ATTR[a].vals[v][0]).join(' ');
+    b.innerHTML=`<span class="an">${s.a.split(' ')[0]}</span><span>${s.a.split(' ')[1]}<br><span class="at">${icons}</span></span>`;
+    b.onclick=()=>{if(over)return;over=true;const ok=s===culprit;b.style.background=ok?'var(--lime)':'#f3d9cf';m.textContent=ok?'Fall gelöst.':`Es war ${culprit.a.split(' ')[1]}.`;done(ok)};list.appendChild(b)})})}
+
 function ttt(){location.href='tictactoe.html'}
 renderPassive();showMenu();
 </script></body></html>
