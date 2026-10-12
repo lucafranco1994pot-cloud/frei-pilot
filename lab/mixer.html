@@ -115,7 +115,7 @@ const ACTIVE=[
  {id:'case',dir:'denk',ic:'🕵️',n:'Mini-Fall',d:'Hinweise lesen, Täter finden · 1–2 Min.'},
  {id:'nums',dir:'denk',ic:'🔢',n:'Zahlen tippen',d:'1 bis 16 der Reihe nach'},
  {id:'maze',dir:'spiel',ic:'🌀',n:'Labyrinth',d:'Mit dem Finger zum grünen Feld'},
- {id:'simon',dir:'spiel',ic:'🟩',n:'Muster nachtippen',d:'Farben merken und nachtippen'},
+ {id:'simon',dir:'spiel',ic:'🟩',n:'Muster nachtippen',d:'Jedes Mal eine Farbe mehr · mit Rekord'},
  {id:'ttt',dir:'spiel',ic:'❌',n:'Tic-Tac-Toe',d:'Zug-Spiel · geht auch beim Gehen',turns:1}
 ];
 function blockedReason(a){
@@ -225,12 +225,17 @@ function maze(){head('Labyrinth','Zieh den Punkt mit dem Finger zum grünen Feld
 function simon(){head('Muster nachtippen','Schau zu, dann tippe die Farben in derselben Reihenfolge.');
   const cols=['#3f8f6b','#d9b44a','#c96a5a','#5a7fc9'],box=document.createElement('div');box.className='simon';const pads=cols.map((c,i)=>{const b=document.createElement('button');b.className='pad';b.style.background=c;box.appendChild(b);return b});
   stage.appendChild(box);const m=document.createElement('div');m.className='big';stage.appendChild(m);
-  let seq=[],inp=0,lock=true,len=3;const flash=(i,ms=420)=>new Promise(r=>{pads[i].classList.add('on');setTimeout(()=>{pads[i].classList.remove('on');setTimeout(r,180)},ms)});
-  const show=async()=>{lock=true;m.textContent='Schau zu …';await new Promise(r=>setTimeout(r,500));for(const i of seq)await flash(i);m.textContent='Du bist dran.';inp=0;lock=false};
-  const newSeq=()=>{seq=[...Array(len)].map(()=>Math.floor(Math.random()*4));show()};
-  pads.forEach((p,i)=>p.onclick=async()=>{if(lock)return;flash(i,200);if(i!==seq[inp]){lock=true;m.textContent='Fast. Nochmal dasselbe.';setTimeout(show,900);return}
-    if(++inp===seq.length){lock=true;if(len>=5){endRound('Schön gemerkt.')}else{len++;m.textContent='Gut. Eins mehr.';setTimeout(newSeq,800)}}});
-  newSeq()}
+  let seq=[],inp=0,lock=true;const flash=(i,ms=420)=>new Promise(r=>{pads[i].classList.add('on');setTimeout(()=>{pads[i].classList.remove('on');setTimeout(r,180)},ms)});
+  let rec=0;try{rec=+localStorage.getItem('frei-simon-rekord')||0}catch(e){}
+  const info=document.createElement('div');info.className='sub';info.id='sinfo';info.style.cssText='display:flex;justify-content:space-between;font-weight:600;margin:0 0 10px';stage.insertBefore(info,box);
+  const upd=()=>{info.innerHTML=`<span>Reihe: ${seq.length}</span><span>🏆 Rekord: ${rec}</span>`};
+  const speed=()=>Math.max(220,420-seq.length*15);
+  const show=async()=>{lock=true;upd();m.textContent='Schau zu …';await new Promise(r=>setTimeout(r,600));for(const i of seq)await flash(i,speed());m.textContent='Du bist dran.';inp=0;lock=false};
+  const grow=()=>{seq.push(Math.floor(Math.random()*4));show()};
+  pads.forEach((p,i)=>p.onclick=()=>{if(lock)return;flash(i,180);
+    if(i!==seq[inp]){lock=true;const got=seq.length-1;let txt;if(got>rec){rec=got;try{localStorage.setItem('frei-simon-rekord',rec)}catch(e){}txt=`🏆 Neuer Rekord: ${got}!`}else txt=`Diesmal ${got} · Dein Rekord ${rec}`;upd();return endRound(txt)}
+    if(++inp===seq.length){lock=true;m.textContent='Gut. Eine Farbe mehr.';setTimeout(grow,700)}});
+  seq=[Math.floor(Math.random()*4),Math.floor(Math.random()*4)];grow()}
 /* 3 rote Dinge */
 function red(){const colors=['rote','blaue','grüne','runde','eckige'];const c=colors[Math.floor(Math.random()*colors.length)];
   head(`3 ${c} Dinge`,'Leg das Handy kurz weg. Schau dich um und finde drei.');
