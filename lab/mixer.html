@@ -33,6 +33,12 @@ h1{font-size:22px;margin:10px 0 2px}
 .actions{display:flex;gap:8px;margin-top:auto;padding-top:14px;flex-wrap:wrap}
 .actions button{flex:1;min-width:30%;padding:15px 8px;border-radius:14px;border:0;font-size:16px;font-weight:600}
 .pri{background:var(--primary);color:#fff}.sec{background:var(--surface);color:var(--ink);box-shadow:inset 0 0 0 1.5px var(--line)}
+.sec-h{font-size:13px;letter-spacing:.1em;color:var(--muted);font-weight:700;margin:16px 0 6px}
+.pace{flex:1;display:flex;flex-direction:column;align-items:center;justify-content:center;text-align:center;border-radius:22px;background:var(--primary);color:#fff;padding:20px;min-height:52dvh}
+.pace .t{font-size:46px;font-weight:700;line-height:1.1}.pace .c{font-size:80px;font-weight:700;margin-top:10px;font-variant-numeric:tabular-nums}.pace .s{opacity:.75;margin-top:8px;font-size:16px}
+.step{flex:1;display:flex;flex-direction:column;justify-content:center;text-align:center;font-size:26px;line-height:1.3;padding:10px}
+.step small{display:block;font-size:16px;color:var(--muted);margin-top:12px}
+.tapbig{width:100%;aspect-ratio:1.6;border:0;border-radius:22px;background:var(--lime);color:var(--primary);font-size:64px;font-weight:700}
 .sheet{position:fixed;inset:0;background:rgba(20,40,30,.45);display:none;z-index:20;align-items:flex-end}
 .sheet .in{background:var(--bg);width:100%;max-width:440px;margin:0 auto;border-radius:22px 22px 0 0;padding:16px 16px calc(18px + env(safe-area-inset-bottom));max-height:88dvh;overflow:auto}
 .sheet h2{margin:4px 0 10px;font-size:19px}
@@ -66,6 +72,7 @@ const PASSIVE={
  ears:{ic:'👂',name:'Ohren',uses:['ears'],items:{
    music:{n:'Eigene Musik',h:'Wähle unten ein Lied von deinem Handy. Es läuft in Schleife.'},
    noise:{n:'Ruhiges Rauschen',h:'Gleichmäßiges, tiefes Rauschen. Lautstärke am Handy einstellen.'},
+   breath:{n:'Atem-Ton',h:'Ein Klang wird lauter (einatmen) und leiser (ausatmen). Einfach mitatmen, nicht hinschauen.'},
    story:{n:'Hörgeschichte',h:'Kommt später – Inhalte müssen erst geprüft werden.',na:1}}},
  hand:{ic:'✋',name:'Freie Hand',uses:['hand2'],items:{
    touch:{n:'Etwas abtasten',h:'Nimm etwas aus der Tasche. Fühl: Wo ist es rau, wo glatt, wo kalt?'},
@@ -89,16 +96,29 @@ const PASSIVE={
 };
 let pg='none',pi='none';
 /* ---------- AKTIV ---------- */
+const DIRS={achts:'🌿 ACHTSAMKEIT',beweg:'💪 BEWEGUNG · Handy ablegen',denk:'🧠 DENKAUFGABEN',spiel:'🎮 SPIELE'};
 const ACTIVE=[
- {id:'nums',ic:'🔢',n:'Zahlen tippen',d:'1 bis 16 der Reihe nach',needs:['eyes']},
- {id:'maze',ic:'🌀',n:'Labyrinth',d:'Mit dem Finger zum grünen Feld',needs:['eyes']},
- {id:'simon',ic:'🟩',n:'Muster nachtippen',d:'Farben merken und nachtippen',needs:['eyes','focus']},
- {id:'red',ic:'🔴',n:'3 rote Dinge',d:'Ohne Bildschirm: im Raum suchen',needs:[]},
- {id:'ttt',ic:'❌',n:'Tic-Tac-Toe',d:'Öffnet die Laborseite',needs:['eyes','turns']}
+ {id:'stop',dir:'achts',ic:'✋',n:'STOP',d:'4 kurze Schritte · 1 Min.'},
+ {id:'sense',dir:'achts',ic:'👁',n:'5-4-3-2-1',d:'Sehen, hören, fühlen · 2 Min.'},
+ {id:'body',dir:'achts',ic:'🧍',n:'Körper-Check',d:'Füße bis Gesicht · 1,5 Min.'},
+ {id:'count',dir:'achts',ic:'🌬',n:'Atemzüge zählen',d:'Bis 10 · 1–2 Min.'},
+ {id:'watch',dir:'achts',ic:'🔍',n:'Craving beobachten',d:'Wo, wie stark, verändert es sich? · 2 Min.'},
+ {id:'red',dir:'achts',ic:'🔴',n:'3 Dinge finden',d:'Im Raum suchen · 1 Min.'},
+ {id:'press',dir:'beweg',ic:'🤲',n:'Hände drücken',d:'10 Sek. drücken, 10 lösen · 1 Min. (Handgrip-Idee, nicht fachlich geprüft)'},
+ {id:'chair',dir:'beweg',ic:'🪑',n:'10× vom Stuhl aufstehen',d:'Im Takt · 1 Min.'},
+ {id:'wall',dir:'beweg',ic:'🧱',n:'Liegestütz an der Wand',d:'10× im Takt · 1 Min.'},
+ {id:'march',dir:'beweg',ic:'🚶',n:'Auf der Stelle gehen',d:'Oder Treppe · 1 Min.'},
+ {id:'shoulder',dir:'beweg',ic:'🔄',n:'Schultern kreisen',d:'Sanft · 1 Min.'},
+ {id:'nums',dir:'denk',ic:'🔢',n:'Zahlen tippen',d:'1 bis 16 der Reihe nach'},
+ {id:'maze',dir:'spiel',ic:'🌀',n:'Labyrinth',d:'Mit dem Finger zum grünen Feld'},
+ {id:'simon',dir:'spiel',ic:'🟩',n:'Muster nachtippen',d:'Farben merken und nachtippen'},
+ {id:'ttt',dir:'spiel',ic:'❌',n:'Tic-Tac-Toe',d:'Zug-Spiel · geht auch beim Gehen',turns:1}
 ];
 function blockedReason(a){
-  if(pg==='stand'&&a.needs.includes('eyes')&&!a.needs.includes('turns'))return 'Beim Gehen nicht – zu viel Hinschauen';
-  if(pg==='ears'&&pi==='story'&&a.needs.includes('focus'))return 'Nicht mit Hörgeschichte';
+  const ears=pg==='ears';
+  if(a.dir==='beweg'&&pg!=='none'&&!(ears&&(pi==='music'||pi==='noise')))return 'Hier passt nebenbei nur Musik oder Rauschen';
+  if(a.dir==='denk'&&(pg==='stand'||(ears&&pi==='story')))return pg==='stand'?'Nicht beim Gehen':'Nicht mit Hörbuch';
+  if(a.dir==='spiel'&&pg==='stand'&&!a.turns)return 'Beim Gehen nur Zug-Spiele';
   return '';
 }
 /* ---------- Passiv-Sheet ---------- */
@@ -123,27 +143,64 @@ function renderSheet(){
 $('pbtn').onclick=()=>{renderSheet();$('sheet').style.display='flex'};
 $('sheetok').onclick=()=>{$('sheet').style.display='none';showMenu()};
 $('sheet').onclick=e=>{if(e.target.id==='sheet')$('sheetok').onclick()};
-/* Rauschen per WebAudio */
-let actx,noiseNode;
+/* Audio */
+let actx,noiseNode,noiseGain,breathNode;
+const ctx=()=>{if(!actx)actx=new (window.AudioContext||window.webkitAudioContext)();actx.resume();return actx};
+function beep(f=660,ms=160){try{const c=ctx(),o=c.createOscillator(),g=c.createGain();o.frequency.value=f;g.gain.setValueAtTime(.0001,c.currentTime);g.gain.exponentialRampToValueAtTime(.25,c.currentTime+.02);g.gain.exponentialRampToValueAtTime(.0001,c.currentTime+ms/1000);o.connect(g).connect(c.destination);o.start();o.stop(c.currentTime+ms/1000+.05)}catch(e){}}
+function duck(on){$('audio').volume=on?.12:1;if(noiseGain)noiseGain.gain.value=on?.08:.5}
 function applyAudio(){
   const a=$('audio');if(!(pg==='ears'&&pi==='music'))a.pause();
   if(pg==='ears'&&pi==='noise'){if(!actx)actx=new (window.AudioContext||window.webkitAudioContext)();
-    if(!noiseNode){const len=actx.sampleRate*4,buf=actx.createBuffer(1,len,actx.sampleRate),d=buf.getChannelData(0);let last=0;
+    if(!noiseNode){noiseGain=actx.createGain();noiseGain.gain.value=.5;const len=actx.sampleRate*4,buf=actx.createBuffer(1,len,actx.sampleRate),d=buf.getChannelData(0);let last=0;
       for(let i=0;i<len;i++){const w=Math.random()*2-1;last=(last+0.02*w)/1.02;d[i]=last*3.2}
-      noiseNode=actx.createBufferSource();noiseNode.buffer=buf;noiseNode.loop=true;const gn=actx.createGain();gn.gain.value=.5;noiseNode.connect(gn).connect(actx.destination);noiseNode.start()}
+      noiseNode=actx.createBufferSource();noiseNode.buffer=buf;noiseNode.loop=true;noiseNode.connect(noiseGain).connect(actx.destination);noiseNode.start()}
     actx.resume()}
   else if(noiseNode){noiseNode.stop();noiseNode=null}
+  if(pg==='ears'&&pi==='breath'){if(!breathNode){const c=ctx(),o=c.createOscillator(),g=c.createGain(),l=c.createOscillator(),lg=c.createGain();
+      o.frequency.value=196;g.gain.value=.12;l.frequency.value=1/10;lg.gain.value=.11;l.connect(lg).connect(g.gain);o.connect(g).connect(c.destination);o.start();l.start();breathNode=[o,l]}}
+  else if(breathNode){breathNode.forEach(n=>n.stop());breathNode=null}
 }
 /* ---------- Aktiv: Menü & Runden ---------- */
 const stage=$('stage');let cur=null;
-function showMenu(){cur=null;stage.innerHTML='<h1>Was jetzt?</h1><p class="sub">Eine Runde, dann entscheidest du neu.</p><div class="list" id="alist"></div>';
-  ACTIVE.forEach(a=>{const r=blockedReason(a),b=document.createElement('button');b.className='card';b.disabled=!!r;
-    b.innerHTML=`<span class="ic">${a.ic}</span><span>${a.n}<small>${r||a.d}</small></span>`;b.onclick=()=>run(a.id);$('alist').appendChild(b)})}
+function showMenu(){if(typeof clearT==='function')clearT();cur=null;stage.innerHTML='<h1>Was jetzt?</h1><p class="sub">Eine Runde, dann entscheidest du neu.</p><div class="list" id="alist"></div>';
+  Object.entries(DIRS).forEach(([dk,dn])=>{const h=document.createElement('div');h.className='sec-h';h.textContent=dn;$('alist').appendChild(h);
+  ACTIVE.filter(a=>a.dir===dk).forEach(a=>{const r=blockedReason(a),b=document.createElement('button');b.className='card';b.disabled=!!r;
+    b.innerHTML=`<span class="ic">${a.ic}</span><span>${a.n}<small>${r||a.d}</small></span>`;b.onclick=()=>run(a.id);$('alist').appendChild(b)})})}
 function endRound(text){const act=document.createElement('div');stage.querySelector('.big').textContent=text;
   act.className='actions';act.innerHTML='<button class="sec" id="e1">Reicht</button><button class="sec" id="e2">Was anderes</button><button class="pri" id="e3">Noch eine Runde</button>';
   stage.appendChild(act);$('e1').onclick=()=>{stage.innerHTML='<div class="big" style="margin:auto">Okay. Gut, dass du hier warst.</div>'};$('e2').onclick=showMenu;$('e3').onclick=()=>run(cur)}
 function head(t,s){stage.innerHTML=`<h1>${t}</h1><p class="sub">${s}</p>`}
-function run(id){cur=id;({nums,maze,simon,red,ttt})[id]()}
+let timers=[];const clearT=()=>{timers.forEach(clearTimeout);timers=[];duck(false)};
+function run(id){clearT();cur=id;({nums,maze,simon,red,ttt,stop,sense,body,count,watch,press,chair,wall,march,shoulder})[id]()}
+function steps(list,endText){/* list: [{t,s,sec?}] – sec: auto weiter, sonst Knopf */let i=0;const box=document.createElement('div');box.className='step';stage.appendChild(box);
+  const m=document.createElement('div');m.className='big';const act=document.createElement('div');act.className='actions';act.innerHTML='<button class="pri" id="nx">Weiter</button>';stage.appendChild(m);stage.appendChild(act);
+  const show=()=>{clearT();if(i>=list.length){act.remove();box.innerHTML='';return endRound(endText)}const st=list[i];if(st.duck)duck(true);
+    box.innerHTML=st.t+(st.s?'<small>'+st.s+'</small>':'');if(st.sec)timers.push(setTimeout(()=>{i++;show()},st.sec*1000))};
+  $('nx').onclick=()=>{i++;show()};show()}
+function pacer(title,seq,rounds,endText){/* seq: [{t,sec}] */const box=document.createElement('div');box.className='pace';box.innerHTML='<div class="t"></div><div class="c"></div><div class="s"></div>';
+  stage.appendChild(box);const m=document.createElement('div');m.className='big';stage.appendChild(m);const act=document.createElement('div');act.className='actions';act.innerHTML='<button class="sec" id="pstop">Stopp</button>';stage.appendChild(act);
+  let r=0,k=0,left=0;const tick=()=>{if(left<=0){if(k>=seq.length){k=0;r++}if(r>=rounds){act.remove();box.querySelector('.t').textContent='Fertig';box.querySelector('.c').textContent='✓';return endRound(endText)}
+      left=seq[k].sec;box.querySelector('.t').textContent=seq[k].t;beep(k%2?440:660);k++}
+    box.querySelector('.c').textContent=left;box.querySelector('.s').textContent=rounds>1?('Runde '+(r+1)+' von '+rounds):'';left--;timers.push(setTimeout(tick,1000))};
+  $('pstop').onclick=()=>{clearT();showMenu()};tick()}
+/* --- Achtsamkeit --- */
+function stop(){head('STOP','Vier kleine Schritte.');steps([{t:'<b>S</b>topp.<br>Halte kurz inne.'},{t:'<b>T</b>ief atmen.<br>Einmal langsam ein … und aus.'},{t:'<b>O</b>ffen wahrnehmen.<br>Was spürst du gerade im Körper?'},{t:'<b>P</b>lan.<br>Was machst du als Nächstes?'}],'Gut gemacht.')}
+function sense(){head('5-4-3-2-1','Tippe weiter, wenn du soweit bist.');steps([{t:'Finde <b>5 Dinge</b>, die du siehst.'},{t:'Finde <b>4 Dinge</b>, die du hörst.',s:'Die Musik ist kurz leiser.',duck:1},{t:'Finde <b>3 Dinge</b>, die du fühlst.',s:'Stoff, Boden, Luft …'},{t:'Finde <b>2 Dinge</b>, die du riechst.'},{t:'Finde <b>1 Ding</b>, das du schmeckst.'}],'Wieder ganz da.')}
+function body(){head('Körper-Check','Wandert von allein weiter. Augen dürfen zu.');steps([{t:'Spür deine <b>Füße</b>.',sec:15},{t:'Deine <b>Beine</b>.',sec:15},{t:'Deine <b>Hände</b>.',sec:15},{t:'Deine <b>Schultern</b>.<br>Lass sie sinken.',sec:15},{t:'Dein <b>Gesicht</b>.<br>Kiefer locker.',sec:15},{t:'Und dein <b>Atem</b>.',sec:15}],'Fertig.')}
+function count(){head('Atemzüge zählen','Tippe bei jedem Ausatmen.');let n=0;const b=document.createElement('button');b.className='tapbig';b.textContent='0';stage.appendChild(b);const m=document.createElement('div');m.className='big';stage.appendChild(m);
+  b.onclick=()=>{if(n>=10)return;b.textContent=++n;if(n===10){b.disabled=true;endRound('Zehn ruhige Atemzüge.')}}}
+function watch(){head('Craving beobachten','Nur hinschauen. Nichts wegmachen.');
+  const q=(t,opts,cb)=>{const w=document.createElement('div');w.innerHTML='<div class="step" style="flex:none;font-size:22px">'+t+'</div>';const c=document.createElement('div');c.className='chips';c.style.justifyContent='center';
+    opts.forEach(o=>{const b=document.createElement('button');b.className='chip';b.textContent=o;b.onclick=()=>{w.remove();cb(o)};c.appendChild(b)});w.appendChild(c);stage.appendChild(w)};
+  q('Wo spürst du es?',['Brust','Bauch','Mund','Hände','Kopf','Weiß nicht'],()=>q('Wie stark gerade?',['schwach','mittel','stark'],()=>{
+    const w=document.createElement('div');w.className='step';w.innerHTML='Bleib 30 Sekunden einfach dabei.<br>Schau, ob es sich bewegt.<small id="wc">30</small>';stage.appendChild(w);let l=30;
+    const t=()=>{if(--l<=0){w.remove();q('Und jetzt?',['schwächer','gleich','stärker'],()=>{const m=document.createElement('div');m.className='big';stage.appendChild(m);endRound('Danke fürs Hinschauen.')});return}$('wc').textContent=l;timers.push(setTimeout(t,1000))};timers.push(setTimeout(t,1000))}))}
+/* --- Bewegung --- */
+function press(){head('Hände drücken','Handy ablegen. Der Ton sagt dir den Wechsel.');pacer('',[{t:'Drücken',sec:10},{t:'Lösen',sec:10}],3,'Eine Runde geschafft.')}
+function chair(){head('Vom Stuhl aufstehen','Handy ablegen. Bei jedem Ton: hoch oder runter.');pacer('',[{t:'Hoch',sec:3},{t:'Hinsetzen',sec:3}],10,'Zehn Mal. Stark.')}
+function wall(){head('Liegestütz an der Wand','Hände an die Wand, Schritt zurück. Im Takt.');pacer('',[{t:'Zur Wand',sec:3},{t:'Wegdrücken',sec:3}],10,'Zehn Mal geschafft.')}
+function march(){head('Auf der Stelle gehen','Oder Treppe. Handy in die Tasche – der Ton zählt mit.');pacer('',[{t:'Gehen',sec:15},{t:'Weiter',sec:15}],2,'Eine Minute bewegt.')}
+function shoulder(){head('Schultern kreisen','Langsam und groß.');pacer('',[{t:'Nach vorne',sec:30},{t:'Nach hinten',sec:30}],1,'Locker.')}
 /* Zahlen 1-16 */
 function nums(){head('Zahlen tippen','Tippe 1 bis 16 der Reihe nach. Ohne Zeitdruck.');
   const g=document.createElement('div');g.className='grid4';const arr=[...Array(16)].map((_,i)=>i+1).sort(()=>Math.random()-.5);let next=1;
