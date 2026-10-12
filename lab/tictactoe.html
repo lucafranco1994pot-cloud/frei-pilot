@@ -27,12 +27,14 @@ p.sub{margin:0 0 20px;color:var(--muted)}
 #walk .big{font-size:44px;font-weight:700;line-height:1.15}
 #walk .small{opacity:.75;margin-top:14px;font-size:17px}
 #walk button{margin-top:40px;background:var(--lime);color:var(--primary);border:0;border-radius:16px;padding:16px 28px;font-size:17px;font-weight:600}
+.levels{display:flex;gap:8px;margin:0 0 12px}.levels button{flex:1;padding:10px;border-radius:12px;border:0;background:var(--surface);box-shadow:inset 0 0 0 1.5px var(--line);font-size:15px;color:var(--ink)}.levels button.on{background:var(--primary);color:#fff;box-shadow:none}
 .done{display:none;text-align:center;margin:auto 0;font-size:20px;color:var(--muted)}
 </style></head>
 <body><main>
 <div class="note">FREI · LABOR (nicht Teil der App)</div>
 <h1>Eine Runde Tic-Tac-Toe</h1>
 <p class="sub">Du bist ✕. Tippe einfach auf ein Feld.</p>
+<div class="levels" id="levels"><button data-l="leicht">Leicht</button><button data-l="mittel" class="on">Mittel</button><button data-l="schwer">Schwer</button></div>
 <label class="toggle"><span>🚶 Mit Gehen <small style="color:var(--muted)">(nur wenn der Weg frei ist)</small></span><input type="checkbox" id="walkmode"></label>
 <div class="board" id="board"></div>
 <div id="walk"><div class="big" id="walkbig"></div><div class="small">Schau ruhig vom Handy weg.</div><button id="walkskip">Bin fertig</button></div>
@@ -44,6 +46,7 @@ p.sub{margin:0 0 20px;color:var(--muted)}
 </div>
 </main>
 <script>
+const LEVELS={leicht:0.35,mittel:0.15,schwer:0.05};let level='mittel';
 const L=[[0,1,2],[3,4,5],[6,7,8],[0,3,6],[1,4,7],[2,5,8],[0,4,8],[2,4,6]];
 const boardEl=document.getElementById('board'),msg=document.getElementById('msg');
 let b,over,busy;
@@ -52,7 +55,7 @@ function minimax(s,me){const w=winner(s);if(w)return w.p==='O'?1:w.p==='X'?-1:0;
   for(let i=0;i<9;i++)if(!s[i]){s[i]=me?'O':'X';const v=minimax(s,!me);s[i]=null;best=me?Math.max(best,v):Math.min(best,v)}return best}
 function botMove(){const free=b.map((v,i)=>v?null:i).filter(v=>v!==null);
   // absichtlich nicht perfekt: in ca. 35 % der Züge ein zufälliges Feld
-  if(Math.random()<0.35)return free[Math.floor(Math.random()*free.length)];
+  if(Math.random()<LEVELS[level])return free[Math.floor(Math.random()*free.length)];
   let best=-2,mv=free[0];for(const i of free){b[i]='O';const v=minimax(b,false);b[i]=null;if(v>best){best=v;mv=i}}return mv}
 function render(w){boardEl.innerHTML='';b.forEach((v,i)=>{const c=document.createElement('button');c.className='cell'+(v==='O'?' o':'')+(w&&w.l&&w.l.includes(i)?' win':'');
   c.textContent=v==='X'?'✕':v==='O'?'◯':'';c.setAttribute('aria-label','Feld '+(i+1));c.onclick=()=>play(i);boardEl.appendChild(c)})}
@@ -69,5 +72,6 @@ function walk(done){const ov=document.getElementById('walk'),big=document.getEle
 function start(){b=Array(9).fill(null);over=false;busy=false;msg.textContent='';render()}
 document.getElementById('again').onclick=start;
 document.getElementById('stop').onclick=()=>{boardEl.style.display='none';msg.style.display='none';document.getElementById('actions').style.display='none';document.querySelector('.sub').style.display='none';document.getElementById('done').style.display='block'};
+document.querySelectorAll('#levels button').forEach(x=>x.onclick=()=>{level=x.dataset.l;document.querySelectorAll('#levels button').forEach(y=>y.classList.toggle('on',y===x));start()});
 start();
 </script></body></html>
