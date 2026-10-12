@@ -1,0 +1,58 @@
+<!doctype html>
+<html lang="de"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#f5f7ef">
+<title>FREI Labor · Tic-Tac-Toe</title>
+<style>
+:root{--bg:#f5f7ef;--ink:#1f352d;--muted:#52695e;--primary:#234f3d;--lime:#dceb9d;--surface:#fffef9;--line:#e5e9df}
+*{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
+html,body{margin:0;background:var(--bg);color:var(--ink);font-family:-apple-system,system-ui,"Segoe UI",sans-serif}
+main{max-width:420px;margin:0 auto;padding:24px 16px calc(24px + env(safe-area-inset-bottom));min-height:100dvh;display:flex;flex-direction:column}
+.note{font-size:12px;letter-spacing:.12em;color:var(--muted);font-weight:600}
+h1{font-size:26px;margin:6px 0 4px;font-weight:650}
+p.sub{margin:0 0 20px;color:var(--muted)}
+.board{display:grid;grid-template-columns:repeat(3,1fr);gap:10px;aspect-ratio:1;width:100%}
+.cell{border:0;border-radius:18px;background:var(--surface);box-shadow:inset 0 0 0 1.5px var(--line);font-size:56px;font-weight:700;color:var(--primary);display:flex;align-items:center;justify-content:center;cursor:pointer;transition:background .15s}
+.cell:active{background:var(--lime)}
+.cell.o{color:#8aa08f}
+.cell.win{background:var(--lime)}
+#msg{min-height:28px;margin:18px 0 8px;font-size:18px;text-align:center}
+.actions{display:flex;gap:10px;margin-top:auto;padding-top:12px}
+.actions button{flex:1;padding:16px;border-radius:16px;border:0;font-size:17px;font-weight:600;cursor:pointer}
+.primary{background:var(--primary);color:#fff}
+.secondary{background:var(--surface);color:var(--ink);box-shadow:inset 0 0 0 1.5px var(--line)}
+.done{display:none;text-align:center;margin:auto 0;font-size:20px;color:var(--muted)}
+</style></head>
+<body><main>
+<div class="note">FREI · LABOR (nicht Teil der App)</div>
+<h1>Eine Runde Tic-Tac-Toe</h1>
+<p class="sub">Du bist ✕. Tippe einfach auf ein Feld.</p>
+<div class="board" id="board"></div>
+<div id="msg" aria-live="polite"></div>
+<div class="done" id="done">Okay. Gut, dass du hier warst.</div>
+<div class="actions" id="actions">
+  <button class="secondary" id="stop">Reicht</button>
+  <button class="primary" id="again">Neue Runde</button>
+</div>
+</main>
+<script>
+const L=[[0,1,2],[3,4,5],[6,7,8],[0,3,6],[1,4,7],[2,5,8],[0,4,8],[2,4,6]];
+const boardEl=document.getElementById('board'),msg=document.getElementById('msg');
+let b,over,busy;
+const winner=s=>{for(const l of L){const[a,c,d]=l;if(s[a]&&s[a]===s[c]&&s[a]===s[d])return{p:s[a],l}}return s.every(Boolean)?{p:'draw'}:null};
+function minimax(s,me){const w=winner(s);if(w)return w.p==='O'?1:w.p==='X'?-1:0;let best=me?-2:2;
+  for(let i=0;i<9;i++)if(!s[i]){s[i]=me?'O':'X';const v=minimax(s,!me);s[i]=null;best=me?Math.max(best,v):Math.min(best,v)}return best}
+function botMove(){const free=b.map((v,i)=>v?null:i).filter(v=>v!==null);
+  // absichtlich nicht perfekt: in ca. 35 % der Züge ein zufälliges Feld
+  if(Math.random()<0.35)return free[Math.floor(Math.random()*free.length)];
+  let best=-2,mv=free[0];for(const i of free){b[i]='O';const v=minimax(b,false);b[i]=null;if(v>best){best=v;mv=i}}return mv}
+function render(w){boardEl.innerHTML='';b.forEach((v,i)=>{const c=document.createElement('button');c.className='cell'+(v==='O'?' o':'')+(w&&w.l&&w.l.includes(i)?' win':'');
+  c.textContent=v==='X'?'✕':v==='O'?'◯':'';c.setAttribute('aria-label','Feld '+(i+1));c.onclick=()=>play(i);boardEl.appendChild(c)})}
+function finish(w){over=true;render(w);msg.textContent=w.p==='X'?'Diese Runde geht an dich.':w.p==='O'?'Diese Runde ging an mich.':'Unentschieden.'}
+function play(i){if(over||busy||b[i])return;b[i]='X';let w=winner(b);if(w)return finish(w);render();busy=true;msg.textContent='';
+  setTimeout(()=>{b[botMove()]='O';busy=false;w=winner(b);w?finish(w):render()},380)}
+function start(){b=Array(9).fill(null);over=false;busy=false;msg.textContent='';render()}
+document.getElementById('again').onclick=start;
+document.getElementById('stop').onclick=()=>{boardEl.style.display='none';msg.style.display='none';document.getElementById('actions').style.display='none';document.querySelector('.sub').style.display='none';document.getElementById('done').style.display='block'};
+start();
+</script></body></html>
