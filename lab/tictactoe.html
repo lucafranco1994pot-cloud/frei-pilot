@@ -21,13 +21,21 @@ p.sub{margin:0 0 20px;color:var(--muted)}
 .actions button{flex:1;padding:16px;border-radius:16px;border:0;font-size:17px;font-weight:600;cursor:pointer}
 .primary{background:var(--primary);color:#fff}
 .secondary{background:var(--surface);color:var(--ink);box-shadow:inset 0 0 0 1.5px var(--line)}
+.toggle{display:flex;align-items:center;justify-content:space-between;background:var(--surface);box-shadow:inset 0 0 0 1.5px var(--line);border-radius:16px;padding:12px 14px;margin:0 0 16px;font-size:16px}
+.toggle input{width:22px;height:22px;accent-color:var(--primary)}
+#walk{position:fixed;inset:0;background:var(--primary);color:#fff;display:none;flex-direction:column;align-items:center;justify-content:center;text-align:center;padding:24px;z-index:9}
+#walk .big{font-size:44px;font-weight:700;line-height:1.15}
+#walk .small{opacity:.75;margin-top:14px;font-size:17px}
+#walk button{margin-top:40px;background:var(--lime);color:var(--primary);border:0;border-radius:16px;padding:16px 28px;font-size:17px;font-weight:600}
 .done{display:none;text-align:center;margin:auto 0;font-size:20px;color:var(--muted)}
 </style></head>
 <body><main>
 <div class="note">FREI · LABOR (nicht Teil der App)</div>
 <h1>Eine Runde Tic-Tac-Toe</h1>
 <p class="sub">Du bist ✕. Tippe einfach auf ein Feld.</p>
+<label class="toggle"><span>🚶 Mit Gehen <small style="color:var(--muted)">(nur wenn der Weg frei ist)</small></span><input type="checkbox" id="walkmode"></label>
 <div class="board" id="board"></div>
+<div id="walk"><div class="big" id="walkbig"></div><div class="small">Schau ruhig vom Handy weg.</div><button id="walkskip">Bin fertig</button></div>
 <div id="msg" aria-live="polite"></div>
 <div class="done" id="done">Okay. Gut, dass du hier warst.</div>
 <div class="actions" id="actions">
@@ -50,7 +58,14 @@ function render(w){boardEl.innerHTML='';b.forEach((v,i)=>{const c=document.creat
   c.textContent=v==='X'?'✕':v==='O'?'◯':'';c.setAttribute('aria-label','Feld '+(i+1));c.onclick=()=>play(i);boardEl.appendChild(c)})}
 function finish(w){over=true;render(w);msg.textContent=w.p==='X'?'Diese Runde geht an dich.':w.p==='O'?'Diese Runde ging an mich.':'Unentschieden.'}
 function play(i){if(over||busy||b[i])return;b[i]='X';let w=winner(b);if(w)return finish(w);render();busy=true;msg.textContent='';
-  setTimeout(()=>{b[botMove()]='O';busy=false;w=winner(b);w?finish(w):render()},380)}
+  const bot=()=>{b[botMove()]='O';busy=false;w=winner(b);w?finish(w):render()};
+  if(document.getElementById('walkmode').checked)walk(bot);else setTimeout(bot,380)}
+let walkT=[];
+function walk(done){const ov=document.getElementById('walk'),big=document.getElementById('walkbig');ov.style.display='flex';big.textContent='5 Schritte vor';
+  const end=()=>{walkT.forEach(clearTimeout);walkT=[];ov.style.display='none';done()};
+  walkT.push(setTimeout(()=>{big.textContent='5 Schritte zurück'},4500));
+  walkT.push(setTimeout(end,9000));
+  document.getElementById('walkskip').onclick=end}
 function start(){b=Array(9).fill(null);over=false;busy=false;msg.textContent='';render()}
 document.getElementById('again').onclick=start;
 document.getElementById('stop').onclick=()=>{boardEl.style.display='none';msg.style.display='none';document.getElementById('actions').style.display='none';document.querySelector('.sub').style.display='none';document.getElementById('done').style.display='block'};
