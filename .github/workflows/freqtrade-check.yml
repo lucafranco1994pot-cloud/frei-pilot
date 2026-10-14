@@ -12,6 +12,8 @@ jobs:
     container:
       image: freqtradeorg/freqtrade:2025.2
       options: --user root --entrypoint ""
+    env:
+      PYTHONUSERBASE: /home/ftuser/.local
     defaults:
       run:
         shell: bash
