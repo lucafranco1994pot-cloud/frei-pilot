@@ -5,6 +5,9 @@ on:
     branches: [freqtrade-check]
   workflow_dispatch:
 
+permissions:
+  contents: write
+
 jobs:
   check:
     runs-on: ubuntu-latest
@@ -78,6 +81,25 @@ jobs:
           print("Erste abweichende Einstiege:", diff[:10])
           EOF
           { echo '## Aenderungs-Check Supertrend'; echo '```'; cat versions.txt comparison.txt; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+      - name: Ergebnis in den Branch schreiben
+        if: always()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          for f in versions.txt original_diff.txt patched_diff.txt download.txt backtest_summary.txt comparison.txt; do echo "===== $f"; cat "$f" 2>&1; done > ergebnis.txt
+          python - <<'EOF'
+          import base64, json, os, urllib.request as u
+          repo=os.environ['GITHUB_REPOSITORY']; path='ergebnisse/freqtrade-check.txt'; br='freqtrade-check'
+          h={'Authorization':'Bearer '+os.environ['GH_TOKEN'],'Accept':'application/vnd.github+json'}
+          url=f'https://api.github.com/repos/{repo}/contents/{path}'
+          sha=None
+          try: sha=json.load(u.urlopen(u.Request(url+'?ref='+br,headers=h)))['sha']
+          except Exception: pass
+          body={'message':'Ergebnis Freqtrade-Check','branch':br,'content':base64.b64encode(open('ergebnis.txt','rb').read()).decode()}
+          if sha: body['sha']=sha
+          u.urlopen(u.Request(url,data=json.dumps(body).encode(),headers=h,method='PUT'))
+          print('geschrieben')
+          EOF
       - name: Fehlerausgabe
         if: failure()
         run: for f in *.txt; do [ -f "$f" ] && tail -15 "$f" | while read -r l; do echo "::error title=$f::$l"; done; done; true
