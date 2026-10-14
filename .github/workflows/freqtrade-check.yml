@@ -1,0 +1,81 @@
+name: freqtrade-check
+# Aenderungs-Check: Supertrend alt (startup 18) vs neu (startup 199) im echten Freqtrade.
+on:
+  push:
+    branches: [freqtrade-check]
+  workflow_dispatch:
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Freqtrade installieren
+        run: |
+          pip install -q freqtrade==2025.2
+          freqtrade --version | tee versions.txt
+          python -c "import numpy,pandas,talib;print('numpy',numpy.__version__,'pandas',pandas.__version__,'talib',talib.__version__)" | tee -a versions.txt
+      - name: Beide Strategie-Versionen holen
+        run: |
+          freqtrade create-userdir --userdir ud
+          base=https://raw.githubusercontent.com/freqtrade/freqtrade-strategies
+          curl -sfL $base/e0579b641bb315dc9402a2c95b34c9f8dcefd2e3/user_data/strategies/Supertrend.py -o ud/strategies/Supertrend_old.py
+          curl -sfL $base/8fddeae020e63ed9d3a36efd30c2615f7a6b1769/user_data/strategies/Supertrend.py -o ud/strategies/Supertrend_new.py
+          diff ud/strategies/Supertrend_old.py ud/strategies/Supertrend_new.py | tee original_diff.txt || true
+          # Gleiche Technik-Anpassung fuer BEIDE (numpy 2): Klassenname, np.NaN, numpy.lib.math
+          for v in old new; do
+            sed -i "s/^class Supertrend(/class Supertrend_$v(/; s/np\.NaN/np.nan/g; s/^from numpy.lib import math/import math/" ud/strategies/Supertrend_$v.py
+          done
+          diff ud/strategies/Supertrend_old.py ud/strategies/Supertrend_new.py | tee patched_diff.txt || true
+      - name: Konfiguration
+        run: |
+          cat > config.json <<'EOF'
+          {
+            "max_open_trades": 1, "stake_currency": "USDT", "stake_amount": 100,
+            "dry_run": true, "dry_run_wallet": 1000, "timeframe": "1h",
+            "trading_mode": "spot",
+            "exchange": {"name": "binanceus", "pair_whitelist": ["BTC/USDT", "ETH/USDT"]},
+            "pairlists": [{"method": "StaticPairList"}],
+            "entry_pricing": {"price_side": "same"}, "exit_pricing": {"price_side": "same"}
+          }
+          EOF
+      - name: Daten laden (binanceus, 1h)
+        run: freqtrade download-data -c config.json --userdir ud --timeframes 1h --timerange 20230101-20250101
+      - name: Backtest beider Versionen
+        run: |
+          freqtrade backtesting -c config.json --userdir ud --strategy-list Supertrend_old Supertrend_new \
+            --timerange 20240101-20250101 --export trades 2>&1 | tail -60 | tee backtest_summary.txt
+      - name: Trades vergleichen
+        run: |
+          python - <<'EOF' | tee comparison.txt
+          from pathlib import Path
+          from freqtrade.data.btanalysis import load_backtest_data
+          d = Path('ud/backtest_results')
+          old = load_backtest_data(d, strategy='Supertrend_old')
+          new = load_backtest_data(d, strategy='Supertrend_new')
+          ent = lambda t: set(zip(t.pair, t.open_date.astype(str)))
+          ex = lambda t: set(zip(t.pair, t.close_date.astype(str), t.exit_reason))
+          print(f"Trades alt: {len(old)}  neu: {len(new)}")
+          print(f"Profit alt: {old.profit_abs.sum():.2f} USDT  neu: {new.profit_abs.sum():.2f} USDT")
+          eo, en = ent(old), ent(new)
+          print(f"Einstiege gleich: {len(eo & en)}  nur alt: {len(eo - en)}  nur neu: {len(en - eo)}")
+          xo, xn = ex(old), ex(new)
+          print(f"Ausstiege gleich: {len(xo & xn)}  nur alt: {len(xo - xn)}  nur neu: {len(xn - xo)}")
+          diff = sorted((eo ^ en))
+          print("Erste abweichende Einstiege:", diff[:10])
+          EOF
+          { echo '## Aenderungs-Check Supertrend'; echo '```'; cat versions.txt comparison.txt; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: freqtrade-check-ergebnis
+          path: |
+            versions.txt
+            original_diff.txt
+            patched_diff.txt
+            backtest_summary.txt
+            comparison.txt
