@@ -1,0 +1,143 @@
+===== varianten.txt
+== ud/strategies/ST_base.py
+22c22
+< class Supertrend(IStrategy):
+---
+> class ST_base(IStrategy):
+== ud/strategies/ST_m1m.py
+22c22
+< class Supertrend(IStrategy):
+---
+> class ST_m1m(IStrategy):
+29c29
+<         "buy_m1": 4,
+---
+>         "buy_m1": 3,
+== ud/strategies/ST_m1p.py
+22c22
+< class Supertrend(IStrategy):
+---
+> class ST_m1p(IStrategy):
+29c29
+<         "buy_m1": 4,
+---
+>         "buy_m1": 5,
+== ud/strategies/ST_p1m.py
+22c22
+< class Supertrend(IStrategy):
+---
+> class ST_p1m(IStrategy):
+32c32
+<         "buy_p1": 8,
+---
+>         "buy_p1": 7,
+== ud/strategies/ST_p1p.py
+22c22
+< class Supertrend(IStrategy):
+---
+> class ST_p1p(IStrategy):
+32c32
+<         "buy_p1": 8,
+---
+>         "buy_p1": 9,
+== ud/strategies/ST_p2m.py
+22c22
+< class Supertrend(IStrategy):
+---
+> class ST_p2m(IStrategy):
+33c33
+<         "buy_p2": 9,
+---
+>         "buy_p2": 8,
+== ud/strategies/ST_p2p.py
+22c22
+< class Supertrend(IStrategy):
+---
+> class ST_p2p(IStrategy):
+33c33
+<         "buy_p2": 9,
+---
+>         "buy_p2": 10,
+== ud/strategies/ST_start100.py
+22c22
+< class Supertrend(IStrategy):
+---
+> class ST_start100(IStrategy):
+66c66
+<     startup_candle_count = 199
+---
+>     startup_candle_count = 100
+===== download.txt
+Downloaded data for BTC/USDT with length 40985.
+Downloaded data for ETH/USDT with length 40985.
+Downloaded data for LTC/USDT with length 40985.
+Downloaded data for BNB/USDT with length 40985.
+Downloaded data for ADA/USDT with length 40985.
+Downloaded data for SOL/USDT with length 40985.
+===== backtest.txt
+                                STRATEGY SUMMARY                                
+┏━━━━━━━━━┳━━━━━━━━┳━━━━━━━━━┳━━━━━━━━━┳━━━━━━━━━┳━━━━━━━━━┳━━━━━━━━━┳━━━━━━━━━┓
+┃         ┃        ┃         ┃         ┃         ┃         ┃     Win ┃         ┃
+┃         ┃        ┃     Avg ┃     Tot ┃     Tot ┃         ┃    Draw ┃         ┃
+┃         ┃        ┃  Profit ┃  Profit ┃  Profit ┃     Avg ┃    Loss ┃         ┃
+┃ Strate… ┃ Trades ┃       % ┃    USDT ┃       % ┃ Durati… ┃    Win% ┃ Drawdo… ┃
+┡━━━━━━━━━╇━━━━━━━━╇━━━━━━━━━╇━━━━━━━━━╇━━━━━━━━━╇━━━━━━━━━╇━━━━━━━━━╇━━━━━━━━━┩
+│ ST_base │   2938 │   -0.16 │ -469.8… │   -0.05 │  1 day, │    1409 │ 512.196 │
+│         │        │         │         │         │ 6:58:00 │     480 │    USDT │
+│         │        │         │         │         │         │    1049 │   0.05% │
+│         │        │         │         │         │         │    48.0 │         │
+│ ST_sta… │   2938 │   -0.16 │ -469.8… │   -0.05 │  1 day, │    1409 │ 512.196 │
+│         │        │         │         │         │ 6:58:00 │     480 │    USDT │
+│         │        │         │         │         │         │    1049 │   0.05% │
+│         │        │         │         │         │         │    48.0 │         │
+│  ST_m1p │   3000 │   -0.17 │ -523.8… │   -0.05 │  1 day, │    1421 │ 552.043 │
+│         │        │         │         │         │ 6:37:00 │     490 │    USDT │
+│         │        │         │         │         │         │    1089 │   0.06% │
+│         │        │         │         │         │         │    47.4 │         │
+│  ST_m1m │   2990 │   -0.14 │ -423.4… │   -0.04 │  1 day, │    1429 │ 470.162 │
+│         │        │         │         │         │ 6:36:00 │     491 │    USDT │
+│         │        │         │         │         │         │    1070 │   0.05% │
+│         │        │         │         │         │         │    47.8 │         │
+│  ST_p1p │   2947 │   -0.16 │ -484.4… │   -0.05 │  1 day, │    1410 │ 521.078 │
+│         │        │         │         │         │ 6:55:00 │     485 │    USDT │
+│         │        │         │         │         │         │    1052 │   0.05% │
+│         │        │         │         │         │         │    47.8 │         │
+│  ST_p1m │   2942 │   -0.15 │ -453.3… │   -0.05 │  1 day, │    1405 │ 496.749 │
+│         │        │         │         │         │ 6:51:00 │     485 │    USDT │
+│         │        │         │         │         │         │    1052 │   0.05% │
+│         │        │         │         │         │         │    47.8 │         │
+│  ST_p2p │   2900 │   -0.18 │ -512.8… │   -0.05 │  1 day, │    1380 │ 540.433 │
+│         │        │         │         │         │ 7:05:00 │     485 │    USDT │
+│         │        │         │         │         │         │    1035 │   0.05% │
+│         │        │         │         │         │         │    47.6 │         │
+│  ST_p2m │   2984 │   -0.17 │ -496.9… │   -0.05 │  1 day, │    1416 │ 524.547 │
+│         │        │         │         │         │ 6:54:00 │     487 │    USDT │
+│         │        │         │         │         │         │    1081 │   0.05% │
+│         │        │         │         │         │         │    47.5 │         │
+└─────────┴────────┴─────────┴─────────┴─────────┴─────────┴─────────┴─────────┘
+===== auswertung.txt
+--- 2024 (nicht blind, nur Info)
+Trades 779, davon C (Stabilität >= 1.0) 398 = 51.1%
+A alle                       n= 779  Verlustquote= 32.5%  Ø Gewinn=  0.038 USDT
+B1 Volumen                   n= 398  Verlustquote= 29.9%  Ø Gewinn=  0.122 USDT
+B2 ruhiger Markt             n= 398  Verlustquote= 38.2%  Ø Gewinn= -0.040 USDT
+B3 Trend 24h                 n= 398  Verlustquote= 26.9%  Ø Gewinn=  0.026 USDT
+B4 Kombination               n= 398  Verlustquote= 29.1%  Ø Gewinn=  0.146 USDT
+C Delta-Profil               n= 398  Verlustquote= 28.1%  Ø Gewinn=  0.289 USDT
+  wacklig (aussortiert)      n= 381  Verlustquote= 37.0%  Ø Gewinn= -0.225 USDT
+Placebo: Anteil Zufallsauswahlen mit Verlustquote <= C: 0.006
+Kriterium 1 (>= 2,0 Pp unter bester B-Regel): Abstand -1.3 Pp -> NICHT erfüllt
+Kriterium 2 (höchster Ø Gewinn): erfüllt
+--- 2025 (BLIND)
+Trades 717, davon C (Stabilität >= 1.0) 402 = 56.1%
+A alle                       n= 717  Verlustquote= 36.1%  Ø Gewinn= -0.275 USDT
+B1 Volumen                   n= 402  Verlustquote= 31.6%  Ø Gewinn= -0.090 USDT
+B2 ruhiger Markt             n= 402  Verlustquote= 39.3%  Ø Gewinn= -0.226 USDT
+B3 Trend 24h                 n= 402  Verlustquote= 33.6%  Ø Gewinn= -0.428 USDT
+B4 Kombination               n= 402  Verlustquote= 32.1%  Ø Gewinn= -0.187 USDT
+C Delta-Profil               n= 402  Verlustquote= 33.1%  Ø Gewinn= -0.196 USDT
+  wacklig (aussortiert)      n= 315  Verlustquote= 40.0%  Ø Gewinn= -0.376 USDT
+Placebo: Anteil Zufallsauswahlen mit Verlustquote <= C: 0.034
+Kriterium 1 (>= 2,0 Pp unter bester B-Regel): Abstand -1.5 Pp -> NICHT erfüllt
+Kriterium 2 (höchster Ø Gewinn): NICHT erfüllt
+ERGEBNIS: KEIN belastbarer Zusatznutzen
