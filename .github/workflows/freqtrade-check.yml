@@ -9,22 +9,23 @@ jobs:
   check:
     runs-on: ubuntu-latest
     timeout-minutes: 60
+    container:
+      image: freqtradeorg/freqtrade:2025.2
+      options: --user root --entrypoint ""
+    defaults:
+      run:
+        shell: bash
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: '3.12'
-      - name: Freqtrade installieren
+      - name: Version (offizielles Freqtrade-Image 2025.2)
         run: |
-          pip install -q freqtrade==2025.2
           freqtrade --version | tee versions.txt
           python -c "import numpy,pandas,talib;print('numpy',numpy.__version__,'pandas',pandas.__version__,'talib',talib.__version__)" | tee -a versions.txt
       - name: Beide Strategie-Versionen holen
         run: |
           freqtrade create-userdir --userdir ud
           base=https://raw.githubusercontent.com/freqtrade/freqtrade-strategies
-          curl -sfL $base/e0579b641bb315dc9402a2c95b34c9f8dcefd2e3/user_data/strategies/Supertrend.py -o ud/strategies/Supertrend_old.py
-          curl -sfL $base/8fddeae020e63ed9d3a36efd30c2615f7a6b1769/user_data/strategies/Supertrend.py -o ud/strategies/Supertrend_new.py
+          python -c "import urllib.request as u;u.urlretrieve('$base/e0579b641bb315dc9402a2c95b34c9f8dcefd2e3/user_data/strategies/Supertrend.py','ud/strategies/Supertrend_old.py')"
+          python -c "import urllib.request as u;u.urlretrieve('$base/8fddeae020e63ed9d3a36efd30c2615f7a6b1769/user_data/strategies/Supertrend.py','ud/strategies/Supertrend_new.py')"
           diff ud/strategies/Supertrend_old.py ud/strategies/Supertrend_new.py | tee original_diff.txt || true
           # Gleiche Technik-Anpassung fuer BEIDE (numpy 2): Klassenname, np.NaN, numpy.lib.math
           for v in old new; do
@@ -44,11 +45,14 @@ jobs:
           }
           EOF
       - name: Daten laden (binanceus, 1h)
-        run: freqtrade download-data -c config.json --userdir ud --timeframes 1h --timerange 20230101-20250101
+        run: |
+          set -o pipefail
+          freqtrade download-data -c config.json --userdir ud --timeframes 1h --timerange 20230101-20250101 2>&1 | tail -20 | tee download.txt
       - name: Backtest beider Versionen
         run: |
+          set -o pipefail
           freqtrade backtesting -c config.json --userdir ud --strategy-list Supertrend_old Supertrend_new \
-            --timerange 20240101-20250101 --export trades 2>&1 | tail -60 | tee backtest_summary.txt
+            --timerange 20240101-20250101 --export trades 2>&1 | tail -80 | tee backtest_summary.txt
       - name: Trades vergleichen
         run: |
           python - <<'EOF' | tee comparison.txt
@@ -69,6 +73,9 @@ jobs:
           print("Erste abweichende Einstiege:", diff[:10])
           EOF
           { echo '## Aenderungs-Check Supertrend'; echo '```'; cat versions.txt comparison.txt; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+      - name: Fehlerausgabe
+        if: failure()
+        run: for f in *.txt; do [ -f "$f" ] && tail -15 "$f" | while read -r l; do echo "::error title=$f::$l"; done; done; true
       - uses: actions/upload-artifact@v4
         if: always()
         with:
@@ -77,5 +84,6 @@ jobs:
             versions.txt
             original_diff.txt
             patched_diff.txt
+            download.txt
             backtest_summary.txt
             comparison.txt
