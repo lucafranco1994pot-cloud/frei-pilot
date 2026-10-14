@@ -1,0 +1,132 @@
+===== varianten.txt
+== ud/strategies/ST_base.py
+22c22
+< class Supertrend(IStrategy):
+---
+> class ST_base(IStrategy):
+== ud/strategies/ST_m1m.py
+22c22
+< class Supertrend(IStrategy):
+---
+> class ST_m1m(IStrategy):
+29c29
+<         "buy_m1": 4,
+---
+>         "buy_m1": 3,
+== ud/strategies/ST_m1p.py
+22c22
+< class Supertrend(IStrategy):
+---
+> class ST_m1p(IStrategy):
+29c29
+<         "buy_m1": 4,
+---
+>         "buy_m1": 5,
+== ud/strategies/ST_p1m.py
+22c22
+< class Supertrend(IStrategy):
+---
+> class ST_p1m(IStrategy):
+32c32
+<         "buy_p1": 8,
+---
+>         "buy_p1": 7,
+== ud/strategies/ST_p1p.py
+22c22
+< class Supertrend(IStrategy):
+---
+> class ST_p1p(IStrategy):
+32c32
+<         "buy_p1": 8,
+---
+>         "buy_p1": 9,
+== ud/strategies/ST_p2m.py
+22c22
+< class Supertrend(IStrategy):
+---
+> class ST_p2m(IStrategy):
+33c33
+<         "buy_p2": 9,
+---
+>         "buy_p2": 8,
+== ud/strategies/ST_p2p.py
+22c22
+< class Supertrend(IStrategy):
+---
+> class ST_p2p(IStrategy):
+33c33
+<         "buy_p2": 9,
+---
+>         "buy_p2": 10,
+== ud/strategies/ST_start100.py
+22c22
+< class Supertrend(IStrategy):
+---
+> class ST_start100(IStrategy):
+66c66
+<     startup_candle_count = 199
+---
+>     startup_candle_count = 100
+===== download.txt
+Downloaded data for BTC/USDT with length 31985.
+Downloaded data for ETH/USDT with length 31985.
+Downloaded data for LTC/USDT with length 31985.
+Downloaded data for BNB/USDT with length 31985.
+Downloaded data for ADA/USDT with length 31985.
+Downloaded data for SOL/USDT with length 31985.
+===== backtest.txt
+                                STRATEGY SUMMARY                                
+┏━━━━━━━━━┳━━━━━━━━┳━━━━━━━━━┳━━━━━━━━━┳━━━━━━━━━┳━━━━━━━━━┳━━━━━━━━━┳━━━━━━━━━┓
+┃         ┃        ┃         ┃         ┃         ┃         ┃     Win ┃         ┃
+┃         ┃        ┃     Avg ┃     Tot ┃     Tot ┃         ┃    Draw ┃         ┃
+┃         ┃        ┃  Profit ┃  Profit ┃  Profit ┃     Avg ┃    Loss ┃         ┃
+┃ Strate… ┃ Trades ┃       % ┃    USDT ┃       % ┃ Durati… ┃    Win% ┃ Drawdo… ┃
+┡━━━━━━━━━╇━━━━━━━━╇━━━━━━━━━╇━━━━━━━━━╇━━━━━━━━━╇━━━━━━━━━╇━━━━━━━━━╇━━━━━━━━━┩
+│ ST_base │   2221 │   -0.13 │ -277.9… │   -0.03 │  1 day, │    1065 │ 468.697 │
+│         │        │         │         │         │ 7:13:00 │     364 │    USDT │
+│         │        │         │         │         │         │     792 │   0.05% │
+│         │        │         │         │         │         │    48.0 │         │
+│ ST_sta… │   2221 │   -0.13 │ -277.9… │   -0.03 │  1 day, │    1065 │ 468.697 │
+│         │        │         │         │         │ 7:13:00 │     364 │    USDT │
+│         │        │         │         │         │         │     792 │   0.05% │
+│         │        │         │         │         │         │    48.0 │         │
+│  ST_m1p │   2265 │   -0.14 │ -323.0… │   -0.03 │  1 day, │    1067 │ 498.202 │
+│         │        │         │         │         │ 6:51:00 │     374 │    USDT │
+│         │        │         │         │         │         │     824 │   0.05% │
+│         │        │         │         │         │         │    47.1 │         │
+│  ST_m1m │   2255 │   -0.11 │ -248.0… │   -0.02 │  1 day, │    1074 │ 470.162 │
+│         │        │         │         │         │ 6:50:00 │     373 │    USDT │
+│         │        │         │         │         │         │     808 │   0.05% │
+│         │        │         │         │         │         │    47.6 │         │
+│  ST_p1p │   2229 │   -0.14 │ -310.8… │   -0.03 │  1 day, │    1062 │ 476.717 │
+│         │        │         │         │         │ 7:07:00 │     370 │    USDT │
+│         │        │         │         │         │         │     797 │   0.05% │
+│         │        │         │         │         │         │    47.6 │         │
+│  ST_p1m │   2227 │   -0.12 │ -269.4… │   -0.03 │  1 day, │    1064 │ 464.958 │
+│         │        │         │         │         │ 7:02:00 │     366 │    USDT │
+│         │        │         │         │         │         │     797 │   0.05% │
+│         │        │         │         │         │         │    47.8 │         │
+│  ST_p2p │   2189 │   -0.14 │ -314.4… │   -0.03 │  1 day, │    1045 │ 512.555 │
+│         │        │         │         │         │ 7:29:00 │     370 │    USDT │
+│         │        │         │         │         │         │     774 │   0.05% │
+│         │        │         │         │         │         │    47.7 │         │
+│  ST_p2m │   2249 │   -0.12 │ -279.7… │   -0.03 │  1 day, │    1072 │ 484.101 │
+│         │        │         │         │         │ 7:14:00 │     366 │    USDT │
+│         │        │         │         │         │         │     811 │   0.05% │
+│         │        │         │         │         │         │    47.7 │         │
+└─────────┴────────┴─────────┴─────────┴─────────┴─────────┴─────────┴─────────┘
+===== auswertung.txt
+Trades gesamt 2221  Lernzeit 1442  Test 779
+Schwelle S = 1.000 (Anteil im Lernzeitraum: 60.7%)
+Stabilitaet im Test (Anzahl Trades je Wert): {0.429: 12, 0.571: 26, 0.714: 114, 0.857: 229, 1.0: 398}
+--- Lernzeitraum (nur zur Info)
+A alle                             n=1442  Verlustquote= 37.2%  Ø Gewinn= -0.209 USDT
+C stabil (>= S)                    n= 875  Verlustquote= 33.9%  Ø Gewinn= -0.070 USDT
+  wacklig (< S)                    n= 567  Verlustquote= 42.3%  Ø Gewinn= -0.425 USDT
+--- TEST 2024 (blind)
+A alle                             n= 779  Verlustquote= 32.7%  Ø Gewinn=  0.031 USDT
+B Volumen-Regel (gleiche Anzahl)   n= 398  Verlustquote= 30.2%  Ø Gewinn=  0.115 USDT
+C Delta-Profil (>= S)              n= 398  Verlustquote= 28.4%  Ø Gewinn=  0.282 USDT
+  wacklig (< S)                    n= 381  Verlustquote= 37.3%  Ø Gewinn= -0.231 USDT
+Placebo: Anteil zufaelliger Auswahlen mit Verlustquote <= C: 0.005
+ERGEBNIS: ERFOLG nach Vorregistrierung
