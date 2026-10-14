@@ -1,0 +1,79 @@
+name: delta-profil
+# Delta-Pruefprofil als Fehlerfilter. Regeln: ergebnisse/delta-profil-vorregistrierung.md
+on:
+  push:
+    branches: [freqtrade-check]
+    paths: ['.github/workflows/delta-profil.yml', 'scripts/delta_profil_auswertung.py']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    container:
+      image: freqtradeorg/freqtrade:2025.2
+      options: --user root --entrypoint ""
+    env:
+      PYTHONUSERBASE: /home/ftuser/.local
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+      - name: Strategie und Varianten
+        run: |
+          set -e
+          python -m freqtrade create-userdir --userdir ud
+          python -c "import urllib.request as u;u.urlretrieve('https://raw.githubusercontent.com/freqtrade/freqtrade-strategies/8fddeae020e63ed9d3a36efd30c2615f7a6b1769/user_data/strategies/Supertrend.py','base.py')"
+          mk(){ sed "s/^class Supertrend(/class $1(/; $2" base.py > ud/strategies/$1.py; }
+          mk ST_base ""
+          mk ST_start100 "s/startup_candle_count = 199/startup_candle_count = 100/"
+          mk ST_m1p 's/"buy_m1": 4,/"buy_m1": 5,/'
+          mk ST_m1m 's/"buy_m1": 4,/"buy_m1": 3,/'
+          mk ST_p1p 's/"buy_p1": 8,/"buy_p1": 9,/'
+          mk ST_p1m 's/"buy_p1": 8,/"buy_p1": 7,/'
+          mk ST_p2p 's/"buy_p2": 9,/"buy_p2": 10,/'
+          mk ST_p2m 's/"buy_p2": 9,/"buy_p2": 8,/'
+          for f in ud/strategies/ST_*.py; do echo "== $f"; diff base.py $f || true; done 2>&1 | tee varianten.txt
+          cat > config.json <<'EOF'
+          {
+            "max_open_trades": -1, "stake_currency": "USDT", "stake_amount": 100,
+            "dry_run": true, "dry_run_wallet": 1000000, "timeframe": "1h", "trading_mode": "spot",
+            "exchange": {"name": "binanceus", "pair_whitelist": ["BTC/USDT","ETH/USDT","LTC/USDT","BNB/USDT","ADA/USDT","SOL/USDT"]},
+            "pairlists": [{"method": "StaticPairList"}],
+            "entry_pricing": {"price_side": "same"}, "exit_pricing": {"price_side": "same"}
+          }
+          EOF
+      - name: Daten
+        run: |
+          set -o pipefail
+          python -m freqtrade download-data -c config.json --userdir ud --timeframes 1h --timerange 20210601-20250101 2>&1 | grep -E "Downloaded|No data|ERROR|WARN" | tee download.txt
+      - name: Backtests
+        run: |
+          set -o pipefail
+          python -m freqtrade backtesting -c config.json --userdir ud \
+            --strategy-list ST_base ST_start100 ST_m1p ST_m1m ST_p1p ST_p1m ST_p2p ST_p2m \
+            --timerange 20220101-20250101 --export trades 2>&1 | tail -40 | tee backtest.txt
+      - name: Auswertung
+        run: python scripts/delta_profil_auswertung.py 2>&1 | tee auswertung.txt
+      - name: Ergebnis in den Branch schreiben
+        if: always()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          for f in varianten.txt download.txt backtest.txt auswertung.txt; do echo "===== $f"; cat "$f" 2>&1; done > ergebnis.txt
+          python - <<'EOF'
+          import base64, json, os, urllib.request as u
+          repo=os.environ['GITHUB_REPOSITORY']; path='ergebnisse/delta-profil.txt'; br='freqtrade-check'
+          h={'Authorization':'Bearer '+os.environ['GH_TOKEN'],'Accept':'application/vnd.github+json'}
+          url=f'https://api.github.com/repos/{repo}/contents/{path}'
+          sha=None
+          try: sha=json.load(u.urlopen(u.Request(url+'?ref='+br,headers=h)))['sha']
+          except Exception: pass
+          body={'message':'Ergebnis Delta-Profil','branch':br,'content':base64.b64encode(open('ergebnis.txt','rb').read()).decode()}
+          if sha: body['sha']=sha
+          u.urlopen(u.Request(url,data=json.dumps(body).encode(),headers=h,method='PUT'))
+          EOF
