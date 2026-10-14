@@ -20,26 +20,26 @@ numpy 1.26.4 pandas 2.2.3 talib 0.4.38
 ---
 >     startup_candle_count = 199
 ===== download.txt
-2026-10-14 11:30:15,580 - freqtrade.exchange.exchange - INFO - Using Exchange 
+2026-10-14 11:55:22,317 - freqtrade.exchange.exchange - INFO - Using Exchange 
 "Binance US"
-2026-10-14 11:30:15,581 - freqtrade.resolvers.exchange_resolver - INFO - Using 
+2026-10-14 11:55:22,317 - freqtrade.resolvers.exchange_resolver - INFO - Using 
 resolved exchange 'Binance'...
-2026-10-14 11:30:15,582 - freqtrade.exchange.exchange - INFO - Markets were not 
+2026-10-14 11:55:22,318 - freqtrade.exchange.exchange - INFO - Markets were not 
 loaded. Loading them now..
-2026-10-14 11:30:16,369 - freqtrade.data.history.history_utils - INFO - About to
+2026-10-14 11:55:23,198 - freqtrade.data.history.history_utils - INFO - About to
 download pairs: ['BTC/USDT', 'ETH/USDT'], intervals: ['1h'] to ud/data/binanceus
-2026-10-14 11:30:16,372 - freqtrade.data.history.history_utils - INFO - Download
+2026-10-14 11:55:23,202 - freqtrade.data.history.history_utils - INFO - Download
 history data for "BTC/USDT", 1h, spot and store in ud/data/binanceus. From 
 2023-01-01T00:00:00 to 2025-01-01T00:00:00
-2026-10-14 11:30:18,055 - freqtrade.data.history.history_utils - INFO - 
+2026-10-14 11:55:24,862 - freqtrade.data.history.history_utils - INFO - 
 Downloaded data for BTC/USDT with length 17992.
-2026-10-14 11:30:18,068 - freqtrade.data.history.history_utils - INFO - Download
+2026-10-14 11:55:24,880 - freqtrade.data.history.history_utils - INFO - Download
 history data for "ETH/USDT", 1h, spot and store in ud/data/binanceus. From 
 2023-01-01T00:00:00 to 2025-01-01T00:00:00
-2026-10-14 11:30:19,511 - freqtrade.data.history.history_utils - INFO - 
+2026-10-14 11:55:26,125 - freqtrade.data.history.history_utils - INFO - 
 Downloaded data for ETH/USDT with length 17992.
 Timeframe            ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 1/1 100% • 0:00:01 • 0:00:00
-Downloading ETH/USDT ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 2/2 100% • 0:00:03 • 0:00:00
+Downloading ETH/USDT ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 2/2 100% • 0:00:02 • 0:00:00
 ===== backtest_summary.txt
 │    ('', │         │    109 │    1.76 │ 191.375 │   19.14 │  1 day, │      73 │
 │  'roi') │         │        │         │         │         │ 8:18:00 │      36 │
