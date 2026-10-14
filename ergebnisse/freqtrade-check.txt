@@ -1,0 +1,129 @@
+===== versions.txt
+Operating System:	Linux-6.17.0-1022-azure-x86_64-with-glibc2.36
+Python Version:		Python 3.12.9
+CCXT Version:		4.4.62
+
+Freqtrade Version:	freqtrade 2025.2
+numpy 1.26.4 pandas 2.2.3 talib 0.4.38
+===== original_diff.txt
+66c66
+<     startup_candle_count = 18
+---
+>     startup_candle_count = 199
+===== patched_diff.txt
+22c22
+< class Supertrend_old(IStrategy):
+---
+> class Supertrend_new(IStrategy):
+66c66
+<     startup_candle_count = 18
+---
+>     startup_candle_count = 199
+===== download.txt
+2026-10-14 11:30:15,580 - freqtrade.exchange.exchange - INFO - Using Exchange 
+"Binance US"
+2026-10-14 11:30:15,581 - freqtrade.resolvers.exchange_resolver - INFO - Using 
+resolved exchange 'Binance'...
+2026-10-14 11:30:15,582 - freqtrade.exchange.exchange - INFO - Markets were not 
+loaded. Loading them now..
+2026-10-14 11:30:16,369 - freqtrade.data.history.history_utils - INFO - About to
+download pairs: ['BTC/USDT', 'ETH/USDT'], intervals: ['1h'] to ud/data/binanceus
+2026-10-14 11:30:16,372 - freqtrade.data.history.history_utils - INFO - Download
+history data for "BTC/USDT", 1h, spot and store in ud/data/binanceus. From 
+2023-01-01T00:00:00 to 2025-01-01T00:00:00
+2026-10-14 11:30:18,055 - freqtrade.data.history.history_utils - INFO - 
+Downloaded data for BTC/USDT with length 17992.
+2026-10-14 11:30:18,068 - freqtrade.data.history.history_utils - INFO - Download
+history data for "ETH/USDT", 1h, spot and store in ud/data/binanceus. From 
+2023-01-01T00:00:00 to 2025-01-01T00:00:00
+2026-10-14 11:30:19,511 - freqtrade.data.history.history_utils - INFO - 
+Downloaded data for ETH/USDT with length 17992.
+Timeframe            ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 1/1 100% • 0:00:01 • 0:00:00
+Downloading ETH/USDT ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 2/2 100% • 0:00:03 • 0:00:00
+===== backtest_summary.txt
+│    ('', │         │    109 │    1.76 │ 191.375 │   19.14 │  1 day, │      73 │
+│  'roi') │         │        │         │         │         │ 8:18:00 │      36 │
+│         │         │        │         │         │         │         │ 0   100 │
+│    ('', │         │      1 │   -2.42 │  -2.409 │   -0.24 │ 10:00:… │       0 │
+│ 'force… │         │        │         │         │         │         │ 0     1 │
+│         │         │        │         │         │         │         │       0 │
+│    ('', │         │     39 │   -3.58 │ -139.5… │  -13.95 │  1 day, │       0 │
+│ 'exit_… │         │        │         │         │         │ 8:20:00 │ 0    39 │
+│         │         │        │         │         │         │         │       0 │
+│   TOTAL │         │    149 │    0.33 │  49.417 │    4.94 │  1 day, │      73 │
+│         │         │        │         │         │         │ 8:10:00 │      36 │
+│         │         │        │         │         │         │         │      40 │
+│         │         │        │         │         │         │         │    49.0 │
+└─────────┴─────────┴────────┴─────────┴─────────┴─────────┴─────────┴─────────┘
+                   SUMMARY METRICS                   
+┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┳━━━━━━━━━━━━━━━━━━━━━┓
+┃ Metric                      ┃ Value               ┃
+┡━━━━━━━━━━━━━━━━━━━━━━━━━━━━━╇━━━━━━━━━━━━━━━━━━━━━┩
+│ Backtesting from            │ 2024-01-01 00:00:00 │
+│ Backtesting to              │ 2025-01-01 00:00:00 │
+│ Trading Mode                │ Spot                │
+│ Max open trades             │ 1                   │
+│                             │                     │
+│ Total/Daily Avg Trades      │ 149 / 0.41          │
+│ Starting balance            │ 1000 USDT           │
+│ Final balance               │ 1049.417 USDT       │
+│ Absolute profit             │ 49.417 USDT         │
+│ Total profit %              │ 4.94%               │
+│ CAGR %                      │ 4.93%               │
+│ Sortino                     │ 1.41                │
+│ Sharpe                      │ 0.89                │
+│ Calmar                      │ 10.06               │
+│ Profit factor               │ 1.35                │
+│ Expectancy (Ratio)          │ 0.33 (-0.15)        │
+│ Avg. daily profit %         │ 0.01%               │
+│ Avg. stake amount           │ 99.732 USDT         │
+│ Total trade volume          │ 29829.105 USDT      │
+│                             │                     │
+│ Best Pair                   │ BTC/USDT 4.08%      │
+│ Worst Pair                  │ ETH/USDT 0.86%      │
+│ Best trade                  │ BTC/USDT 5.79%      │
+│ Worst trade                 │ BTC/USDT -10.61%    │
+│ Best day                    │ 8.694 USDT          │
+│ Worst day                   │ -10.588 USDT        │
+│ Days win/draw/lose          │ 60 / 267 / 39       │
+│ Avg. Duration Winners       │ 1 day, 1:06:00      │
+│ Avg. Duration Loser         │ 1 day, 7:46:00      │
+│ Max Consecutive Wins / Loss │ 8 / 7               │
+│ Rejected Entry signals      │ 1492                │
+│ Entry/Exit Timeouts         │ 0 / 0               │
+│                             │                     │
+│ Min balance                 │ 993.07 USDT         │
+│ Max balance                 │ 1058.683 USDT       │
+│ Max % of account underwater │ 2.56%               │
+│ Absolute Drawdown (Account) │ 2.56%               │
+│ Absolute Drawdown           │ 26.419 USDT         │
+│ Drawdown high               │ 30.696 USDT         │
+│ Drawdown low                │ 4.277 USDT          │
+│ Drawdown Start              │ 2024-03-04 18:00:00 │
+│ Drawdown End                │ 2024-07-03 02:00:00 │
+│ Market change               │ 81.09%              │
+└─────────────────────────────┴─────────────────────┘
+
+Backtested 2024-01-01 00:00:00 -> 2025-01-01 00:00:00 | Max open trades : 1
+                                STRATEGY SUMMARY                                
+┏━━━━━━━━━┳━━━━━━━━┳━━━━━━━━━┳━━━━━━━━━┳━━━━━━━━━┳━━━━━━━━━┳━━━━━━━━━┳━━━━━━━━━┓
+┃         ┃        ┃         ┃         ┃         ┃         ┃     Win ┃         ┃
+┃         ┃        ┃     Avg ┃     Tot ┃     Tot ┃         ┃    Draw ┃         ┃
+┃         ┃        ┃  Profit ┃  Profit ┃  Profit ┃     Avg ┃    Loss ┃         ┃
+┃ Strate… ┃ Trades ┃       % ┃    USDT ┃       % ┃ Durati… ┃    Win% ┃ Drawdo… ┃
+┡━━━━━━━━━╇━━━━━━━━╇━━━━━━━━━╇━━━━━━━━━╇━━━━━━━━━╇━━━━━━━━━╇━━━━━━━━━╇━━━━━━━━━┩
+│ Supert… │    149 │    0.33 │  49.417 │    4.94 │  1 day, │      73 │  26.419 │
+│         │        │         │         │         │ 8:10:00 │      36 │    USDT │
+│         │        │         │         │         │         │      40 │   2.56% │
+│         │        │         │         │         │         │    49.0 │         │
+│ Supert… │    149 │    0.33 │  49.417 │    4.94 │  1 day, │      73 │  26.419 │
+│         │        │         │         │         │ 8:10:00 │      36 │    USDT │
+│         │        │         │         │         │         │      40 │   2.56% │
+│         │        │         │         │         │         │    49.0 │         │
+└─────────┴────────┴─────────┴─────────┴─────────┴─────────┴─────────┴─────────┘
+===== comparison.txt
+Trades alt: 149  neu: 149
+Profit alt: 49.42 USDT  neu: 49.42 USDT
+Einstiege gleich: 149  nur alt: 0  nur neu: 0
+Ausstiege gleich: 149  nur alt: 0  nur neu: 0
+Erste abweichende Einstiege: []
