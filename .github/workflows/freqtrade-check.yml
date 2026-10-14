@@ -18,11 +18,14 @@ jobs:
     steps:
       - name: Version (offizielles Freqtrade-Image 2025.2)
         run: |
-          freqtrade --version | tee versions.txt
+          echo "::notice::user=$(id -u) py=$(command -v python) ft=$(command -v freqtrade) home=$HOME path=$PATH"
+          ls /home/ftuser/.local/bin 2>&1 | head -5 | while read -r l; do echo "::notice::bin $l"; done
+          python -m freqtrade --version 2>&1 | tee versions.txt | while read -r l; do echo "::notice::$l"; done
+          test ${PIPESTATUS[0]} -eq 0
           python -c "import numpy,pandas,talib;print('numpy',numpy.__version__,'pandas',pandas.__version__,'talib',talib.__version__)" | tee -a versions.txt
       - name: Beide Strategie-Versionen holen
         run: |
-          freqtrade create-userdir --userdir ud
+          python -m freqtrade create-userdir --userdir ud
           base=https://raw.githubusercontent.com/freqtrade/freqtrade-strategies
           python -c "import urllib.request as u;u.urlretrieve('$base/e0579b641bb315dc9402a2c95b34c9f8dcefd2e3/user_data/strategies/Supertrend.py','ud/strategies/Supertrend_old.py')"
           python -c "import urllib.request as u;u.urlretrieve('$base/8fddeae020e63ed9d3a36efd30c2615f7a6b1769/user_data/strategies/Supertrend.py','ud/strategies/Supertrend_new.py')"
@@ -47,11 +50,11 @@ jobs:
       - name: Daten laden (binanceus, 1h)
         run: |
           set -o pipefail
-          freqtrade download-data -c config.json --userdir ud --timeframes 1h --timerange 20230101-20250101 2>&1 | tail -20 | tee download.txt
+          python -m freqtrade download-data -c config.json --userdir ud --timeframes 1h --timerange 20230101-20250101 2>&1 | tail -20 | tee download.txt
       - name: Backtest beider Versionen
         run: |
           set -o pipefail
-          freqtrade backtesting -c config.json --userdir ud --strategy-list Supertrend_old Supertrend_new \
+          python -m freqtrade backtesting -c config.json --userdir ud --strategy-list Supertrend_old Supertrend_new \
             --timerange 20240101-20250101 --export trades 2>&1 | tail -80 | tee backtest_summary.txt
       - name: Trades vergleichen
         run: |
