@@ -1,4 +1,5 @@
 
+name: CCXT Originaltest
 on:
   workflow_dispatch:
 permissions:
@@ -11,6 +12,12 @@ jobs:
       - uses: actions/checkout@v4
         with:
           persist-credentials: false
+      - name: Pin repository and frozen archive identity
+        shell: bash
+        run: |
+          set -euo pipefail
+          git rev-parse HEAD | tee repository_commit.txt
+          echo "b804b42ac6ab890ed43735fbeb45345558c19583c767ca80740482aab0d44f99  ccxt-test.zip" | sha256sum -c | tee frozen_zip_verification.txt
       - name: Extract frozen test package
         run: unzip -oq ccxt-test.zip
       - name: Set up Python
@@ -19,17 +26,65 @@ jobs:
           python-version: '3.11'
       - name: Verify inputs
         run: python verify_inputs.py
-      - name: Install CCXT
-        run: python -m pip install -r ccxt_pilot_001/requirements.txt
+      - name: Download exact wheel and check published PyPI SHA-256
+        shell: bash
+        run: |
+          set -euo pipefail
+          python --version 2>&1 | tee python_version.txt
+          uname -a | tee runner_os.txt
+          mkdir -p "$RUNNER_TEMP/ccxt-wheel"
+          python -m pip download --disable-pip-version-check --no-input --no-deps --only-binary=:all: --dest "$RUNNER_TEMP/ccxt-wheel" "ccxt==4.5.87" 2>&1 | tee wheel_download.log
+          python - <<'PY_CHECK' | tee wheel_verification.txt
+          from pathlib import Path
+          import os, hashlib
+          p=Path(os.environ['RUNNER_TEMP'])/'ccxt-wheel'/'ccxt-4.5.87-py3-none-any.whl'
+          expected='c04c2079becc1bef5e855428a23eb827af86d1c0cea1ece01fc52da2a808f27c'
+          if not p.is_file():
+              raise SystemExit('FAIL: exact official wheel absent')
+          actual=hashlib.sha256(p.read_bytes()).hexdigest()
+          print('wheel:',p.name,'observed_sha256:',actual,'expected_sha256:',expected)
+          if actual!=expected:
+              raise SystemExit('FAIL: official wheel SHA-256 differs')
+          print('OFFICIAL_WHEEL_SHA256_OK')
+          PY_CHECK
+      - name: Install verified CCXT and dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --disable-pip-version-check --no-input "$RUNNER_TEMP/ccxt-wheel/ccxt-4.5.87-py3-none-any.whl" 2>&1 | tee install.log
+          python -m pip check 2>&1 | tee pip_check.txt
+          python -m pip freeze | tee installed_packages.txt
+          python -m pip show ccxt | tee installed_package.txt
       - name: Execute original parser
+        shell: bash
         working-directory: ccxt_pilot_001
-        run: python run_original.py
+        run: |
+          set +e
+          python run_original.py > raw_stdout.json 2> raw_stderr.txt
+          code=$?
+          echo "$code" > original_exit_code.txt
+          cat raw_stdout.json
+          if [[ -s raw_stderr.txt ]]; then cat raw_stderr.txt >&2; fi
+          exit "$code"
       - name: Save evidence
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: ccxt-original-evidence
+          name: ccxt-original-evidence-${{ github.run_id }}
           path: |
+            repository_commit.txt
+            frozen_zip_verification.txt
+            python_version.txt
+            runner_os.txt
+            wheel_download.log
+            wheel_verification.txt
+            install.log
+            pip_check.txt
+            installed_packages.txt
+            installed_package.txt
+            ccxt_pilot_001/raw_stdout.json
+            ccxt_pilot_001/raw_stderr.txt
+            ccxt_pilot_001/original_exit_code.txt
             ccxt_pilot_001/original_run.json
             ccxt_pilot_001/fixture.json
             ccxt_pilot_001/requirements.txt
