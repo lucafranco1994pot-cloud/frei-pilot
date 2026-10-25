@@ -1,4 +1,4 @@
-name: CCXT Originaltest
+
 on:
   workflow_dispatch:
 permissions:
