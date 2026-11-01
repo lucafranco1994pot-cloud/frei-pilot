@@ -1,0 +1,210 @@
+# ATLAS E2A: original upstream meta-snapshot identity and deletion-boundary references.
+# Product code and original tests UNMODIFIED; isolated from F1B/F1D/E0/E1.
+# NATS baseline: d163ae747ad050ea89054f8fb03c43e64e737aea
+# No production bug asserted. Does not prove actual erroneous orphan deletion.
+name: ATLAS NATS E2A Meta Identity References
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  original-meta-identity-references:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      GOTOOLCHAIN: auto
+    steps:
+      - name: Checkout frozen original NATS commit
+        uses: actions/checkout@v4
+        with:
+          repository: nats-io/nats-server
+          ref: d163ae747ad050ea89054f8fb03c43e64e737aea
+          fetch-depth: 1
+          path: nats
+
+      - name: Install baseline Go toolchain
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.26.10'
+          cache: false
+
+      - name: Verify upstream test selection and freeze source files
+        shell: bash
+        run: |
+          set -euo pipefail
+          PIN=d163ae747ad050ea89054f8fb03c43e64e737aea
+          [ "$(git -C nats rev-parse HEAD)" = "$PIN" ]
+          test "$(git -C nats hash-object server/jetstream_cluster.go)" = d4f7f413367d9f3c122955ce99e9e10da5b8214c
+          test "$(git -C nats hash-object server/jetstream_cluster_3_test.go)" = 80b8d39d6a7d6ddcd70a794dfc10876909816606
+          test -z "$(git -C nats status --porcelain)"
+          {
+            echo "ATLAS_E2A_PIN=$PIN"
+            echo "ATLAS_E2A_GO=$(go version)"
+            echo "ATLAS_E2A_PRODUCT_TEST_SOURCE_GIT_CLEAN=true"
+            sha256sum nats/server/jetstream_cluster.go nats/server/jetstream_cluster_3_test.go nats/server/raft.go nats/go.mod
+            echo 'ATLAS_E2A_TEST_NAMES:'
+            printf '%s\n' TestJetStreamClusterMetaSnapshotRecoveryRecreateStream TestJetStreamClusterMetaSnapshotRecoveryScaleStream TestJetStreamClusterMetaSnapshotIdempotentCreatePreservesStream TestJetStreamClusterApplyMetaSnapshotRecreateDetection
+          } | tee atlas-e2a-inputs.txt
+          set +e
+          (cd nats && go test ./server -list '^TestJetStreamCluster(MetaSnapshotRecovery(RecreateStream|ScaleStream)|MetaSnapshotIdempotentCreatePreservesStream|ApplyMetaSnapshotRecreateDetection)$') > atlas-e2a-selection.txt 2> atlas-e2a-selection-errors.txt
+          rc=$?
+          set -e
+          if [ "$rc" -ne 0 ]; then echo "ATLAS_E2A_SELECTION=BLOCKED list_exit=$rc"; exit 3; fi
+          python3 - <<'PYSELECTION'
+          from pathlib import Path
+          wanted = set(['TestJetStreamClusterMetaSnapshotRecoveryRecreateStream', 'TestJetStreamClusterMetaSnapshotRecoveryScaleStream', 'TestJetStreamClusterMetaSnapshotIdempotentCreatePreservesStream', 'TestJetStreamClusterApplyMetaSnapshotRecreateDetection'])
+          found = {x.strip() for x in Path('atlas-e2a-selection.txt').read_text().splitlines() if x.strip().startswith('Test')}
+          print('ATLAS_E2A_SELECTED='+','.join(sorted(found)))
+          if found != wanted: raise SystemExit('ATLAS_E2A_BLOCKED_TEST_SELECTION expected='+str(sorted(wanted))+' got='+str(sorted(found)))
+          print('ATLAS_E2A_SELECTION=EXACT_FOUR')
+          PYSELECTION
+          cp nats/server/jetstream_cluster.go atlas-e2a-upstream-jetstream_cluster.go
+          cp nats/server/jetstream_cluster_3_test.go atlas-e2a-upstream-jetstream_cluster_3_test.go
+          cp nats/server/raft.go atlas-e2a-upstream-raft.go
+          cp nats/go.mod atlas-e2a-upstream-go.mod
+
+      - name: Run four original upstream tests exactly once
+        id: e2a
+        working-directory: nats
+        shell: bash
+        run: |
+          set +e
+          go test ./server -run '^TestJetStreamCluster(MetaSnapshotRecovery(RecreateStream|ScaleStream)|MetaSnapshotIdempotentCreatePreservesStream|ApplyMetaSnapshotRecreateDetection)$' -count=1 -timeout=12m -covermode=atomic -coverprofile=../atlas-e2a-coverage.out -json > ../atlas-e2a-test.jsonl 2> ../atlas-e2a-stderr.txt
+          rc=$?
+          printf '%s\n' "$rc" > ../atlas-e2a-go-test.exit
+          echo "ATLAS_E2A_GO_TEST_EXIT=$rc"
+          exit "$rc"
+
+      - name: Evaluate each original test and relevant source coverage
+        if: always()
+        shell: bash
+        run: |
+          python3 - <<'PYAUDIT' | tee atlas-e2a-audit.txt
+          from pathlib import Path
+          import hashlib,json,re,subprocess,sys
+          expected = [
+           'TestJetStreamClusterMetaSnapshotRecoveryRecreateStream',
+           'TestJetStreamClusterMetaSnapshotRecoveryScaleStream',
+           'TestJetStreamClusterMetaSnapshotIdempotentCreatePreservesStream',
+           'TestJetStreamClusterApplyMetaSnapshotRecreateDetection',
+          ]
+          errors=[]
+          print('ATLAS_E2A_SCOPE=original_upstream_three_node_regressions_and_synthetic_identity_matrix')
+          print('ATLAS_E2A_CLAIM_LIMIT=no_five_node_failure_no_erroneous_orphan_delete_proven')
+          for name in ['atlas-e2a-inputs.txt','atlas-e2a-selection.txt','atlas-e2a-test.jsonl','atlas-e2a-stderr.txt','atlas-e2a-coverage.out','atlas-e2a-go-test.exit']:
+           p=Path(name)
+           print('ATLAS_E2A_EVIDENCE file=%s exists=%s sha256=%s'%(name,p.exists(),hashlib.sha256(p.read_bytes()).hexdigest() if p.exists() else 'ABSENT'))
+           if not p.exists(): errors.append('missing_'+name)
+          try: exit_code=int(Path('atlas-e2a-go-test.exit').read_text().strip())
+          except (OSError,ValueError): exit_code=None
+          print('ATLAS_E2A_GO_TEST_EXIT=%s'%exit_code)
+          if exit_code != 0: errors.append('original_tests_failed_or_not_run')
+          all_events=[]
+          if Path('atlas-e2a-test.jsonl').exists():
+           for line in Path('atlas-e2a-test.jsonl').read_text(errors='replace').splitlines():
+            try: ev=json.loads(line)
+            except (ValueError,TypeError): continue
+            if isinstance(ev,dict): all_events.append(ev)
+          for name in expected:
+           events=[ev['Action'] for ev in all_events if ev.get('Test')==name and ev.get('Action')]
+           outcome=(events.count('run')==1 and events.count('pass')==1 and 'fail' not in events and 'skip' not in events)
+           print('ATLAS_E2A_TEST name=%s run=%d pass=%d fail=%d skip=%d outcome=%s'%(name,events.count('run'),events.count('pass'),events.count('fail'),events.count('skip'),'PASS' if outcome else 'NOT_PROVEN'))
+           if not outcome: errors.append('unproven_'+name)
+          # Source-level coverage is process-wide and only shows that instrumented blocks ran.
+          source=Path('nats/server/jetstream_cluster.go')
+          coverage=Path('atlas-e2a-coverage.out')
+          intervals=[]
+          mode='ABSENT'
+          if coverage.exists():
+           rows=coverage.read_text().splitlines()
+           mode=rows[0] if rows else 'EMPTY'
+           for row in rows[1:]:
+            m=re.fullmatch(r'(.+):(\d+)\.(\d+),(\d+)\.(\d+)\s+(\d+)\s+(\d+)',row)
+            if m and m.group(1).endswith('/server/jetstream_cluster.go'):
+             intervals.append((int(m.group(2)),int(m.group(3)),int(m.group(4)),int(m.group(5)),int(m.group(7))))
+          print('ATLAS_E2A_COVERAGE_MODE='+mode)
+          if mode!='mode: atomic': errors.append('atomic_coverage_missing')
+          lines=source.read_text().splitlines() if source.exists() else []
+          checks=[
+           ('snapshot_decode','streams, err := js.decodeMetaSnapshot(buf)',2630,2636),
+           ('removed_from_snapshot','saDel = append(saDel, sa)',2640,2652),
+           ('recreate_add','saAdd = append(saAdd, nsa)',2640,2652),
+           ('stage_removal','ru.removeStream(sa)',2724,2732),
+           ('stage_update','ru.updateStream(sa)',2757,2767),
+           ('orphan_scan','deleteStreams, deleteConsumers := js.getOrphans()',2785,2802),
+           ('orphan_actual_delete','mset.stop(true, false)',2785,2802),
+           ('prior_assignment_created_time_guard','needDelete = !mset.createdTime().After(created)',7210,7235),
+          ]
+          for label,needle,lo,hi in checks:
+           pos=[i+1 for i in range(lo-1,min(hi,len(lines))) if needle in lines[i]]
+           if len(pos)!=1:
+            print('ATLAS_E2A_PATH=%s classification=BLOCKED_SOURCE_MATCH lines=%s'%(label,pos))
+            continue
+           lineno=pos[0]
+           hits=[count for a,ac,b,bc,count in intervals if (a,ac)<=(lineno,1) and (b,bc)>=(lineno,1)]
+           # Coverage inclusion is block-level and does not attribute the operation to a particular test/node.
+           if not hits: hits=[count for a,ac,b,bc,count in intervals if a<=lineno<=b]
+           print('ATLAS_E2A_PATH=%s line=%d coverage_executed=%s counts=%s'%(label,lineno,str(any(n>0 for n in hits)).lower(),hits))
+           if label=='snapshot_decode' and not any(n>0 for n in hits): errors.append('snapshot_decode_not_covered')
+          print('ATLAS_E2A_COVERAGE_LIMIT=whole_selected_test_batch_not_per_node_or_precise_event_order')
+          git_result=subprocess.run(['git','-C','nats','status','--porcelain'],capture_output=True,text=True)
+          clean=(git_result.returncode==0 and not git_result.stdout.strip())
+          print('ATLAS_E2A_UPSTREAM_SOURCE_UNMODIFIED='+str(clean).lower())
+          if not clean: errors.append('source_not_clean')
+          if errors:
+           print('ATLAS_E2A_VERDICT=FAIL_OR_BLOCKED reasons='+','.join(errors))
+           sys.exit(3)
+          else:
+           print('ATLAS_E2A_VERDICT=UPSTREAM_META_IDENTITY_REGRESSION_REFERENCES_PASS')
+           print('ATLAS_E2A_NEXT_GAP=direct_target_specific_orphan_candidate_and_cleanup_decision_not_proven')
+          PYAUDIT
+
+      - name: Publish readable result summary
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          {
+           echo '=== E2A upstream regression test audit ==='
+           test -f atlas-e2a-audit.txt && cat atlas-e2a-audit.txt || echo 'ATLAS_E2A_BLOCKED_AUDIT_MISSING'
+           echo '=== Original test output excerpt ==='
+           if test -f atlas-e2a-test.jsonl; then
+             python3 - <<'PYLOG'
+          import json
+          from pathlib import Path
+          for s in Path('atlas-e2a-test.jsonl').read_text(errors='replace').splitlines():
+           try: e=json.loads(s)
+           except ValueError: continue
+           if not isinstance(e,dict): continue
+           test=e.get('Test','')
+           if test and e.get('Action') in ('run','pass','fail','skip') and '/' not in test:
+            print('ATLAS_E2A_GO_JSON test=%s action=%s'%(test,e['Action']))
+          PYLOG
+           fi
+          } | tee atlas-e2a-summary.txt
+          cat atlas-e2a-summary.txt >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Preserve exact original logs sources and audit
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: atlas-nats-e2a-upstream-meta-identity-evidence
+          path: |
+            atlas-e2a-inputs.txt
+            atlas-e2a-selection.txt
+            atlas-e2a-selection-errors.txt
+            atlas-e2a-test.jsonl
+            atlas-e2a-stderr.txt
+            atlas-e2a-go-test.exit
+            atlas-e2a-coverage.out
+            atlas-e2a-audit.txt
+            atlas-e2a-summary.txt
+            atlas-e2a-upstream-jetstream_cluster.go
+            atlas-e2a-upstream-jetstream_cluster_3_test.go
+            atlas-e2a-upstream-raft.go
+            atlas-e2a-upstream-go.mod
+          if-no-files-found: warn
+          retention-days: 14
