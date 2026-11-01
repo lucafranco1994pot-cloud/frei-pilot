@@ -1,0 +1,301 @@
+# ATLAS EXTREME E2C: explicitly instrumented diagnostic, not original upstream test.
+# F1B/F1D/E0/E1/E2A/E2B remain frozen and unchanged.
+# Original NATS baseline: d163ae747ad050ea89054f8fb03c43e64e737aea
+# Additive test SHA-256: d2b9ced277233f8387fa3900bdcaf7606216289b7c06e0e09e2ba0d0c706c8f5
+# Instrument patcher SHA-256: 597273d46e1bedf2299ac00087077205e326d4a5cfedba0d1eb93b3c90fb8a58
+# IMPORTANT: Diagnostic runner alters temporary jetstream_cluster.go with log-only probes.
+# Controls: authorized DOOMED delete, protected ATLAS remains fully readable; no corruption.
+name: ATLAS NATS E2C Trace Actual Delete Decision
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  snapshot-decision-trace:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      GOTOOLCHAIN: auto
+    steps:
+      - name: Checkout original NATS baseline into ephemeral runner
+        uses: actions/checkout@v4
+        with:
+          repository: nats-io/nats-server
+          ref: d163ae747ad050ea89054f8fb03c43e64e737aea
+          fetch-depth: 1
+          path: nats
+      - name: Set up matching original Go toolchain
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.26.10'
+          cache: false
+      - name: Verify pinned originals and restore separate test and diagnostic patcher
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C nats rev-parse HEAD)" = d163ae747ad050ea89054f8fb03c43e64e737aea
+          test "$(git -C nats hash-object server/jetstream_cluster.go)" = d4f7f413367d9f3c122955ce99e9e10da5b8214c
+          test "$(git -C nats hash-object server/raft.go)" = 3c76b99e9bb0ac863c02e088da2766a1970813e0
+          test -z "$(git -C nats status --porcelain)"
+          cp nats/server/jetstream_cluster.go atlas-e2c-original-jetstream_cluster.go
+          base64 -d <<'ATLAS_E2C_TEST_BASE64' | gzip -dc > nats/server/atlas_e2c_decision_trace_test.go
+          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
+          ATLAS_E2C_TEST_BASE64
+          base64 -d <<'ATLAS_E2C_PATCH_BASE64' | gzip -dc > atlas-e2c-instrument.py
+          H4sIAAAAAAAC/8VXW2/bNhR+1684NZBKwlRlK7A9dNCD5ghJNscOJGcvSSDQEi2zlUiVpHLZ2v++Q0mW7SRN4gLF
+          YBgQb+fynY/nHI5Go3A+CROI3o8hZ6TgQmmWQU10tqIS3sF0BsuGZ5oJTkpYSMJxQUG2IryguW+FdV0ynKB3JNNg
+          VoWkOZSiKBgv3gle3kMlcrZkGTFCFGgBH6lWWlJSpVnZKE2lXwhgHI9DdH4SnUVxOAHZcI4moLrsk2i0b8X0c8Mk
+          6lpK8Q/loEQjMwrHTMOiFAtITkIjvDK2w4Iu0ZDOETTEt0ajkYUHKzO1KtkCWFULqeEch1b/vSLKLK2HqlnUUmRU
+          KcuqA7PRsTnR6lBReUPl4VNu2K6lgtrH2TzV9E47riUkK4JetK9W5P2vvznKpzwTOXVc11/Ru5wVVJm9HfAquLQc
+          W3FSq5XQacWUQh9sD2zbvtLmx5bAFYEPAXCiyKXi17+3EwFOsBL+tbptV/rwEJLWRrglCiStxA2GDeV8j7CPylfy
+          xp8K5AhdOh13UuROOo/DcQQ1ekmDZBqeJyezeXp2miSn02Pg6GhwoIBkmWi4Np8dbuZLlHma4UDTPDi4QQsztFCi
+          u8GBHnmwVkkqxMpbi/BAcfwTf9yd9ICpeDjpvuy9620DjEpbOdugfAVaKgqIzRu+UeRHnxtSOpsJF96+BcfsOJai
+          qdeYffkCT0wN21p/4E0AOxPuM3HrIXoQuf/ZyD35EEfjOArn0V6E4PR2e2hWC2NMiuYiRdr1nYnvZRDfHjzAxQP+
+          aOZ1jNuKW8s5IREUnqqM8E0g0cSq8eOJyD45naicllTTTpLyoBuOMX02FZXKXFU8U1A9a8Wp/lQv54KXraRtrvwg
+          FdbraTCLz0/CaZqMw+lAgJ1YwTqZEp6zHFFTwUEOWW/R7vTjuG6Hw4OScmfHQXd7bvDSdR/EpVvfwIZFBFIPKkW1
+          QUSaqgc7gofrYPb4Sova0bKhHiwJXs0OoK/bkdhX5IOwXWktSUbDNY3bUU85FNceQY63uHRa/GxZtMOHUneCuGcY
+          j6JJ9MJNfhyjb1q+41ok5eDJ03juS7n57ByTT3IxmT+feqiUmGP2sLsfoMWbQLd0IlixC15RbooLVh1Srglgii2l
+          +VEb8D7SqK5vNMZdI3G0RQfM44bdZ7RaUOmZtDLB5oK2Gr9aW9R6HSYh1uTj6Vk0Nfn4bPY3dlr7pWOa97fkW+m1
+          Y57qAcqG/Dp4bSz/ATB0NV1j29cbiNCrptRrfITy47YDCMvSWbKSmk7Q/1Mw7nTGHjHZlQTBl6y7Mq5rWW1S5wJE
+          bQotFxpoVev7DfAtBzrRPXe/U9WVVi8W0/ksjvrb9ypOd01POlBbDaEy6rF353jLsJ9lA8PXaxvTepoPLj4LCobh
+          2jJJriQLinUSCWSCf2sa/L69/WABD5TfacN112qFvAl++YD5kGFHk9xj/KvojmnH/mMyG/8VHbVQnIfz8UkaTscn
+          s7hTYHxcMW2Kgn3gdDo5YgkKNUhal2i40eGhCdhf+7eSITPa1lxhrz60+D6+N5xLuxDLChljv7u1PQTRqd1rr32C
+          BHPMQigAH0jr/n5xj8XINO1Yc9DOTcBOp8k8vjB3DM1OZhfxOErxdYKNf2D/9OAlYATuvAGekDeLT49Pp+HkkSzz
+          tHhif4tSlOAG9MT/aGh3d/nzNZio3G3FAXX9B9l7RQgCDgAA
+          ATLAS_E2C_PATCH_BASE64
+          echo 'd2b9ced277233f8387fa3900bdcaf7606216289b7c06e0e09e2ba0d0c706c8f5  nats/server/atlas_e2c_decision_trace_test.go' | sha256sum --check
+          echo '597273d46e1bedf2299ac00087077205e326d4a5cfedba0d1eb93b3c90fb8a58  atlas-e2c-instrument.py' | sha256sum --check
+          test -z "$(gofmt -l nats/server/atlas_e2c_decision_trace_test.go)"
+          {
+            echo 'ATLAS_E2C_PIN=d163ae747ad050ea89054f8fb03c43e64e737aea'
+            echo 'ATLAS_E2C_INPUT_BASELINE_UNMODIFIED=true'
+            echo 'ATLAS_E2C_SCOPE=diagnostic_instrumented_runner_source'
+            go version
+            sha256sum atlas-e2c-original-jetstream_cluster.go nats/server/raft.go nats/server/atlas_e2c_decision_trace_test.go atlas-e2c-instrument.py nats/go.mod
+          } | tee atlas-e2c-inputs.txt
+      - name: Apply six explicitly disclosed LOGGING-ONLY probes in runner copy
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 atlas-e2c-instrument.py | tee atlas-e2c-patch-info.txt
+          git -C nats diff -- server/jetstream_cluster.go > atlas-e2c-diagnostic-source.diff
+          test -s atlas-e2c-diagnostic-source.diff
+          test -z "$(gofmt -l nats/server/jetstream_cluster.go)"
+          test "$(git -C nats diff --name-only)" = 'server/jetstream_cluster.go'
+          cp nats/server/jetstream_cluster.go atlas-e2c-instrumented-jetstream_cluster.go
+          sha256sum nats/server/jetstream_cluster.go atlas-e2c-diagnostic-source.diff | tee -a atlas-e2c-patch-info.txt
+          echo 'ATLAS_E2C_DIAGNOSTIC_DIFF_ONLY=server/jetstream_cluster.go' | tee -a atlas-e2c-patch-info.txt
+      - name: Run one five-server E2C diagnostic test
+        id: diagnostic
+        shell: bash
+        working-directory: nats
+        env:
+          ATLAS_E2C_EVIDENCE_DIR: ${{ github.workspace }}/atlas-e2c-raw
+        run: |
+          set +e
+          set -o pipefail
+          go test ./server -run '^TestAtlasE2CDeletionDecisionTrace$' -count=1 -timeout=20m -covermode=atomic -coverprofile=../atlas-e2c-coverage.out -v > ../atlas-e2c-test.log 2> ../atlas-e2c-stderr.txt
+          rc=$?
+          echo "$rc" > ../atlas-e2c-go-test.exit
+          echo "ATLAS_E2C_GO_TEST_EXIT=$rc"
+          exit "$rc"
+      - name: Classify decision evidence without treating diagnostic as pristine product
+        if: always()
+        shell: bash
+        run: |
+          python3 - <<'PYAUDIT' | tee atlas-e2c-audit.txt
+          from pathlib import Path
+          import re, hashlib
+          log = Path('atlas-e2c-test.log').read_text(errors='replace') if Path('atlas-e2c-test.log').exists() else ''
+          def flagged(label,pattern):
+              val=bool(re.search(pattern,log))
+              print('ATLAS_E2C_CHECK=%s passed=%s'%(label,str(val).lower()))
+              return val
+          print('ATLAS_E2C_SCOPE=instrumented_diagnostic_not_unmodified_upstream')
+          print('ATLAS_E2C_AUTHORISATION=only_DOOMED_deleted_via_client_API')
+          print('ATLAS_E2C_TEST_SHA256=d2b9ced277233f8387fa3900bdcaf7606216289b7c06e0e09e2ba0d0c706c8f5')
+          try: rc=int(Path('atlas-e2c-go-test.exit').read_text().strip())
+          except (ValueError,OSError):rc=-999
+          print('ATLAS_E2C_GO_TEST_EXIT=%d'%rc)
+          checks={
+            'selected_test':flagged('selected_test',r'=== RUN\s+TestAtlasE2CDeletionDecisionTrace\b'),
+            'passed_test':flagged('passed_test',r'--- PASS: TestAtlasE2CDeletionDecisionTrace'),
+            'authorized_delete':flagged('authorized_delete',r'ATLAS_E2C_AUTHORIZED_DELETE stream=DOOMED .*err=nil'),
+            'transfer':flagged('transfer',r'ATLAS_E2C_TRANSFER_PROOF .*payload_identical=true'),
+            'target_identity':flagged('target_identity',r'ATLAS_E2C_LOCAL_META_ASSIGNMENT .*stream=ATLAS .*consistent=true'),
+            'decision_trace':flagged('decision_trace',r'ATLAS_E2C_DECISION_AUDIT .*control_validly_deleted=true ATLAS_protected=true'),
+            'result':flagged('result',r'ATLAS_E2C_VERDICT=LEGITIMATE_DELETION_TRACED_ATLAS_PRESERVED'),
+          }
+          print('ATLAS_E2C_TRACE_LIMIT=only_target_logs_and_test_coverage_not_production_no_instrumentation')
+          print('ATLAS_E2C_SAFETY_LIMIT=no_wrong_delete_in_this_control_not_disproof_of_issue_7556')
+          verdict='DIAGNOSTIC_CONTROL_PASS' if rc==0 and all(checks.values()) else 'NOT_PROVEN_OR_FAIL'
+          print('ATLAS_E2C_AUDIT_VERDICT='+verdict)
+          PYAUDIT
+          {
+            echo '=== E2C scope and audit ==='
+            test -f atlas-e2c-audit.txt && cat atlas-e2c-audit.txt || true
+            echo '=== E2C critical test evidence ==='
+            grep -E 'ATLAS_E2C_(VERDICT|DECISION_AUDIT|CONTROL_AFTER|AUTHORIZED_DELETE|TRANSFER_PROOF|METADATA_APPLICATION)|^--- (PASS|FAIL):' atlas-e2c-test.log 2>/dev/null || true
+            echo '=== Instrumentation provenance ==='
+            cat atlas-e2c-patch-info.txt 2>/dev/null || true
+          } | tee atlas-e2c-summary.txt
+          cat atlas-e2c-summary.txt >> "$GITHUB_STEP_SUMMARY"
+      - name: Hash preserved materials
+        if: always()
+        shell: bash
+        run: |
+          find . -maxdepth 2 -type f \( -name 'atlas-e2c-*' -o -name '*snapshot.bin' -o -name '*manifest.tsv' \) -print0 | sort -z | xargs -0 -r sha256sum > atlas-e2c-evidence-sha256.txt
+          cat atlas-e2c-evidence-sha256.txt | tail -n 35
+      - name: Upload complete E2C evidence on success or failure
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: atlas-nats-e2c-explicitly-instrumented-decision-trace
+          path: |
+            atlas-e2c-inputs.txt
+            atlas-e2c-patch-info.txt
+            atlas-e2c-instrument.py
+            atlas-e2c-original-jetstream_cluster.go
+            atlas-e2c-instrumented-jetstream_cluster.go
+            atlas-e2c-diagnostic-source.diff
+            atlas-e2c-test.log
+            atlas-e2c-stderr.txt
+            atlas-e2c-go-test.exit
+            atlas-e2c-coverage.out
+            atlas-e2c-audit.txt
+            atlas-e2c-summary.txt
+            atlas-e2c-evidence-sha256.txt
+            atlas-e2c-raw/**
+            nats/server/atlas_e2c_decision_trace_test.go
+          if-no-files-found: warn
+          retention-days: 14
