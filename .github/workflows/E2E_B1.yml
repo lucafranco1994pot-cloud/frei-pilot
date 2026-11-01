@@ -1,0 +1,280 @@
+# ATLAS E2E-B1: five independent NATS processes, live minority snapshot corruption,
+# SIGKILL on exactly two processes, same-store restart, and post-fault verification.
+# Original upstream commit frozen; no product source patching or legitimate Delete.
+# Diagnostic only. No assertion that nats-io/nats-server #7556 is reproduced or fixed.
+# Embedded Python driver SHA-256: 1f1d162777b9fa6f1ab5715bdbbfd6f5adaf7dde23d86717a073586db1cbed98
+# Embedded Go client SHA-256: 7e12fca62893a0709c4c701dcfc586981278db5bec478e19f317a626c394a49a
+name: ATLAS NATS E2E B1 External Process Crash Control
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  five-real-processes:
+    runs-on: ubuntu-latest
+    timeout-minutes: 32
+    env:
+      GOTOOLCHAIN: auto
+    steps:
+      - name: Checkout exactly frozen NATS original
+        uses: actions/checkout@v4
+        with:
+          repository: nats-io/nats-server
+          ref: d163ae747ad050ea89054f8fb03c43e64e737aea
+          fetch-depth: 1
+          path: nats
+      - name: Install pinned Go toolchain
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.26.10'
+          cache: false
+      - name: Restore separate test harness and inspect unchanged original source
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C nats rev-parse HEAD)" = d163ae747ad050ea89054f8fb03c43e64e737aea
+          test "$(git -C nats hash-object server/raft.go)" = 3c76b99e9bb0ac863c02e088da2766a1970813e0
+          test "$(git -C nats hash-object server/jetstream_cluster.go)" = d4f7f413367d9f3c122955ce99e9e10da5b8214c
+          test -z "$(git -C nats status --porcelain)"
+          base64 -d <<'ATLAS_E2E_PY_BASE64' | gzip -dc > atlas-e2e-hard-crash.py
+          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
+          ATLAS_E2E_PY_BASE64
+          mkdir -p nats/atlas_e2e_client
+          base64 -d <<'ATLAS_E2E_GO_BASE64' | gzip -dc > nats/atlas_e2e_client/main.go
+          H4sIAAAAAAAC/6VWXXPiNhR9jn/FrWfo2BswhCxpS+sHhiVbdgNkMJ19SDMexRZEWSN5LTkfk/DfeyUZAmmWbKcv2Po699xz
+          z5VpNqE3O+tFMGgPgKQpU+yWQkFJ2hA8e2gm+KqY4JBkjHIVwFgoyEmhQMxh3JtFUOZS4aYlSFEWCQ2cnCRfyYLCkjDuOGyZ
+          C9ztOQduUjzkSjTlNWl3TlycmC+VfgipfxVbUtfBlwVT1+VVkIhlkxMlG0yYZ7AQruM7TiK4VJCIkisI4ajVcpx5yRMTzvPh
+          0Tlgc8go94QMesVC+vBTCMd6/gDjBad5wbjKzHKkUloUdXBLiYS7QFRGZIO2acNmCyZ7+nRXMPzVooBm0m02M5GQ7FpI1dXZ
+          uT6CI97gnimvjYOVc8CTOiA4dENzJugLzmmi1qwu2pd1uzAWU5pUi341N0MtRIlYnVbrnRYmGLEsY1JvTH3fpKjBMTPOshe5
+          zXdS60/G40F/Fg+m08kUard/c9cQ26Z8bCmndE4L4EnQz4SkHk7eyOckkuATVZEptWdIjsj9F8IsSXgH/4/mp2gvw/eWobxj
+          KrmGtYZHlxozIZKCa0vldvFQbEmHcIP70rTi/LMhbQdYjDlbPI7JEqvumgbAmFF5dYNVkF24uERPM754dI0lArSEu8INShTG
+          KAbqlGW0mqnDlOYZQyZd6Kw08X9n/v0KTQe92eDV9Df5d/RoVel3XjnYEo+xc2OLEU4+Y+taImEHpCUXzpGotqgVypjZ6DQX
+          BUj6TVf36Hfz9kdoG8uMDg8t71xvuLi8elDU0+GjKgcbvoHhG7XWcYqs8ZBvaOMNgDnoc1iC8/IKPXHtbWlZh9zs0yqtNXp6
+          AjwG4fYoiOi3kvLEbCox6sl7TwfZLNubBxerIlrG35X6y3S4URpxwlqqYcLa4a1WPKzEx5U62BQMy00VTsxwtS7m+bYOpgy9
+          /uc1bk4eMkHS2N52Ye3+GdpOBVG5xIeX+2/UFkHj3tlZjFcdFvi5kPo+MnWUbNOlN2uHD/lcVCDuf/QjWulDPByfTvZb8pc1
+          bYSWDI9j+wUjuZA6iL2e3w7Tn/w1nsWjYTTqzfp/wkIo1M4qtQ25E/jXjV4/5t+lXDyb8SNVCOhten7LVK85Es9uORJH+xy5
+          W1e9+QNRxHx/dpd+vJn8NwxtRNzx80sfv7DwbxsL73Pc+TDWyCFaTrsHPwykzFR37yeUf+XijmPf6L8Lr3wRV84/Ku7Dg2wI
+          AAA=
+          ATLAS_E2E_GO_BASE64
+          printf '%s\n' '1f1d162777b9fa6f1ab5715bdbbfd6f5adaf7dde23d86717a073586db1cbed98  atlas-e2e-hard-crash.py' '7e12fca62893a0709c4c701dcfc586981278db5bec478e19f317a626c394a49a  nats/atlas_e2e_client/main.go' | sha256sum --check
+          python3 -m py_compile atlas-e2e-hard-crash.py
+          test -z "$(gofmt -l nats/atlas_e2e_client/main.go)"
+          test -z "$(git -C nats diff --name-only)"
+          {
+            echo 'ATLAS_E2E_BASELINE=d163ae747ad050ea89054f8fb03c43e64e737aea'
+            echo 'ATLAS_E2E_SOURCE_MODIFICATIONS=NONE'
+            echo 'ATLAS_E2E_ARCHITECTURE=5_independent_nats-server_OS_processes'
+            echo 'ATLAS_E2E_CORRUPTION=two_real_single_bit_writes_verified_and_fsynced'
+            echo 'ATLAS_E2E_CRASH=two_SIGKILL_and_same_store_restart'
+            go version
+            sha256sum atlas-e2e-hard-crash.py nats/atlas_e2e_client/main.go nats/server/raft.go nats/server/jetstream_cluster.go nats/go.mod
+          } | tee atlas-e2e-inputs.txt
+      - name: Build exact frozen server binary and additive independent Go client
+        shell: bash
+        run: |
+          set -euo pipefail
+          (cd nats && go build -o ../atlas-e2e-server .)
+          (cd nats && go build -o ../atlas-e2e-client ./atlas_e2e_client)
+          test -x atlas-e2e-server
+          test -x atlas-e2e-client
+          ./atlas-e2e-server -v | tee atlas-e2e-server-version.txt
+          sha256sum atlas-e2e-server atlas-e2e-client | tee atlas-e2e-binary-hashes.txt
+          test -z "$(git -C nats diff --name-only)"
+      - name: Execute exactly one bounded external-process fault schedule
+        shell: bash
+        env:
+          ATLAS_E2E_WORK_DIR: ${{ github.workspace }}/atlas-e2e-work
+          ATLAS_E2E_EVIDENCE_DIR: ${{ github.workspace }}/atlas-e2e-raw
+          ATLAS_E2E_SERVER_BIN: ${{ github.workspace }}/atlas-e2e-server
+          ATLAS_E2E_CLIENT_BIN: ${{ github.workspace }}/atlas-e2e-client
+        run: |
+          set +e
+          python3 atlas-e2e-hard-crash.py > atlas-e2e-test.log 2> atlas-e2e-test-stderr.txt
+          rc=$?
+          printf '%s\n' "$rc" > atlas-e2e-driver.exit
+          echo "ATLAS_E2E_DRIVER_EXIT=$rc"
+          exit "$rc"
+      - name: Audit executed operations and explicitly classify partial evidence
+        if: always()
+        shell: bash
+        run: |
+          python3 - <<'ATLAS_E2E_AUDIT' | tee atlas-e2e-audit.txt
+          import json,hashlib
+          from pathlib import Path
+          root=Path('.')
+          evidence=root/'atlas-e2e-raw'
+          try:
+              data=json.loads((evidence/'result.json').read_text())
+          except (FileNotFoundError,ValueError) as e:
+              data={'verdict':'BLOCKED_NO_RESULT_JSON','failure':str(e),'observations':{},'preconditions':{}}
+          try: rc=int((root/'atlas-e2e-driver.exit').read_text().strip())
+          except (OSError,ValueError): rc=-999
+          obs=data.get('observations',{})
+          prec=data.get('preconditions',{})
+          mutations=obs.get('mutations',{})
+          exits=obs.get('hard_crash_exitcodes',{})
+          log=obs.get('log_evidence',{})
+          mreads=obs.get('majority_read_while_minority_down',{})
+          healthy=['S-1','S-4','S-5']
+          checks={
+           'frozen_source_unchanged':(root/'atlas-e2e-inputs.txt').exists() and 'ATLAS_E2E_SOURCE_MODIFICATIONS=NONE' in (root/'atlas-e2e-inputs.txt').read_text(),
+           'two_verified_single_bit_faults':set(mutations)=={'S-2','S-3'} and all(x['exactly_one_bit'] and x['running'] for x in mutations.values()),
+           'two_genuine_sigkill_exits':exits=={'S-2':-9,'S-3':-9},
+           '100_confirmed_original_writes':prec.get('100_confirmed_acks') is True and (evidence/'ack-manifest.txt').is_file(),
+           'five_initial_local_store_dirs':prec.get('five_stream_directories') is True,
+           'three_healthy_read_during_crashes':set(mreads)==set(healthy) and all(mreads[n]==0 for n in healthy),
+           'three_healthy_stores_after':obs.get('safe_majority_stores') is True,
+           'three_healthy_reads_after':obs.get('healthy_three_routed_api_readable') is True,
+           'no_protected_stream_directory_erasure':obs.get('protected_stream_directories_erased')==[],
+           'corrupt_snapshot_read_error_observed':obs.get('actual_corrupt_snapshot_read_error_logged') is True,
+           'driver_exit_zero':rc==0,
+           'guard_verdict':data.get('verdict')=='CORRUPT_SNAPSHOT_REJECTED_NO_UNAUTHORIZED_ERASURE_OBSERVED',
+          }
+          print('ATLAS_E2E_DRIVER_EXIT='+str(rc))
+          print('ATLAS_E2E_HARNESS_VERDICT='+str(data.get('verdict')))
+          for k,v in checks.items():print('ATLAS_E2E_CHECK='+k+' passed='+str(v).lower())
+          print('ATLAS_E2E_AUDIT_VERDICT='+('SAFE_CRASH_CONTROL_PASS' if all(checks.values()) else 'BLOCKED_OR_RED_CANDIDATE_REVIEW_EVIDENCE'))
+          print('ATLAS_E2E_LIMIT=process_failure_and_snapshot_placement_only_no_mandated_meta_leader_election')
+          print('ATLAS_E2E_LIMIT=not_a_reproduction_or_fix_of_issue_7556')
+          ATLAS_E2E_AUDIT
+          {
+            cat atlas-e2e-audit.txt
+            grep -E '^ATLAS_E2E_(CONFIG_READY|ACKS|BITFLIP|KILL_VERIFIED|RESTART_ATTEMPT|MAJORITY_DURING_CRASH|DISK_STATE|LOG_SUMMARY|API_RESULT|VERDICT|BLOCKED|FINAL)' atlas-e2e-test.log 2>/dev/null || true
+          } | tee atlas-e2e-summary.txt
+          cat atlas-e2e-summary.txt >> "$GITHUB_STEP_SUMMARY"
+      - name: Hash and verify all collected human-readable and raw evidence
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'ATLAS_E2E_HASH'
+          from pathlib import Path
+          import hashlib
+          root=Path('.')
+          manifest=root/'atlas-e2e-evidence-sha256.txt'
+          excluded={manifest,root/'atlas-e2e-manifest-check.txt'}
+          files={p for p in root.glob('atlas-e2e-*') if p.is_file() and p not in excluded and p.suffix not in ('.pyc',)}
+          raw=root/'atlas-e2e-raw'
+          if raw.exists():files.update(p for p in raw.rglob('*') if p.is_file())
+          goclient=root/'nats/atlas_e2e_client/main.go'
+          if goclient.is_file():files.add(goclient)
+          required=['atlas-e2e-inputs.txt','atlas-e2e-test.log','atlas-e2e-driver.exit','atlas-e2e-audit.txt','atlas-e2e-summary.txt','atlas-e2e-server-version.txt','atlas-e2e-binary-hashes.txt','atlas-e2e-hard-crash.py','nats/atlas_e2e_client/main.go']
+          missing=[name for name in required if not (root/name).is_file()]
+          manifest.write_text(''.join(f'{hashlib.sha256(p.read_bytes()).hexdigest()}  {p.as_posix()}\n' for p in sorted(files)),encoding='utf8')
+          print('ATLAS_E2E_MANIFEST_SELF_INCLUDED='+str(manifest in files).lower())
+          print('ATLAS_E2E_MANIFEST_FILE_COUNT='+str(len(files)))
+          print('ATLAS_E2E_MISSING_REQUIRED='+(','.join(missing) if missing else 'NONE'))
+          if missing:raise SystemExit(3)
+          ATLAS_E2E_HASH
+          sha256sum --check atlas-e2e-evidence-sha256.txt | tee atlas-e2e-manifest-check.txt
+      - name: Preserve all captured evidence even if the experiment fails
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: atlas-nats-e2e-b1-five-real-processes-evidence
+          path: |
+            atlas-e2e-inputs.txt
+            atlas-e2e-server-version.txt
+            atlas-e2e-binary-hashes.txt
+            atlas-e2e-hard-crash.py
+            nats/atlas_e2e_client/main.go
+            atlas-e2e-test.log
+            atlas-e2e-test-stderr.txt
+            atlas-e2e-driver.exit
+            atlas-e2e-audit.txt
+            atlas-e2e-summary.txt
+            atlas-e2e-evidence-sha256.txt
+            atlas-e2e-manifest-check.txt
+            atlas-e2e-raw/**
+          if-no-files-found: warn
+          retention-days: 14
+      - name: Mandatory final classification and integrity gate
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          grep -Fxq 'ATLAS_E2E_AUDIT_VERDICT=SAFE_CRASH_CONTROL_PASS' atlas-e2e-audit.txt
+          test -s atlas-e2e-evidence-sha256.txt
+          test -s atlas-e2e-manifest-check.txt
+          sha256sum --check atlas-e2e-evidence-sha256.txt >/dev/null
+          echo 'ATLAS_E2E_FINAL_GATE=PASS'
