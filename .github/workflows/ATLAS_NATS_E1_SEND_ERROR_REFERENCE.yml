@@ -1,7 +1,7 @@
-# ATLAS NATS E1: unchanged upstream regression test at pinned NATS baseline.
-# Verifies that the corrupted-snapshot error path is actually COVERED.
-# Does not assert JetStream metadata/data deletion; E0 is a separate case.
-name: ATLAS NATS E1 Send Error Reference
+# ATLAS NATS E1: execute ONLY unmodified upstream regression at frozen baseline.
+# E0, F1B, F1D remain untouched. No NATS source edits or added Go tests.
+# Scope: 2-server raft TEST state-adder, NOT 5-server JetStream meta or orphan cleanup.
+name: ATLAS NATS E1 Original Snapshot Send Error
 
 on:
   workflow_dispatch:
@@ -10,14 +10,14 @@ permissions:
   contents: read
 
 jobs:
-  upstream-send-error-reference:
+  original-upstream-send-error:
     runs-on: ubuntu-latest
-    timeout-minutes: 25
+    timeout-minutes: 24
     env:
       GOTOOLCHAIN: auto
-      EVIDENCE_DIR: ${{ github.workspace }}/atlas_e1_evidence
+      E1_TEST: TestNRGNoLogResetOnCorruptedSendToFollower
     steps:
-      - name: Checkout frozen NATS sources (no modifications)
+      - name: Checkout frozen NATS commit
         uses: actions/checkout@v4
         with:
           repository: nats-io/nats-server
@@ -25,87 +25,173 @@ jobs:
           fetch-depth: 1
           path: nats
 
-      - name: Install upstream Go toolchain
+      - name: Set up baseline Go
         uses: actions/setup-go@v5
         with:
           go-version: '1.26.10'
           cache: false
 
-      - name: Verify frozen inputs
+      - name: Verify original test exists and capture input identity
+        id: verify
         shell: bash
         run: |
           set -euo pipefail
-          mkdir -p "$EVIDENCE_DIR"
-          git -C nats rev-parse HEAD | tee "$EVIDENCE_DIR/product_commit.txt"
-          test "$(cat "$EVIDENCE_DIR/product_commit.txt")" = d163ae747ad050ea89054f8fb03c43e64e737aea
-          test "$(git -C nats hash-object server/raft_test.go)" = b1f2a83a77258c097faf8fedda3cda0943d76734
+          test "$(git -C nats rev-parse HEAD)" = d163ae747ad050ea89054f8fb03c43e64e737aea
           test "$(git -C nats hash-object server/raft.go)" = 3c76b99e9bb0ac863c02e088da2766a1970813e0
-          test "$(git -C nats hash-object go.mod)" = 5c0538ad934c66f5de5820d1a9111f503b149837
+          test "$(git -C nats hash-object server/raft_test.go)" = b1f2a83a77258c097faf8fedda3cda0943d76734
           test -z "$(git -C nats status --porcelain)"
-          echo "ATLAS_E1_INPUTS=FROZEN_UPSTREAM_UNMODIFIED" | tee "$EVIDENCE_DIR/inputs.txt"
+          {
+            echo 'ATLAS_E1_BASELINE=d163ae747ad050ea89054f8fb03c43e64e737aea'
+            echo 'ATLAS_E1_ORIGINAL_TEST_BLOB=b1f2a83a77258c097faf8fedda3cda0943d76734'
+            echo 'ATLAS_E1_PRODUCT_RAFT_BLOB=3c76b99e9bb0ac863c02e088da2766a1970813e0'
+            echo "ATLAS_E1_GO=$(go version)"
+            echo 'ATLAS_E1_SOURCE_SHA256:'
+            sha256sum nats/server/raft.go nats/server/raft_test.go nats/go.mod
+            echo 'ATLAS_E1_WORKTREE_CLEAN=true'
+          } | tee atlas-e1-inputs.txt
+          # A Go package may PASS even when -run selected zero tests. Check exact name.
+          set +e
+          (cd nats && go test ./server -list '^TestNRGNoLogResetOnCorruptedSendToFollower$') > atlas-e1-test-list.txt 2> atlas-e1-list-stderr.txt
+          rc=$?
+          set -e
+          if [ "$rc" -ne 0 ]; then
+            echo "ATLAS_E1_TEST_SELECTION=BLOCKED list_exit=$rc" | tee -a atlas-e1-inputs.txt
+            exit 4
+          fi
+          if [ "$(grep -Fxc "$E1_TEST" atlas-e1-test-list.txt || true)" != 1 ]; then
+            echo 'ATLAS_E1_TEST_SELECTION=BLOCKED missing_or_duplicate_name' | tee -a atlas-e1-inputs.txt
+            exit 4
+          fi
+          echo 'ATLAS_E1_TEST_SELECTION=EXACT_MATCH' | tee -a atlas-e1-inputs.txt
+          # Archive exact original upstream files; no modifications.
+          cp nats/server/raft.go atlas-e1-original-raft.go
+          cp nats/server/raft_test.go atlas-e1-original-raft_test.go
+          cp nats/go.mod atlas-e1-original-go.mod
 
-      - name: Run original upstream regression test once with branch coverage
+      - name: Execute one unchanged upstream regression test
+        id: run_original
+        if: steps.verify.outcome == 'success'
+        working-directory: nats
         shell: bash
         run: |
-          set -euo pipefail
-          cd nats
-          go test ./server -run '^TestNRGNoLogResetOnCorruptedSendToFollower$' -count=1 -timeout=8m -v -covermode=atomic -coverprofile="$EVIDENCE_DIR/coverage.out" 2>&1 | tee "$EVIDENCE_DIR/upstream_test.log"
+          set +e
+          go test ./server \
+            -run '^TestNRGNoLogResetOnCorruptedSendToFollower$' \
+            -count=1 \
+            -timeout=10m \
+            -covermode=atomic \
+            -coverprofile=../atlas-e1.cover.out \
+            -json > ../atlas-e1-test.jsonl 2> ../atlas-e1-stderr.txt
+          rc=$?
+          echo "$rc" > ../atlas-e1-go-test.exit
+          echo "ATLAS_E1_GO_TEST_EXIT=$rc"
+          exit "$rc"
 
-      - name: Prove error branch executed and WAL reset absent
-        shell: bash
-        run: |
-          set -euo pipefail
-          python3 - <<'PY' | tee "$EVIDENCE_DIR/audit.log"
-          from pathlib import Path
-          import re, sys
-
-          source = Path("nats/server/raft.go").read_text()
-          marker = "func (n *raft) sendSnapshotToFollower("
-          if source.count(marker) != 1:
-              sys.exit("ATLAS_E1_VERDICT=BLOCKED_FUNCTION_IDENTITY")
-          start = source.index(marker)
-          end = source.find("\nfunc ", start + len(marker))
-          fn = source[start:end if end != -1 else None]
-          branch = ("if err != nil {\n"
-                    "\t\t// We need to stepdown here when this happens.\n"
-                    "\t\tn.stepdownLocked(noLeader)\n"
-                    "\t\treturn 0, err\n"
-                    "\t}")
-          if branch not in fn:
-              sys.exit("ATLAS_E1_VERDICT=BLOCKED_ERROR_BRANCH_SOURCE")
-          target = source[:start].count("\n") + fn[:fn.index("n.stepdownLocked(noLeader)" )].count("\n") + 1
-          pat = re.compile(r"^(.+):(\d+)\.(\d+),(\d+)\.(\d+)\s+(\d+)\s+(\d+)$")
-          matching = []
-          for line in Path("atlas_e1_evidence/coverage.out").read_text().splitlines()[1:]:
-              m = pat.match(line)
-              if not m or not m.group(1).endswith("/server/raft.go"):
-                  continue
-              first, last, stmts, hits = int(m.group(2)), int(m.group(4)), int(m.group(6)), int(m.group(7))
-              if first <= target <= last and stmts > 0:
-                  matching.append((first, last, stmts, hits))
-          if not matching or max(row[3] for row in matching) == 0:
-              sys.exit(f"ATLAS_E1_VERDICT=BLOCKED_ERROR_BRANCH_NOT_COVERED target_line={target} intervals={matching}")
-          log = Path("atlas_e1_evidence/upstream_test.log").read_text()
-          if not re.search(r"--- PASS: TestNRGNoLogResetOnCorruptedSendToFollower", log):
-              sys.exit("ATLAS_E1_VERDICT=BLOCKED_UPSTREAM_TEST_NOT_PASSED")
-          print(f"ATLAS_E1_ERROR_BRANCH_LINE={target} intervals={matching}")
-          print("ATLAS_E1_VERDICT=UPSTREAM_TEST_PASS_ERROR_BRANCH_COVERED_NO_RESET_WAL")
-          print("ATLAS_E1_SCOPE=SEPARATE_TEST_RAFT_GROUP_NOT_META_SNAPSHOT_DELETE")
-          PY
-          test -z "$(git -C nats status --porcelain)"
-
-      - name: Hash and preserve original evidence even on failure
+      - name: Audit exact test events and snapshot-load error branch
         if: always()
         shell: bash
         run: |
-          mkdir -p "$EVIDENCE_DIR"
-          (cd "$EVIDENCE_DIR"; find . -maxdepth 1 -type f ! -name SHA256SUMS.txt -printf '%f\n' | sort | xargs -r sha256sum > SHA256SUMS.txt)
-          cat "$EVIDENCE_DIR/SHA256SUMS.txt"
+          set -euo pipefail
+          python3 - <<'PY' | tee atlas-e1-audit.txt
+          import hashlib, json, re, subprocess, sys
+          from pathlib import Path
 
-      - name: Upload E1 evidence
+          test = 'TestNRGNoLogResetOnCorruptedSendToFollower'
+          src = Path('nats/server/raft.go')
+          testsrc = Path('nats/server/raft_test.go')
+          jsonl = Path('atlas-e1-test.jsonl')
+          cov = Path('atlas-e1.cover.out')
+          rcfile = Path('atlas-e1-go-test.exit')
+          reasons = []
+          print('ATLAS_E1_SCOPE=original_2_server_Raft_TEST_group_not_JetStream_meta')
+          print('ATLAS_E1_BASELINE=d163ae747ad050ea89054f8fb03c43e64e737aea')
+          for f in (src, testsrc, jsonl, cov, rcfile):
+              digest = hashlib.sha256(f.read_bytes()).hexdigest() if f.exists() else 'ABSENT'
+              print('ATLAS_E1_FILE=%s sha256=%s' % (f, digest))
+          listing = Path('atlas-e1-test-list.txt')
+          exact_selected = listing.exists() and listing.read_text().splitlines().count(test) == 1
+          print('ATLAS_E1_EXACT_TEST_SELECTED=%s' % str(exact_selected).lower())
+          if not exact_selected: reasons.append('test_not_selected')
+
+          events = []
+          skipped_nonjson = 0
+          if jsonl.exists():
+              for line in jsonl.read_text(errors='replace').splitlines():
+                  try: obj = json.loads(line)
+                  except ValueError:
+                      skipped_nonjson += 1
+                      continue
+                  if isinstance(obj, dict): events.append(obj)
+          actions = [e.get('Action') for e in events if e.get('Test') == test]
+          try: rc = int(rcfile.read_text().strip())
+          except (OSError, ValueError): rc = None
+          passed = (rc == 0 and actions.count('run') == 1 and actions.count('pass') == 1
+                    and actions.count('fail') == 0 and actions.count('skip') == 0)
+          print('ATLAS_E1_JSON_EVENTS=%d non_json=%d' % (len(events), skipped_nonjson))
+          print('ATLAS_E1_TEST_EVENT_COUNTS run=%d pass=%d fail=%d skip=%d' %
+                tuple(actions.count(x) for x in ('run','pass','fail','skip')))
+          print('ATLAS_E1_GO_TEST_EXIT=%s' % rc)
+          print('ATLAS_E1_ORIGINAL_TEST_PASSED=%s' % str(passed).lower())
+          if not passed: reasons.append('original_test_not_passed')
+
+          profile = []
+          mode = 'MISSING'
+          if cov.exists():
+              lines = cov.read_text().splitlines()
+              mode = lines[0] if lines else 'EMPTY'
+              for line in lines[1:]:
+                  m = re.fullmatch(r'(.+):([0-9]+)\.([0-9]+),([0-9]+)\.([0-9]+)\s+([0-9]+)\s+([0-9]+)', line)
+                  if m:
+                      profile.append((m.group(1), int(m.group(2)), int(m.group(4)), int(m.group(7))))
+          print('ATLAS_E1_COVERAGE_MODE=%s blocks=%d' % (mode, len(profile)))
+          if mode != 'mode: atomic': reasons.append('missing_atomic_coverage')
+          source_lines = src.read_text().splitlines() if src.exists() else []
+          def line_for(needle, lo, hi):
+              matches = [i+1 for i in range(lo-1, min(hi, len(source_lines))) if needle in source_lines[i]]
+              if len(matches) != 1:
+                  reasons.append('ambiguous_original_source_line')
+                  return None
+              return matches[0]
+          load = line_for('snap, err := n.loadLastSnapshot()', 3895, 3900)
+          stepdown = line_for('n.stepdownLocked(noLeader)', 3897, 3901)
+          error_return = line_for('return 0, err', 3897, 3901)
+          send = line_for('n.sendRPC(subject, n.areply, encoding)', 3900, 3920)
+          def covered(n):
+              return n is not None and any(count > 0 for p, start, end, count in profile
+                                           if p.endswith('/server/raft.go') and start <= n <= end)
+          result = dict(snapshot_load=covered(load), error_stepdown=covered(stepdown),
+                        error_return=covered(error_return), successful_send=covered(send))
+          for k,v in result.items(): print('ATLAS_E1_PATH=%s executed=%s' % (k, str(v).lower()))
+          branch = result['snapshot_load'] and result['error_stepdown'] and result['error_return']
+          print('ATLAS_E1_SNAPSHOT_LOAD_ERROR_BRANCH_PROVEN=%s' % str(branch).lower())
+          print('ATLAS_E1_COVERAGE_LIMIT=whole_test_not_per_node_trace')
+          if not branch: reasons.append('snapshot_load_error_branch_not_proven')
+          git = subprocess.run(['git','-C','nats','status','--porcelain'], capture_output=True, text=True)
+          clean = git.returncode == 0 and not git.stdout.strip()
+          print('ATLAS_E1_ORIGINAL_SOURCE_UNMODIFIED=%s' % str(clean).lower())
+          if not clean: reasons.append('upstream_worktree_modified')
+          verdict = 'UPSTREAM_REGRESSION_AND_SEND_ERROR_BRANCH_PROVEN' if not reasons else 'BLOCKED_OR_FAILED'
+          print('ATLAS_E1_VERDICT=%s' % verdict)
+          if reasons: print('ATLAS_E1_UNMET=' + ','.join(reasons))
+          sys.exit(0 if not reasons else 3)
+          PY
+
+      - name: Preserve original test sources, logs and audit even if failed
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: atlas-nats-e1-original-reference
-          path: atlas_e1_evidence/
+          name: atlas-nats-e1-original-snapshot-send-regression
+          path: |
+            atlas-e1-inputs.txt
+            atlas-e1-test-list.txt
+            atlas-e1-list-stderr.txt
+            atlas-e1-test.jsonl
+            atlas-e1-stderr.txt
+            atlas-e1-go-test.exit
+            atlas-e1.cover.out
+            atlas-e1-audit.txt
+            atlas-e1-original-raft.go
+            atlas-e1-original-raft_test.go
+            atlas-e1-original-go.mod
           if-no-files-found: warn
+          retention-days: 14
