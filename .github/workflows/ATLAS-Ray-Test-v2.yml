@@ -1,0 +1,380 @@
+name: ATLAS Ray 66917 A-B No Replay v2
+'on':
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  compare-original-and-no-replay:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 50
+    steps:
+      - name: Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install pinned original Ray
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p evidence
+          python -VV | tee evidence/python.txt
+          python -m pip install --disable-pip-version-check --no-cache-dir 'ray[data]==2.58.0' 'numpy>=2,<3'
+          python -m pip freeze > evidence/dependencies.txt
+      - name: Prepare both variants from one pinned source
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > evidence/baseline.py <<'PYBASE'
+          """Ray #66917: strict original-system reproduction / classification.
+
+          Based on the issue author's public 40-group reproduction. Requires genuine
+          ray[data]==2.58.0 on Linux; no exchange/API credentials. One attempt per
+          process. A missing-row success is RED only if Core's replay-inconsistency
+          error is also found in the original Ray process logs.
+
+          This file intentionally does NOT patch Ray. It is a baseline / RED test.
+          """
+          from collections import Counter
+          import glob
+          import os
+          import sys
+          import tempfile
+          import threading
+          import time
+
+          os.environ.setdefault("RAY_DEDUP_LOGS", "0")
+
+          import ray
+          from ray.cluster_utils import Cluster
+          from ray.data.context import DataContext
+
+          N_GROUPS = 40
+          ROWS_PER_GROUP = 4
+          TARGET = 1 * 1024 * 1024
+          SLICE_AT = int(1.5 * TARGET)
+          PAYLOAD_FIRST = SLICE_AT // ROWS_PER_GROUP - 8 * 1024
+          PAYLOAD_REPLAY = PAYLOAD_FIRST + 16 * 1024
+          MARKER_DIR = tempfile.mkdtemp(prefix="atlas_ray_66917_")
+          OSM = 300 * 1024 * 1024
+
+
+          def produce(batch):
+              gid = int(batch["id"][0])
+              marker = os.path.join(MARKER_DIR, str(gid))
+              first = not os.path.exists(marker)
+              if first:
+                  open(marker, "w").close()
+              size = PAYLOAD_FIRST if first else PAYLOAD_REPLAY
+              print(f"PRODUCE gid={gid} first={first} bytes_per_row={size}", flush=True)
+              return {
+                  "id": [gid * ROWS_PER_GROUP + j for j in range(ROWS_PER_GROUP)],
+                  "group": [gid] * ROWS_PER_GROUP,
+                  "payload": [b"x" * size] * ROWS_PER_GROUP,
+              }
+
+
+          def consume(batch):
+              print(f"CONSUME groups={sorted(set(map(int, batch['group'])))} rows={len(batch['id'])}", flush=True)
+              time.sleep(0.5)
+              return {"id": batch["id"], "group": batch["group"]}
+
+
+          def core_errors(session_dir):
+              hits = []
+              for path in glob.glob(os.path.join(session_dir, "logs", "**", "*"), recursive=True):
+                  if not os.path.isfile(path):
+                      continue
+                  try:
+                      with open(path, errors="replace") as f:
+                          for line in f:
+                              if "STREAMING_GENERATOR_REPLAY_INCONSISTENT" in line or (
+                                  "re-executed and produced" in line and "expected" in line
+                              ):
+                                  hits.append((os.path.basename(path), line.strip()[:450]))
+                  except OSError:
+                      pass
+              return hits
+
+
+          def main():
+              print("RAY_VERSION", ray.__version__, flush=True)
+              assert ray.__version__ == "2.58.0", "Only the reported version is accepted"
+              cluster = Cluster(
+                  initialize_head=True,
+                  head_node_args={"num_cpus": 0, "object_store_memory": OSM},
+              )
+              rows = None
+              raised = None
+              session_dir = None
+              try:
+                  ray.init(address=cluster.address, log_to_driver=True)
+                  session_dir = ray._private.worker.global_worker.node.get_session_dir_path()
+                  p1 = cluster.add_node(
+                      num_cpus=4, resources={"producer": 4}, object_store_memory=OSM
+                  )
+                  cluster.add_node(
+                      num_cpus=4, resources={"producer": 4}, object_store_memory=OSM
+                  )
+                  cluster.add_node(
+                      num_cpus=1, resources={"consumer": 1}, object_store_memory=OSM
+                  )
+                  cluster.wait_for_nodes()
+                  ctx = DataContext.get_current()
+                  ctx.target_max_block_size = TARGET
+                  ctx.max_errored_blocks = 0
+                  ds = ray.data.range(N_GROUPS, override_num_blocks=N_GROUPS)
+                  ds = ds.map_batches(produce, batch_size=None, resources={"producer": 1})
+                  ds = ds.map_batches(consume, batch_size=None, resources={"consumer": 1})
+
+                  def kill_worker():
+                      time.sleep(float(os.environ.get("KILL_AFTER_S", "4")))
+                      print("KILLING_PRODUCER", p1.node_id, flush=True)
+                      cluster.remove_node(p1, allow_graceful=False)
+                      print("PRODUCER_REMOVAL_CONFIRMED", p1.node_id, flush=True)
+
+                  threading.Thread(target=kill_worker, daemon=True).start()
+                  try:
+                      rows = ds.take_all()
+                  except Exception as ex:
+                      raised = f"{type(ex).__name__}: {str(ex)[:400]}"
+                      print("DATASET_RAISED", raised, flush=True)
+                      chain = []
+                      cur = ex
+                      seen = set()
+                      while cur is not None and id(cur) not in seen and len(chain) < 10:
+                          seen.add(id(cur))
+                          chain.append(type(cur).__name__)
+                          cur = cur.__cause__ if cur.__cause__ is not None else cur.__context__
+                      print("DATASET_ERROR_CHAIN", ",".join(chain), flush=True)
+                  # Give Core a brief interval to flush the failure record before reading logs.
+                  time.sleep(1)
+                  hits = core_errors(session_dir)
+                  for path, msg in hits[:15]:
+                      print("CORE_ERROR", path, msg, flush=True)
+                  if rows is None:
+                      outcome = "RAISED_REPLAY_ERROR" if (
+                          raised and "StreamingGeneratorReplayInconsistentError" in raised
+                      ) else "RAISED_OTHER_ERROR"
+                      print("ATLAS_CASE", outcome, "CORE_HITS", len(hits), flush=True)
+                      return 0 if outcome == "RAISED_REPLAY_ERROR" else 3
+                  ids = [int(row["id"]) for row in rows]
+                  expected = set(range(N_GROUPS * ROWS_PER_GROUP))
+                  missing = sorted(expected - set(ids))
+                  duplicates = len(ids) - len(set(ids))
+                  unexpected = sorted(set(ids) - expected)
+                  # Check the complete row multiset, including its group relation.
+                  expected_pairs = Counter((i, i // ROWS_PER_GROUP) for i in range(N_GROUPS * ROWS_PER_GROUP))
+                  actual_pairs = Counter((int(row["id"]), int(row["group"])) for row in rows)
+                  missing_pairs = list((expected_pairs - actual_pairs).elements())
+                  extra_pairs = list((actual_pairs - expected_pairs).elements())
+                  group_mismatch = sorted((i, g) for i, g in extra_pairs if i in expected and g != i // ROWS_PER_GROUP)
+                  counter_ok = actual_pairs == expected_pairs
+                  assert (not missing_pairs and not extra_pairs) == counter_ok
+                  print(
+                      "DATASET_COMPLETED", "rows", len(ids), "expected", len(expected),
+                      "missing", missing, "duplicates", duplicates, "unexpected", unexpected,
+                      "group_mismatch", group_mismatch, "multiset_ok", counter_ok,
+                      flush=True,
+                  )
+                  if not counter_ok:
+                      outcome = "RED_CONFIRMED" if missing and hits else "DATA_INTEGRITY_FAILURE_UNATTRIBUTED"
+                  else:
+                      outcome = "NO_DATA_LOSS_OBSERVED"
+                  print("ATLAS_CASE", outcome, "CORE_HITS", len(hits), flush=True)
+                  return 1 if outcome == "RED_CONFIRMED" else (3 if not counter_ok else 2)
+              finally:
+                  try:
+                      ray.shutdown()
+                  finally:
+                      cluster.shutdown()
+
+
+          if __name__ == "__main__":
+              try:
+                  sys.exit(main())
+              except BaseException as ex:
+                  print("ATLAS_CASE", "INFRA_OR_UNHANDLED_ERROR", repr(ex), flush=True)
+                  raise
+          PYBASE
+          cat > evidence/classify.py <<'PYCLASS'
+          """Strict outcome classification for Ray #66917.
+
+          Classifies the combination of emitted dataset rows and Ray Core replay failures
+          from the SAME attempt's process log. A task-level causal link still requires
+          additional instrumentation and must NOT be inferred from this classifier.
+          """
+          import ast
+          import re
+          import sys
+          from pathlib import Path
+
+
+          COMPLETED = re.compile(
+              r"^DATASET_COMPLETED\s+rows\s+(\d+)\s+expected\s+(\d+)\s+"
+              r"missing\s+(\[[^\n]*?\])\s+duplicates\s+(-?\d+)\s+unexpected\s+(\[[^\n]*?\])\s+"
+              r"group_mismatch\s+(\[[^\n]*?\])\s+multiset_ok\s+(True|False)\s*$",
+              flags=re.MULTILINE,
+          )
+          CORE_REPLAY = re.compile(
+              r"STREAMING_GENERATOR_REPLAY_INCONSISTENT|"
+              r"(?:Streaming generator task\s+[0-9a-f]+\s+was re-executed and produced\s+\d+\s+objects, expected\s+\d+)",
+              re.IGNORECASE,
+          )
+
+
+          def classify(log: str, rc: int) -> str:
+              """Return an explicitly scoped status. Never promotes a raised/infra error to RED."""
+              # Prefer structured test results over a stray "missing" word in traceback.
+              matches = COMPLETED.findall(log)
+              if len(matches) == 1 and "DATASET_RAISED" not in log:
+                  row_s, expected_s, missing_s, duplicates_s, unexpected_s, group_s, multiset_s = matches[0]
+                  try:
+                      rows, expected = int(row_s), int(expected_s)
+                      missing = ast.literal_eval(missing_s)
+                      duplicates, unexpected = int(duplicates_s), ast.literal_eval(unexpected_s)
+                      group_mismatch = ast.literal_eval(group_s)
+                      if not all(isinstance(v, list) for v in (missing, unexpected, group_mismatch)):
+                          return "MALFORMED_OUTPUT"
+                  except (ValueError, SyntaxError, TypeError, MemoryError):
+                      return "MALFORMED_OUTPUT"
+                  has_core = bool(CORE_REPLAY.search(log))
+                  if missing or duplicates != 0 or unexpected or group_mismatch or multiset_s != 'True' or rows != expected:
+                      if missing and has_core:
+                          return "RED_COOCCURRENCE_CONFIRMED"
+                      return "DATA_INTEGRITY_FAILURE_UNATTRIBUTED"
+                  return "COMPLETE_WITH_CORE_ERROR" if has_core else "COMPLETE_NO_CORE_ERROR"
+
+              if "DATASET_RAISED" in log:
+                  if re.search(r"^(?:DATASET_RAISED|DATASET_ERROR_CHAIN).*StreamingGeneratorReplayInconsistentError", log, re.MULTILINE):
+                      return "RAISED_REPLAY_ERROR"
+                  return "RAISED_OTHER_ERROR"
+              if rc == 124:
+                  return "TIMEOUT"
+              return "INFRA_OR_MISSING_RESULT"
+
+
+          def main() -> int:
+              if len(sys.argv) != 3:
+                  raise SystemExit("Usage: classify.py /path/to/attempt.log EXIT_CODE")
+              name, rc = sys.argv[1], int(sys.argv[2])
+              status = classify(Path(name).read_text(errors="replace"), rc)
+              print(status)
+              return 0
+
+
+          if __name__ == "__main__":
+              raise SystemExit(main())
+          PYCLASS
+          python - <<'PYSETUP'
+          from pathlib import Path
+          import py_compile
+          p=Path('evidence/baseline.py')
+          src=p.read_text()
+          old='ds = ds.map_batches(produce, batch_size=None, resources={"producer": 1})'
+          new='ds = ds.map_batches(produce, batch_size=None, resources={"producer": 1}, max_retries=0)'
+          assert src.count(old)==1, 'Unanticipated baseline: abort, do not guess'
+          modified=src.replace(old,new)
+          assert modified.replace(new,old)==src, 'Non-reversible patch'
+          Path('evidence/no_replay.py').write_text(modified)
+          for path in ('evidence/baseline.py','evidence/no_replay.py','evidence/classify.py'):
+              py_compile.compile(path,doraise=True)
+          print('Source delta verified: one max_retries=0 argument, nothing else')
+          PYSETUP
+          sha256sum evidence/baseline.py evidence/no_replay.py evidence/classify.py > evidence/code.sha256
+      - name: Run fixed-comparison matrix
+        shell: bash
+        run: |
+          set -euo pipefail
+          printf 'Ray 2.58.0, issue 66917, unchanged baseline; no-replay differs in one argument only\n' > evidence/manifest.txt
+          echo 'Only human-verified results count as repair evidence' >> evidence/manifest.txt
+          printf 'scenario,attempt,exit_code,status,kill_seen,replay_seen,node_loss_error_seen\n' > evidence/results.csv
+          # Both fault-free controls must PASS before any failure is injected.
+          for phase in controls faults; do
+            for scenario in baseline no_replay; do
+              if [[ "$phase" == controls ]]; then
+                attempts=(control)
+              else
+                attempts=(1 2 3 4 5)
+              fi
+              for attempt in "${attempts[@]}"; do
+                kill=4
+                if [[ "$attempt" == control ]]; then kill=600; fi
+              log="evidence/${scenario}-${attempt}.log"
+              set +e
+              KILL_AFTER_S="$kill" timeout 180s python -u "evidence/${scenario}.py" > "$log" 2>&1
+              rc=$?
+              set -e
+              printf '%s\n' "$rc" > "evidence/${scenario}-${attempt}.exitcode"
+              status=$(python evidence/classify.py "$log" "$rc")
+              killed=0; replayed=0
+              if grep -q 'PRODUCER_REMOVAL_CONFIRMED' "$log"; then killed=1; fi
+              if grep -Eq 'PRODUCE gid=[0-9]+ first=False' "$log"; then replayed=1; fi
+              node_loss_error=0
+              # Do not count arbitrary RayTaskError / node-worker failure as proof of a lost object.
+              if grep -Eq '^(DATASET_RAISED|DATASET_ERROR_CHAIN).*(ObjectLostError|ObjectReconstructionFailed[A-Za-z]*Error)' "$log"; then node_loss_error=1; fi
+              echo "RUN scenario=$scenario attempt=$attempt rc=$rc status=$status kill=$killed replay_marker=$replayed" | tee -a evidence/summary.txt
+                printf '%s,%s,%s,%s,%s,%s,%s\n' "$scenario" "$attempt" "$rc" "$status" "$killed" "$replayed" "$node_loss_error" >> evidence/results.csv
+              done
+            done
+            if [[ "$phase" == controls ]]; then
+              python - <<'PYCONTROL'
+          from pathlib import Path
+          import csv
+          records = list(csv.DictReader(Path('evidence/results.csv').open()))
+          controls = [r for r in records if r['attempt'] == 'control']
+          good = len(controls) == 2 and {r['scenario'] for r in controls} == {'baseline', 'no_replay'} and all(
+              r['exit_code'] == '2' and r['status'] == 'COMPLETE_NO_CORE_ERROR' for r in controls
+          )
+          print('ATLAS_CONTROLS', 'PASS' if good else 'FAIL', controls)
+          with Path('evidence/summary.txt').open('a') as f:
+              f.write('CONTROLS=' + ('PASS' if good else 'FAIL') + '\n')
+          if not good:
+              raise SystemExit('INVALID_CONTROLS: fault runs not started')
+          PYCONTROL
+            fi
+          done
+          python - <<'PYRESULTS'
+          from pathlib import Path
+          import csv
+          records=list(csv.DictReader(Path('evidence/results.csv').open()))
+          def lookup(s, a):
+              return next(r for r in records if r['scenario']==s and r['attempt']==str(a))
+          controls=[lookup(s,'control') for s in ('baseline','no_replay')]
+          control_ok=all(r['status']=='COMPLETE_NO_CORE_ERROR' and r['exit_code']=='2' for r in controls)
+          base=[lookup('baseline',i) for i in range(1,6)]
+          no_rep=[lookup('no_replay',i) for i in range(1,6)]
+          red=sum(r['status']=='RED_COOCCURRENCE_CONFIRMED' and r['kill_seen']=='1' and r['replay_seen']=='1' for r in base)
+          unsafe=[r for r in no_rep if r['status'] in ('RED_COOCCURRENCE_CONFIRMED','DATA_INTEGRITY_FAILURE_UNATTRIBUTED','COMPLETE_WITH_CORE_ERROR')]
+          inconclusive=[r for r in no_rep if r['status'] in ('TIMEOUT','INFRA_OR_MISSING_RESULT','MALFORMED_OUTPUT')]
+          propagated=[r for r in no_rep if r['status']=='RAISED_OTHER_ERROR' and r['kill_seen']=='1' and r['replay_seen']=='0' and r['node_loss_error_seen']=='1']
+          if not control_ok: verdict='INVALID_CONTROLS'
+          elif any(r['kill_seen'] != '1' for r in base+no_rep): verdict='BLOCKED_FAILURE_NOT_CONFIRMED'
+          elif unsafe: verdict='NO_REPLAY_UNSAFE_OBSERVED'
+          elif inconclusive: verdict='BLOCKED_INFRA_OR_TIMEOUT'
+          elif red == 0: verdict='INCONCLUSIVE_BASELINE_NOT_REPRODUCED'
+          elif not propagated: verdict='INCONCLUSIVE_NO_REPLAY_NODE_LOSS_NOT_PROVEN'
+          else: verdict='CANDIDATE_MITIGATION_SUPPORTED_FOR_EXPLICIT_OBJECT_LOSS_ONLY'
+          summary=f'CONTROL_OK={control_ok} BASELINE_RED={red}/5 NO_REPLAY_UNSAFE={len(unsafe)}/5 NO_REPLAY_EXPLICIT_ERRORS={len(propagated)}/5 VERDICT={verdict}'
+          print(summary)
+          with Path('evidence/summary.txt').open('a') as f: f.write(summary+'\n')
+          # Only a confirmed node removal plus a node-loss exception counts as mitigation support.
+          # A run's outcome is recorded even when the hypothesis fails; post-run uploads still execute.
+          if verdict != 'CANDIDATE_MITIGATION_SUPPORTED_FOR_EXPLICIT_OBJECT_LOSS_ONLY':
+              raise SystemExit(1)
+          PYRESULTS
+      - name: Hash all evidence
+        if: always()
+        shell: bash
+        run: |
+          mkdir -p evidence
+          ( cd evidence && find . -maxdepth 1 -type f ! -name SHA256SUMS.txt -printf '%P\0' | LC_ALL=C sort -z | xargs -0 -r sha256sum > SHA256SUMS.txt && sha256sum -c SHA256SUMS.txt )
+      - name: Upload evidence even on failure
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: atlas-ray-66917-ab-no-replay
+          path: evidence/
+          if-no-files-found: error
+          retention-days: 30
