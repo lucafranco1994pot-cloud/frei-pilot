@@ -1,0 +1,260 @@
+# ATLAS E2D: online minority META snapshot bitflips, targeted leadership transfer.
+# A distinct test of fault timing; NOT a reproduction or fix of NATS #7556.
+# No NATS product source modifications; additive test only.
+# Frozen NATS commit: d163ae747ad050ea89054f8fb03c43e64e737aea
+# Additive Go test SHA-256: 8ec2d7bf96e29c90cc0800dac59290eb5b2b46ee8250a31e358ebcb224fb3b5c
+name: ATLAS NATS E2D Live Corrupt Snapshot Leader Handoff
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  e2d-online-corruption:
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    env:
+      GOTOOLCHAIN: auto
+      E2D_TEST: TestAtlasE2DOnlineMinoritySnapshotLeaderTransfer
+    steps:
+      - name: Checkout frozen unchanged NATS product
+        uses: actions/checkout@v4
+        with:
+          repository: nats-io/nats-server
+          ref: d163ae747ad050ea89054f8fb03c43e64e737aea
+          fetch-depth: 1
+          path: nats
+      - name: Install frozen compatible Go toolchain
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.26.10'
+          cache: false
+      - name: Restore additive test and verify original NATS sources
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C nats rev-parse HEAD)" = d163ae747ad050ea89054f8fb03c43e64e737aea
+          test "$(git -C nats hash-object server/jetstream_cluster.go)" = d4f7f413367d9f3c122955ce99e9e10da5b8214c
+          test "$(git -C nats hash-object server/raft.go)" = 3c76b99e9bb0ac863c02e088da2766a1970813e0
+          test -z "$(git -C nats status --porcelain)"
+          cp nats/server/raft.go atlas-e2d-original-raft.go
+          cp nats/server/jetstream_cluster.go atlas-e2d-original-jetstream_cluster.go
+          base64 -d <<'ATLAS_E2D_SOURCE_BASE64' | gzip -dc > nats/server/atlas_e2d_live_corrupt_leader_test.go
+          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
+          ATLAS_E2D_SOURCE_BASE64
+          printf '%s\n' '8ec2d7bf96e29c90cc0800dac59290eb5b2b46ee8250a31e358ebcb224fb3b5c  nats/server/atlas_e2d_live_corrupt_leader_test.go' | sha256sum -c
+          test -z "$(gofmt -l nats/server/atlas_e2d_live_corrupt_leader_test.go)"
+          test -z "$(git -C nats diff --name-only)"
+          {
+            echo 'ATLAS_E2D_BASELINE=d163ae747ad050ea89054f8fb03c43e64e737aea'
+            echo 'ATLAS_E2D_PRODUCT_SOURCE_UNCHANGED=true'
+            echo 'ATLAS_E2D_FAULT=on_disk_live_two_followers_single_bit_each'
+            go version
+            sha256sum nats/server/atlas_e2d_live_corrupt_leader_test.go nats/server/raft.go nats/server/jetstream_cluster.go nats/go.mod
+          } | tee atlas-e2d-inputs.txt
+      - name: Prove selected Go test exists exactly once
+        shell: bash
+        run: |
+          set -euo pipefail
+          set +e
+          (cd nats && go test ./server -list '^TestAtlasE2DOnlineMinoritySnapshotLeaderTransfer$') > atlas-e2d-test-list.txt 2> atlas-e2d-list-stderr.txt
+          rc=$?
+          set -e
+          echo "ATLAS_E2D_LIST_EXIT=$rc" | tee atlas-e2d-selection.txt
+          if [ "$rc" -ne 0 ]; then echo 'ATLAS_E2D_SELECTION=BLOCKED_LIST_ERROR'; exit 5; fi
+          matches=$(grep -Fxc "$E2D_TEST" atlas-e2d-test-list.txt || true)
+          echo "ATLAS_E2D_MATCHES=$matches" | tee -a atlas-e2d-selection.txt
+          if [ "$matches" != 1 ]; then echo 'ATLAS_E2D_SELECTION=BLOCKED_ZERO_OR_MULTIPLE'; exit 5; fi
+          echo 'ATLAS_E2D_SELECTION=EXACT_ONE' | tee -a atlas-e2d-selection.txt
+      - name: Run one E2D online-corruption and leader-transfer observation
+        shell: bash
+        working-directory: nats
+        env:
+          ATLAS_E2D_EVIDENCE_DIR: ${{ github.workspace }}/atlas-e2d-raw
+        run: |
+          set +e
+          go test ./server -run '^TestAtlasE2DOnlineMinoritySnapshotLeaderTransfer$' -count=1 -timeout=17m -v > ../atlas-e2d-test.log 2> ../atlas-e2d-stderr.txt
+          rc=$?
+          echo "$rc" > ../atlas-e2d-go-test.exit
+          echo "ATLAS_E2D_GO_TEST_EXIT=$rc"
+          exit "$rc"
+      - name: Audit exact test, real fault and election event, and local bytes
+        if: always()
+        shell: bash
+        run: |
+          python3 - <<'ATLAS_E2D_AUDIT' | tee atlas-e2d-audit.txt
+          from pathlib import Path
+          import re,hashlib
+          name='TestAtlasE2DOnlineMinoritySnapshotLeaderTransfer'
+          log=Path('atlas-e2d-test.log').read_text(errors='replace') if Path('atlas-e2d-test.log').exists() else ''
+          try: rc=int(Path('atlas-e2d-go-test.exit').read_text().strip())
+          except (OSError,ValueError): rc=-999
+          try: selection=Path('atlas-e2d-test-list.txt').read_text().splitlines().count(name)==1
+          except OSError: selection=False
+          run=len(re.findall(r'^=== RUN\s+'+re.escape(name)+r'\s*$',log,re.M))
+          passed=len(re.findall(r'^--- PASS: '+re.escape(name)+r'\s+\(',log,re.M))
+          failed=len(re.findall(r'^--- FAIL: '+re.escape(name)+r'\s+\(',log,re.M))
+          skipped=len(re.findall(r'^--- SKIP: '+re.escape(name)+r'\s+\(',log,re.M))
+          flips=re.findall(r'ATLAS_E2D_BITFLIP node=([^\s]+) .*?exactly_one_bit=true',log)
+          after=re.findall(r'ATLAS_E2D_AFTER node=([^\s]+) identity_equal=(true|false) local_verified=(\d+) local_error=([^\n]+)',log)
+          original=Path('nats/server/atlas_e2d_live_corrupt_leader_test.go')
+          test_sha='8ec2d7bf96e29c90cc0800dac59290eb5b2b46ee8250a31e358ebcb224fb3b5c'
+          check={
+            'selection_exactly_one':selection,
+            'exact_one_run_pass_no_skip':run==1 and passed==1 and failed==0 and skipped==0 and rc==0,
+            'two_real_single_bit_injections':len(flips)==2 and len(set(flips))==2,
+            'real_corrupt_target_election':bool(re.search(r'ATLAS_E2D_ELECTION corrupted_target=\S+ elected_meta_leader=true disk_snapshot_still_corrupt=true',log)),
+            'five_local_replica_bytes':len(after)==5 and len(set(a[0] for a in after))==5 and all(a[1]=='true' and a[2]=='100' and a[3]=='<nil>' for a in after),
+            'no_wrong_delete_observed':bool(re.search(r'ATLAS_E2D_OBSERVATION elected_corrupted_meta_leader=true original_ATLAS_identity_all5=true local_100_all5=true .*orphan_checks_on_elected_leader=[1-9][0-9]* detected_orphan_warnings=0 fatal_logs=0',log)),
+            'explicit_result': 'ATLAS_E2D_VERDICT=ONLINE_CORRUPT_SNAPSHOT_LEADER_ELECTED_NO_WRONG_DELETE_OBSERVED' in log,
+            'source_file_hash_correct':original.is_file() and hashlib.sha256(original.read_bytes()).hexdigest()==test_sha,
+            'raw_ack_manifest':Path('atlas-e2d-raw/ack-manifest.tsv').is_file(),
+            'two_before_after_snapshots':len(list(Path('atlas-e2d-raw').glob('snap-before-*.bin')))==2 and len(list(Path('atlas-e2d-raw').glob('snap-after-*.bin')))==2,
+            'leader_log_evidence':Path('atlas-e2d-raw/meta-leader-and-cleanup-events.tsv').is_file(),
+          }
+          print('ATLAS_E2D_RUN=%d PASS=%d FAIL=%d SKIP=%d GO_EXIT=%d'%(run,passed,failed,skipped,rc))
+          print('ATLAS_E2D_BITFLIP_NODES='+','.join(flips))
+          print('ATLAS_E2D_SCOPE=online_corruption_no_restart_before_handoff_one_35s_window')
+          print('ATLAS_E2D_LIMIT=cannot_prove_original_Jepsen_issue_7556_or_universal_safety')
+          print('ATLAS_E2D_LIMIT=absence_of_warning_is_not_global_delete_path_coverage')
+          for k,v in check.items():print('ATLAS_E2D_CHECK=%s passed=%s'%(k,str(v).lower()))
+          print('ATLAS_E2D_AUDIT_VERDICT='+('LIVE_CORRUPTED_META_LEADER_CONTROL_PASS' if all(check.values()) else 'BLOCKED_OR_RED_CANDIDATE_REQUIRES_REVIEW'))
+          ATLAS_E2D_AUDIT
+          {
+            echo '=== E2D audit ==='
+            cat atlas-e2d-audit.txt
+            echo '=== original test key events ==='
+            grep -E 'ATLAS_E2D_(BITFLIP|HANDOFF|ELECTION|OBSERVATION|VERDICT|AFTER|CORRUPTION_PERSISTENCE)|^=== RUN|^--- (PASS|FAIL|SKIP):' atlas-e2d-test.log 2>/dev/null || true
+          } | tee atlas-e2d-summary.txt
+          cat atlas-e2d-summary.txt >> "$GITHUB_STEP_SUMMARY"
+      - name: Create and check complete evidence file hash manifest
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'ATLAS_E2D_HASH'
+          from pathlib import Path
+          import hashlib
+          root=Path('.')
+          manifest=root/'atlas-e2d-evidence-sha256.txt'
+          required=['atlas-e2d-inputs.txt','atlas-e2d-selection.txt','atlas-e2d-test-list.txt','atlas-e2d-test.log','atlas-e2d-go-test.exit','atlas-e2d-audit.txt','atlas-e2d-summary.txt','atlas-e2d-original-raft.go','atlas-e2d-original-jetstream_cluster.go','nats/server/atlas_e2d_live_corrupt_leader_test.go']
+          missing=[p for p in required if not (root/p).is_file()]
+          raw=list(Path('atlas-e2d-raw').glob('*')) if Path('atlas-e2d-raw').exists() else []
+          files={x for x in root.glob('atlas-e2d-*') if x.is_file() and x!=manifest}
+          files.update(x for x in raw if x.is_file())
+          p=root/'nats/server/atlas_e2d_live_corrupt_leader_test.go'
+          if p.is_file():files.add(p)
+          manifest.write_text(''.join('%s  %s\n'%(hashlib.sha256(x.read_bytes()).hexdigest(),x.as_posix()) for x in sorted(files)),encoding='utf8')
+          print('ATLAS_E2D_HASH_MISSING='+(','.join(missing) if missing else 'NONE'))
+          print('ATLAS_E2D_MANIFEST_SELF_INCLUDED='+str(manifest in files).lower())
+          print('ATLAS_E2D_HASH_FILES='+str(len(files)))
+          if missing:raise SystemExit('BLOCKED required evidence missing')
+          ATLAS_E2D_HASH
+          sha256sum --check atlas-e2d-evidence-sha256.txt | tee atlas-e2d-manifest-check.txt
+      - name: Preserve all original evidence regardless of result
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: atlas-nats-e2d-live-minority-meta-snapshot-evidence
+          path: |
+            atlas-e2d-inputs.txt
+            atlas-e2d-selection.txt
+            atlas-e2d-test-list.txt
+            atlas-e2d-list-stderr.txt
+            atlas-e2d-test.log
+            atlas-e2d-stderr.txt
+            atlas-e2d-go-test.exit
+            atlas-e2d-audit.txt
+            atlas-e2d-summary.txt
+            atlas-e2d-original-raft.go
+            atlas-e2d-original-jetstream_cluster.go
+            atlas-e2d-evidence-sha256.txt
+            atlas-e2d-manifest-check.txt
+            atlas-e2d-raw/**
+            nats/server/atlas_e2d_live_corrupt_leader_test.go
+          if-no-files-found: warn
+          retention-days: 14
+      - name: Fail closed if experiment not reached, inconclusive or hash invalid
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          grep -Fxq 'ATLAS_E2D_AUDIT_VERDICT=LIVE_CORRUPTED_META_LEADER_CONTROL_PASS' atlas-e2d-audit.txt
+          test -s atlas-e2d-evidence-sha256.txt
+          test -s atlas-e2d-manifest-check.txt
+          sha256sum --check atlas-e2d-evidence-sha256.txt > /dev/null
+          echo 'ATLAS_E2D_FINAL_GATE=PASS'
