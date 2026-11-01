@@ -1,0 +1,422 @@
+name: ATLAS Ray 66917 Gated Late Replay v5
+'on':
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  late-replay-proof:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 20
+    steps:
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install exact reported Ray version
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p evidence
+          python -VV | tee evidence/python.txt
+          python -m pip install --no-cache-dir --disable-pip-version-check 'ray[data]==2.58.0' 'numpy>=2,<3'
+          python -m pip freeze > evidence/dependencies.txt
+      - name: Prepare single targeted gated replay test
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p evidence
+          cat > evidence/probe.py <<'PYATLAS'
+          """ATLAS Ray #66917: one targeted *candidate* late-replay ordering test.
+          
+          Not yet executed on Ray. No Ray library patches. The test tries to force:
+          original producer is retired -> its object is lost -> replay publishes 3 rows
+          -> consumer acknowledges those rows -> replay publishes a second block
+          -> Ray Core detects a 4-object vs 2-object streaming replay inconsistency.
+          
+          Possible outcomes are classified STRICTLY. A failed trigger is INCONCLUSIVE;
+          no accepted trigger means no regression proof. Run fresh Python process per phase.
+          """
+          from collections import Counter
+          import glob
+          import json
+          import os
+          from pathlib import Path
+          import sys
+          import tempfile
+          import time
+          import traceback
+          
+          os.environ.setdefault("RAY_DEDUP_LOGS", "0")
+          
+          import ray
+          from ray.cluster_utils import Cluster
+          from ray.data.context import DataContext
+          from ray.experimental.locations import get_object_locations
+          
+          PHASE = os.environ.get("ATLAS_PHASE", "control")
+          assert PHASE in ("control", "loss")
+          assert ray.__version__ == "2.58.0", f"pinned version required, got {ray.__version__}"
+          MARKERS = Path(tempfile.mkdtemp(prefix="atlas_ray_late_66917_"))
+          EXPECTED = Counter({(i, 0): 1 for i in range(4)})
+          TARGET = 1024 * 1024
+          OSM = 300 * 1024 * 1024
+          # Original: ~1.41 MiB for 4 rows -> one unsliced output block.
+          # Replay: ~1.19 MiB for first 3 -> one output block, then 0.40 MiB
+          # for final row -> second block when the UDF generator ends.
+          ORIGINAL_BYTES_PER_ROW = 360 * 1024
+          REPLAY_BYTES_PER_ROW = 405 * 1024
+          BARRIER_SECONDS = 55
+          assert TARGET < 4 * ORIGINAL_BYTES_PER_ROW < 1.5 * TARGET
+          assert TARGET < 3 * REPLAY_BYTES_PER_ROW < 1.5 * TARGET
+          assert REPLAY_BYTES_PER_ROW < TARGET
+          
+          
+          def emit(kind, value):
+              print(kind, json.dumps(value, sort_keys=True, default=str), flush=True)
+          
+          
+          def marker(name):
+              return MARKERS / name
+          
+          
+          def rows_batch(ids, size):
+              return {
+                  "id": ids,
+                  "group": [0] * len(ids),
+                  "payload": [b"X" * size] * len(ids),
+              }
+          
+          
+          def produce(batch):
+              assert list(map(int, batch["id"])) == [0], "unexpected producer input"
+              attempts = marker("attempt_count")
+              try:
+                  number = int(attempts.read_text()) + 1
+              except FileNotFoundError:
+                  number = 1
+              attempts.write_text(str(number))
+              task_id = str(ray.get_runtime_context().get_task_id())
+              marker(f"task_id_{number}").write_text(task_id)
+              emit("ATLAS_PRODUCE_START", {
+                  "attempt": number,
+                  "task_id": task_id,
+                  "node_id": str(ray.get_runtime_context().get_node_id()),
+              })
+              if number == 1:
+                  yield rows_batch([0, 1, 2, 3], ORIGINAL_BYTES_PER_ROW)
+                  emit("ATLAS_PRODUCER_FIRST_EXECUTION_EOF", {"attempt": number})
+                  return
+              if number != 2:
+                  raise RuntimeError("more than one replay observed: stop instead of guessing")
+          
+              emit("ATLAS_REPLAY_FIRST_THREE_YIELD", {"ids": [0, 1, 2]})
+              yield rows_batch([0, 1, 2], REPLAY_BYTES_PER_ROW)
+              # Critical barrier: this resumes once the first replay batch has been
+              # converted by Ray into a block. Do not issue the extra replay block until
+              # the *downstream task* has actually seen the first three rows.
+              deadline = time.monotonic() + BARRIER_SECONDS
+              emit("ATLAS_REPLAY_AWAIT_CONSUMER", {"seconds": BARRIER_SECONDS})
+              while not marker("consumer_saw_first_three").exists():
+                  if time.monotonic() >= deadline:
+                      marker("replay_barrier_timeout").write_text("1")
+                      raise TimeoutError("Consumer did not see replay's first three rows")
+                  time.sleep(0.04)
+              emit("ATLAS_REPLAY_CONSUMER_ACK_OBSERVED", {"ids": [0, 1, 2]})
+              marker("replay_second_released").write_text("1")
+              yield rows_batch([3], REPLAY_BYTES_PER_ROW)
+              emit("ATLAS_REPLAY_ALL_ROWS_YIELDED", {"ids": [0, 1, 2, 3]})
+          
+          
+          def consume(batch):
+              ids = [int(i) for i in batch["id"]]
+              emit("ATLAS_CONSUMER_ACCEPTED", {"ids": ids})
+              if PHASE == "loss" and ids == [0, 1, 2]:
+                  marker("consumer_saw_first_three").write_text("1")
+                  emit("ATLAS_CONSUMER_ACK_FIRST_THREE", {"ids": ids})
+              return {"id": batch["id"], "group": batch["group"]}
+          
+          
+          def replay_error_lines(session):
+              hits = []
+              for filepath in glob.glob(os.path.join(session, "logs", "**", "*"), recursive=True):
+                  if not os.path.isfile(filepath):
+                      continue
+                  try:
+                      with open(filepath, encoding="utf-8", errors="replace") as fh:
+                          for line in fh:
+                              if ("STREAMING_GENERATOR_REPLAY_INCONSISTENT" in line or
+                                      "was re-executed and produced" in line):
+                                  hits.append((os.path.basename(filepath), line.strip()[:1100]))
+                  except OSError:
+                      pass
+              return hits
+          
+          
+          def exception_chain(exc):
+              chain, queue, seen = [], [exc], set()
+              while queue and len(chain) < 20:
+                  obj = queue.pop(0)
+                  if id(obj) in seen:
+                      continue
+                  seen.add(id(obj))
+                  chain.append({
+                      "type": type(obj).__name__,
+                      "object_ref_hex": getattr(obj, "object_ref_hex", None),
+                      "message": str(obj)[:1600],
+                  })
+                  for key in ("cause", "__cause__", "__context__"):
+                      x = getattr(obj, key, None)
+                      if isinstance(x, BaseException):
+                          queue.append(x)
+              return chain
+          
+          
+          def main():
+              evidence = {
+                  "phase": PHASE, "version": ray.__version__, "trace": [],
+                  "result": "BLOCKED_UNTRIGGERED", "target_object_ref": None,
+                  "producer_task_id": None, "replay_task_id": None,
+                  "producer_node_id": None, "effective_max_retries": None,
+                  "initial_producer_retired": False,
+                  "replay_second_released": False, "consumer_ack_first_three": False,
+                  "replay_barrier_timeout": False, "core_replay_lines": [],
+                  "row_multiset": None, "expected_row_multiset": [[i, 0] for i in range(4)],
+                  "exception_chain": [], "producer_executions": None,
+              }
+              cluster = Cluster(initialize_head=True, head_node_args={
+                  "num_cpus": 0, "object_store_memory": OSM,
+              })
+              session = None
+              try:
+                  ray.init(address=cluster.address, log_to_driver=True)
+                  session = ray._private.worker.global_worker.node.get_session_dir_path()
+                  producer_a = cluster.add_node(
+                      num_cpus=2, resources={"producer": 2}, object_store_memory=OSM,
+                  )
+                  producer_b = cluster.add_node(
+                      num_cpus=2, resources={"producer": 2}, object_store_memory=OSM,
+                  )
+                  cluster.add_node(num_cpus=1, resources={"consumer": 1}, object_store_memory=OSM)
+                  cluster.wait_for_nodes()
+                  producers = {str(n.node_id).lower(): n for n in (producer_a, producer_b)}
+                  ctx = DataContext.get_current()
+                  ctx.target_max_block_size = TARGET
+                  ctx.max_errored_blocks = 0
+          
+                  from ray.data._internal.execution.operators.map_operator import MapOperator
+                  original_get_options = MapOperator._get_dynamic_ray_remote_args
+                  op_refs, option_records = [], []
+                  def inspect_submission(self, *args, **kwargs):
+                      opts = original_get_options(self, *args, **kwargs)
+                      if opts.get("resources", {}).get("producer", 0):
+                          op_refs.append(self)
+                          row = {"operator": self.name, "max_retries": opts.get("max_retries", -1)}
+                          option_records.append(row)
+                          emit("ATLAS_PRODUCER_OPTIONS", row)
+                      return opts
+                  MapOperator._get_dynamic_ray_remote_args = inspect_submission
+          
+                  ds = ray.data.range(1, override_num_blocks=1).map_batches(
+                      produce, batch_size=None, resources={"producer": 1}
+                  )
+                  materialized = ds.materialize()
+                  evidence["trace"].append("PRODUCER_MATERIALIZE_RETURNED")
+                  if not op_refs or not all(x["max_retries"] == -1 for x in option_records):
+                      evidence["result"] = "BLOCKED_PRODUCER_RETRY_OPTIONS"
+                      return evidence
+                  evidence["effective_max_retries"] = option_records
+                  # Crucial real Ray Data observation: original producer has been retired
+                  # by the operator, not merely returned from user Python code.
+                  retired = all(
+                      op.num_active_tasks() == 0 and len(op._data_tasks) == 0 for op in set(op_refs)
+                  )
+                  evidence["initial_producer_retired"] = retired
+                  emit("ATLAS_ORIGINAL_TASK_RETIRED", {"confirmed": retired})
+                  if not retired:
+                      evidence["result"] = "BLOCKED_PRODUCER_NOT_RETIRED"
+                      return evidence
+                  evidence["trace"].append("ORIGINAL_PRODUCER_RETIRED")
+          
+                  refs = materialized.get_internal_block_refs()
+                  if len(refs) != 1:
+                      evidence["result"] = "BLOCKED_NOT_ONE_ORIGINAL_BLOCK"
+                      evidence["block_count"] = len(refs)
+                      return evidence
+                  ref = refs[0]
+                  evidence["target_object_ref"] = ref.hex().lower()
+                  evidence["trace"].append("TARGET_REF_REGISTERED")
+                  location_info = get_object_locations([ref], timeout_ms=10000).get(ref, {})
+                  nodes = [str(x).lower() for x in location_info.get("node_ids", [])]
+                  evidence["location"] = location_info
+                  if (len(nodes) != 1 or nodes[0] not in producers or
+                          location_info.get("did_spill") is not False):
+                      evidence["result"] = "BLOCKED_UNVERIFIED_UNIQUE_LOCATION"
+                      return evidence
+                  node_id = nodes[0]
+                  evidence["producer_node_id"] = node_id
+                  evidence["trace"].append("UNIQUE_LOCATION_VERIFIED")
+          
+                  if PHASE == "loss":
+                      # No Ray Data consumer task has been constructed before this point.
+                      cluster.remove_node(producers[node_id], allow_graceful=False)
+                      deadline = time.monotonic() + 15
+                      while time.monotonic() < deadline:
+                          if not any(n["NodeID"].lower() == node_id and n["Alive"] for n in ray.nodes()):
+                              evidence["trace"].append("TARGET_NODE_REMOVED")
+                              emit("ATLAS_TARGET_NODE_REMOVED", {"node": node_id})
+                              break
+                          time.sleep(0.2)
+                      else:
+                          evidence["result"] = "BLOCKED_NODE_REMOVAL_UNCONFIRMED"
+                          return evidence
+                  else:
+                      evidence["trace"].append("CONTROL_NODE_KEPT")
+          
+                  # Only now submit a downstream MapBatches consumer. The consumer sees
+                  # the reconstructed first replay block *before* the UDF can emit another.
+                  evidence["trace"].append("CONSUMER_SUBMITTED_AFTER_TARGET_DECISION")
+                  downstream = materialized.map_batches(
+                      consume, batch_size=None, resources={"consumer": 1}, max_retries=0
+                  )
+                  raised = None
+                  try:
+                      values = downstream.take_all()
+                      actual = Counter((int(v["id"]), int(v["group"])) for v in values)
+                      evidence["row_multiset"] = sorted([list(p) for p in actual.elements()])
+                      evidence["row_count"] = len(values)
+                      evidence["trace"].append("CALLER_RETURNED")
+                  except Exception as exc:
+                      raised = exc
+                      evidence["exception_chain"] = exception_chain(exc)
+                      evidence["trace"].append("CALLER_RAISED")
+                      emit("ATLAS_CALLER_ERROR", evidence["exception_chain"])
+          
+                  # Let the second output/late Core error actually occur, not just the
+                  # data caller return. Do not mistake a pending replay for a RED proof.
+                  if PHASE == "loss":
+                      deadline = time.monotonic() + 15
+                      while time.monotonic() < deadline:
+                          if marker("replay_second_released").exists() and replay_error_lines(session):
+                              break
+                          time.sleep(0.2)
+                  evidence["producer_executions"] = (
+                      int(marker("attempt_count").read_text()) if marker("attempt_count").exists() else 0
+                  )
+                  for n, name in ((1, "producer_task_id"), (2, "replay_task_id")):
+                      p = marker(f"task_id_{n}")
+                      if p.exists():
+                          evidence[name] = p.read_text()
+                  evidence["consumer_ack_first_three"] = marker("consumer_saw_first_three").exists()
+                  evidence["replay_second_released"] = marker("replay_second_released").exists()
+                  evidence["replay_barrier_timeout"] = marker("replay_barrier_timeout").exists()
+                  evidence["core_replay_lines"] = replay_error_lines(session) if session else []
+                  evidence["trace"].append("CORE_ERRORS_INSPECTED")
+          
+                  if PHASE == "control":
+                      if raised is None and actual == EXPECTED and evidence["producer_executions"] == 1:
+                          evidence["result"] = "CONTROL_PASS"
+                      else:
+                          evidence["result"] = "INVALID_CONTROL"
+                      return evidence
+          
+                  barriers = (
+                      evidence["initial_producer_retired"]
+                      and evidence["consumer_ack_first_three"]
+                      and evidence["replay_second_released"]
+                      and evidence["producer_executions"] == 2
+                      and any("was re-executed and produced 4 objects, expected 2" in msg
+                              for _, msg in evidence["core_replay_lines"])
+                      and evidence["producer_task_id"] is not None
+                      and evidence["replay_task_id"] is not None
+                      and "TARGET_NODE_REMOVED" in evidence["trace"]
+                  )
+                  if not barriers:
+                      evidence["result"] = "BLOCKED_LATE_REPLAY_BARRIER_NOT_PROVEN"
+                  elif raised is None and actual != EXPECTED:
+                      evidence["result"] = "RED_CONFIRMED_LATE_REPLAY_SILENT_INCOMPLETE"
+                  elif raised is not None:
+                      evidence["result"] = "LATE_REPLAY_ERROR_PROPAGATED"
+                  else:
+                      evidence["result"] = "LATE_REPLAY_COMPLETE_UNEXPECTED"
+                  return evidence
+              finally:
+                  try:
+                      ray.shutdown()
+                  finally:
+                      cluster.shutdown()
+          
+          
+          if __name__ == "__main__":
+              output = Path(os.environ.get("ATLAS_OUTPUT", "atlas-late.json"))
+              try:
+                  record = main()
+                  output.write_text(json.dumps(record, indent=2, sort_keys=True, default=str))
+                  emit("ATLAS_FINAL_RESULT", record)
+              except BaseException as exc:
+                  out = {"result": "HARNESS_ERROR", "message": repr(exc),
+                         "traceback": traceback.format_exc()}
+                  output.write_text(json.dumps(out, indent=2, sort_keys=True))
+                  emit("ATLAS_HARNESS_ERROR", out)
+                  raise
+          PYATLAS
+          python -m py_compile evidence/probe.py
+          echo "7b82a11dbd93a7b19ac1f52223bf753836a014a0915b598e844c272933c8a3ec  evidence/probe.py" | sha256sum -c -
+          printf '%s\n' 'Ray 2.58.0; source hash pinned; one control and one gated loss' > evidence/manifest.txt
+      - name: Execute control then gated post-retirement replay
+        shell: bash
+        run: |
+          set -euo pipefail
+          for phase in control loss; do
+            set +e
+            ATLAS_PHASE="$phase" ATLAS_OUTPUT="evidence/${phase}.json" timeout 200s python -u evidence/probe.py > "evidence/${phase}.log" 2>&1
+            rc=$?
+            set -e
+            printf '%s\n' "$rc" > "evidence/${phase}.exitcode"
+            echo "ATLAS_ATTEMPT phase=$phase process_exit=$rc"
+            grep -E 'ATLAS_(FINAL_RESULT|HARNESS_ERROR|ORIGINAL_TASK_RETIRED|TARGET_NODE_REMOVED|CONSUMER_ACK_FIRST_THREE|REPLAY_CONSUMER_ACK_OBSERVED|REPLAY_ALL_ROWS_YIELDED)' "evidence/${phase}.log" | tail -n 14 | cut -c 1-2000 || true
+            if [[ "$rc" != "0" || ! -f "evidence/${phase}.json" ]]; then
+              echo "ATLAS_VERDICT=BLOCKED_PROCESS_FAILURE_PHASE_${phase}"
+              exit 1
+            fi
+            if [[ "$phase" == control ]]; then
+              python - <<'PYCONTROL'
+          import json
+          from pathlib import Path
+          x=json.loads(Path('evidence/control.json').read_text())
+          if x.get('result') != 'CONTROL_PASS':
+              raise SystemExit('ATLAS_VERDICT=INVALID_CONTROL, no replay loss run allowed')
+          print('ATLAS_CONTROL=PASS',flush=True)
+          PYCONTROL
+            fi
+          done
+          python - <<'PYFINAL'
+          import json
+          from pathlib import Path
+          x=json.loads(Path('evidence/loss.json').read_text())
+          verdict=x['result']
+          print('ATLAS_VERDICT='+verdict,flush=True)
+          print('ATLAS_CORE_LINES='+str(len(x.get('core_replay_lines',[]))),flush=True)
+          print('ATLAS_CONSUMER_ACK='+str(x.get('consumer_ack_first_three')),flush=True)
+          print('ATLAS_ORIGINAL_TASK_RETIRED='+str(x.get('initial_producer_retired')),flush=True)
+          print('ATLAS_ACTUAL_ROWS='+str(x.get('row_multiset')),flush=True)
+          if verdict not in ('RED_CONFIRMED_LATE_REPLAY_SILENT_INCOMPLETE','LATE_REPLAY_ERROR_PROPAGATED'):
+              raise SystemExit('INCONCLUSIVE: required ordered barriers not confirmed')
+          PYFINAL
+      - name: Hash all files and verify evidence integrity
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd evidence
+          find . -maxdepth 1 -type f ! -name SHA256SUMS.txt -printf '%P\0' | LC_ALL=C sort -z | xargs -0 -r sha256sum > SHA256SUMS.txt
+          sha256sum -c SHA256SUMS.txt
+      - name: Upload evidence even on invalid trigger
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: atlas-ray-66917-late-replay-v5
+          path: evidence/
+          if-no-files-found: error
+          retention-days: 30
