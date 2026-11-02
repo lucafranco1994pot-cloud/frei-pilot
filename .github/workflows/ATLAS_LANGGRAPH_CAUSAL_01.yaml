@@ -1,0 +1,28 @@
+name: ATLAS LangGraph Dependent Result Replay
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - '.github/workflows/ATLAS_LANGGRAPH_CAUSAL_01.yaml'
+      - 'repro.py'
+
+jobs:
+  replay-probe:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        langgraph-version: ['1.2.18', '1.2.19']
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install tested LangGraph version
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install "langgraph==${{ matrix.langgraph-version }}"
+          python -m pip freeze | grep -E '^(langgraph|langchain-core)'
+      - name: Run diagnostic and print signed-off classification
+        run: python repro.py
