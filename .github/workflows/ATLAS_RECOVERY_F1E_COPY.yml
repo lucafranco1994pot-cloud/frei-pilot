@@ -1,0 +1,158 @@
+
+name: ATLAS F1E nested approval chronology
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  chronology:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065
+        with:
+          python-version: '3.12'
+      - name: Install exact SDK
+        run: |
+          pip install 'git+https://github.com/openai/openai-agents-python.git@e355d69152d4f4730dfb03b63dbce53e8d9f5d8c'
+          pip freeze > dependencies.txt
+      - name: One chronology, with and without nested session
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > check.py <<'PY'
+          import asyncio, json, sqlite3, sys, traceback
+          from pathlib import Path
+          from agents import Agent, Runner, RunConfig
+          from agents.decorators import tool
+          from agents.testing import ScriptedModel, function_call, assistant_message
+          from agents.tool_guardrails import tool_input_guardrail, tool_output_guardrail, ToolGuardrailFunctionOutput
+          mode=sys.argv[1]
+          base=Path('proof')/mode; base.mkdir(parents=True)
+          effects=base/'effects.db'; db=base/'session.db'; trace=[]; phase=['init']
+          def sql(path, query, args=()):
+              with sqlite3.connect(path) as c: return c.execute(query,args).fetchall()
+          sql(effects,'CREATE TABLE events(id INTEGER PRIMARY KEY, kind TEXT)')
+          sql(db,'CREATE TABLE items(id INTEGER PRIMARY KEY, body TEXT)')
+          sql(db,'CREATE TABLE batches(id INTEGER PRIMARY KEY, body TEXT)')
+          def mark(s): sql(effects,'INSERT INTO events(kind) VALUES (?)',(s,))
+          def count(): return dict(sql(effects,'SELECT kind,count(*) FROM events GROUP BY kind'))
+          class Session:
+              session_id='F1E-'+mode
+              async def get_items(self,limit=None):
+                  items=[json.loads(x[0]) for x in sql(db,'SELECT body FROM items ORDER BY id')]
+                  return items if limit is None else items[-limit:] if limit else []
+              async def add_items(self,items):
+                  rows=[x.model_dump(mode='json') if hasattr(x,'model_dump') else x for x in items]
+                  with sqlite3.connect(db) as c:
+                      c.execute('INSERT INTO batches(body) VALUES (?)',(json.dumps(rows),))
+                      c.executemany('INSERT INTO items(body) VALUES (?)',[(json.dumps(x),) for x in rows])
+              async def pop_item(self):
+                  with sqlite3.connect(db) as c:
+                      x=c.execute('SELECT id,body FROM items ORDER BY id DESC LIMIT 1').fetchone()
+                      if x:c.execute('DELETE FROM items WHERE id=?',(x[0],))
+                  return json.loads(x[1]) if x else None
+              async def clear_session(self):sql(db,'DELETE FROM items')
+          def profile(frame,event,value):
+              if event!='return':return
+              name=frame.f_code.co_name; loc=frame.f_locals
+              if name=='_nested_approvals_status' and frame.f_code.co_filename.endswith('/agents/agent.py'):
+                  trace.append(dict(phase=phase[0],gate=value,decision=loc.get('has_decision'),pending=loc.get('has_pending')))
+              if name=='get_approval_status' and loc.get('call_id') in ('inner-A','inner-B') and frame.f_code.co_filename.endswith('/agents/run_context.py'):
+                  trace.append(dict(phase=phase[0],tool=loc.get('call_id'),approval=value))
+          def pending(result):return [getattr(x.raw_item,'call_id',None) for x in result.interruptions]
+          def snapshot(name,state): (base/(name+'.json')).write_text(json.dumps(state.to_json(),indent=2,default=str))
+          async def test():
+              @tool_input_guardrail
+              async def input_a(_):mark('input_A');return ToolGuardrailFunctionOutput.allow()
+              @tool_output_guardrail
+              async def output_a(_):mark('output_A');return ToolGuardrailFunctionOutput.allow()
+              @tool(needs_approval=True,tool_input_guardrails=[input_a],tool_output_guardrails=[output_a])
+              async def action_a()->str:
+                  """Harmless synthetic A."""
+                  mark('entry_A');mark('effect_A');return 'receipt-A'
+              @tool(needs_approval=True)
+              async def action_b()->str:
+                  """Harmless synthetic B."""
+                  mark('entry_B');mark('effect_B');return 'receipt-B'
+              inner=ScriptedModel([[function_call('action_a',{},call_id='inner-A'),function_call('action_b',{},call_id='inner-B')],[assistant_message('inner done')]])
+              outer=ScriptedModel([[function_call('delegate',{'input':'run'},call_id='outer-1')],[assistant_message('outer done')]])
+              child=Agent(name='child',model=inner,tools=[action_a,action_b])
+              delegate=child.as_tool(tool_name='delegate',tool_description='Delegate',session=Session() if mode=='WITH_SESSION' else None,failure_error_function=None)
+              parent=Agent(name='parent',model=outer,tools=[delegate]);cfg=RunConfig(tracing_disabled=True)
+              record={'mode':mode,'status':'NOT_EVALUABLE'}
+              try:
+                  first=await Runner.run(parent,'go',run_config=cfg)
+                  state=first.to_state()
+                  if sorted(pending(first))!=['inner-A','inner-B']:raise ValueError('Missing initial A/B requests')
+                  snapshot('paused',state)
+                  item=next(x for x in state.get_interruptions() if x.raw_item.call_id=='inner-A')
+                  state.approve(item);snapshot('approved-A',state)
+                  phase[0]='resume_A';sys.setprofile(profile)
+                  try:second=await Runner.run(parent,state,run_config=cfg)
+                  finally:sys.setprofile(None)
+                  record['after_A']={'pending':pending(second),'events':count(),'model_calls':[len(inner.calls),len(outer.calls)]}
+                  state2=second.to_state();snapshot('after-A',state2)
+                  if pending(second)!=['inner-B']:raise ValueError('Expected B pending after A decision')
+                  item2=next(x for x in state2.get_interruptions() if x.raw_item.call_id=='inner-B')
+                  state2.reject(item2,rejection_message='reviewer declined');snapshot('rejected-B',state2)
+                  phase[0]='resume_B';sys.setprofile(profile)
+                  try:third=await Runner.run(parent,state2,run_config=cfg)
+                  finally:sys.setprofile(None)
+                  record['after_B']={'pending':pending(third),'events':count(),'final':third.final_output,'model_calls':[len(inner.calls),len(outer.calls)]}
+                  snapshot('after-B',third.to_state())
+                  record['status']='OBSERVED'
+              except Exception as ex:
+                  sys.setprofile(None);record['error']={'type':type(ex).__name__,'message':str(ex),'trace':traceback.format_exc()[-1500:]}
+              record['gate_trace']=trace
+              record['session_items']=[json.loads(x[0]) for x in sql(db,'SELECT body FROM items ORDER BY id')]
+              record['session_batches']=[json.loads(x[0]) for x in sql(db,'SELECT body FROM batches ORDER BY id')]
+              record['event_log']=sql(effects,'SELECT id,kind FROM events ORDER BY id')
+              record['model_inputs']={'inner':[x.input for x in inner.calls],'outer':[x.input for x in outer.calls]}
+              (base/'result.json').write_text(json.dumps(record,indent=2,default=str))
+              print(json.dumps({k:v for k,v in record.items() if k in ('mode','status','after_A','after_B','gate_trace','error')},default=str))
+          asyncio.run(test())
+          PY
+          python -m py_compile check.py
+          python check.py WITH_SESSION
+          python check.py NO_SESSION
+          python - <<'VERIFY'
+          import json
+          from pathlib import Path
+          rs={s:json.loads((Path('proof')/s/'result.json').read_text()) for s in ('WITH_SESSION','NO_SESSION')}
+          checks={}; summary={'sdk_bug_confirmed':False}
+          for mode,r in rs.items():
+              if r['status']!='OBSERVED':checks[mode]={'harness':'NOT_EVALUABLE'};continue
+              a=r['after_A'];b=r['after_B'];ca=a['events'];cb=b['events']
+              checks[mode]={'A_after_partial':ca.get('entry_A',0),'A_final':cb.get('entry_A',0),
+                            'B_final':cb.get('entry_B',0),'B_pending_after_partial':a['pending']==['inner-B'],
+                            'finished':b['pending']==[] and b['final']=='outer done',
+                            'B_isolated':cb.get('entry_B',0)==cb.get('effect_B',0)==0,
+                            'A_not_duplicated':cb.get('entry_A',0)<=1}
+          summary['cases']=checks
+          if any('harness' in x for x in checks.values()):summary['status']='NOT_EVALUABLE'
+          elif any(not x['B_isolated'] or not x['A_not_duplicated'] or not x['finished'] for x in checks.values()):summary['status']='BOUNDARY_CONTRADICTION'
+          elif all(x['A_after_partial']==0 and x['A_final']==1 for x in checks.values()):summary['status']='DEFERRED_IN_BOTH_MODES'
+          elif checks['WITH_SESSION']['A_after_partial']==0 and checks['NO_SESSION']['A_after_partial']==1:summary['status']='SESSION_DEPENDENT'
+          elif all(x['A_after_partial']==x['A_final']==1 for x in checks.values()):summary['status']='BOTH_PROGRESS'
+          else:summary['status']='OTHER_DIFFERENCE'
+          Path('proof/summary.json').write_text(json.dumps(summary,indent=2)+'\n')
+          print('ATLAS_F1E_RESULT',json.dumps(summary))
+          assert summary['status'] not in ('NOT_EVALUABLE','BOUNDARY_CONTRADICTION')
+          VERIFY
+      - name: Integrity proof
+        if: always()
+        run: |
+          find proof -type f -print0 | sort -z | xargs -0 -r sha256sum > SHA256SUMS
+          sha256sum check.py dependencies.txt >> SHA256SUMS
+      - name: Upload evidence even on failure
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: atlas-f1e-causal-mobile
+          path: |
+            check.py
+            proof/
+            dependencies.txt
+            SHA256SUMS
+          if-no-files-found: warn
