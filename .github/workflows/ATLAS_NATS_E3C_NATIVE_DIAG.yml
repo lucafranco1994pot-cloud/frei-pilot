@@ -1,0 +1,116 @@
+# ATLAS E3-C native-path diagnostic: no product modifications, no bug verdict.
+# Reads the test verbatim from the frozen 2026-11-02 pilot commit.
+name: ATLAS NATS E3C Native Diagnostic Only
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  native-diagnostic:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout exact archived pilot E3C source
+        uses: actions/checkout@v4
+        with:
+          repository: lucafranco1994pot-cloud/frei-pilot
+          ref: 6c8eb91a52e25b2d47c543fa45bf8dd2dd190798
+          path: pilot
+          persist-credentials: false
+      - name: Checkout frozen NATS original
+        uses: actions/checkout@v4
+        with:
+          repository: nats-io/nats-server
+          ref: d163ae747ad050ea89054f8fb03c43e64e737aea
+          path: nats
+          persist-credentials: false
+      - name: Set up Go toolchain
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.26.10'
+          cache: false
+      - name: Restore exact archived test and verify identity
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C pilot rev-parse HEAD)" = 6c8eb91a52e25b2d47c543fa45bf8dd2dd190798
+          test "$(git -C nats rev-parse HEAD)" = d163ae747ad050ea89054f8fb03c43e64e737aea
+          test "$(git -C nats hash-object server/jetstream_cluster.go)" = d4f7f413367d9f3c122955ce99e9e10da5b8214c
+          test "$(git -C nats hash-object server/stream.go)" = 685758e51460493aebe2d8db679983a0da259bf7
+          test "$(git -C nats hash-object server/filestore.go)" = acee437a0ff4dfb80197f288a78df4108f4db24b
+          python3 - <<'PY'
+          from pathlib import Path
+          import hashlib
+          wf=Path('pilot/.github/workflows/ATLAS_NATS_E3C_NATIVE_ORPHAN_REACHABILITY.yml')
+          lines=wf.read_text().splitlines()
+          opening="cat > nats/server/atlas_e3c_native_orphan_test.go <<'ATLAS_E3C_SOURCE'"
+          begins=[i for i,l in enumerate(lines) if l.strip()==opening]
+          if len(begins)!=1: raise RuntimeError('test opening delimiter mismatch')
+          start=begins[0]
+          ends=[i for i in range(start+1,len(lines)) if lines[i].strip()=='ATLAS_E3C_SOURCE']
+          if len(ends)!=1: raise RuntimeError('test closing delimiter mismatch')
+          end=ends[0]
+          source='\n'.join(l[10:] if l.startswith('          ') else l for l in lines[start+1:end])+'\n'
+          h=hashlib.sha256(source.encode()).hexdigest()
+          assert h=='9933c17e42c6fa6461c3f483e91d16a3c05db1bbf00234f52dd6db4c3959b5cc',h
+          Path('nats/server/atlas_e3c_native_orphan_test.go').write_text(source)
+          print('ATLAS_E3CDIAG_TEST_SOURCE_SHA256='+h)
+          print('ATLAS_E3CDIAG_CODE=EXACT_ARCHIVED_E3C_TEST_NO_CHANGES')
+          PY
+          test -z "$(gofmt -l nats/server/atlas_e3c_native_orphan_test.go)"
+          test -z "$(git -C nats diff --name-only)"
+          echo 'ATLAS_E3CDIAG_PRODUCT_UNCHANGED=true'
+      - name: Run only natural migration test and PRINT its complete result
+        shell: bash
+        run: |
+          set +e
+          (cd nats && go test ./server -run '^TestAtlasE3CNaturalOrphanMigration$' -count=1 -timeout=9m -v) 2>&1 | tee atlas-e3c-native-diagnostic.log
+          rc=${PIPESTATUS[0]}
+          echo "$rc" > atlas-e3c-native-diagnostic.exit
+          echo "ATLAS_E3CDIAG_NATIVE_EXIT=$rc"
+          exit 0
+      - name: Classify exact failure point without promoting a bug claim
+        if: always()
+        shell: bash
+        run: |
+          python3 - <<'PY' | tee atlas-e3c-native-classification.txt
+          from pathlib import Path
+          import re
+          p=Path('atlas-e3c-native-diagnostic.log')
+          log=p.read_text(errors='replace') if p.exists() else ''
+          try: rc=int(Path('atlas-e3c-native-diagnostic.exit').read_text().strip())
+          except (OSError,ValueError): rc=-999
+          markers=re.findall(r'ATLAS_E3CN_[A-Z0-9_]+=\S+',log)
+          print('ATLAS_E3CDIAG_GO_EXIT='+str(rc))
+          print('ATLAS_E3CDIAG_NATIVE_MARKERS='+repr(markers))
+          failures=[ln.strip() for ln in log.splitlines() if re.search(r'(BLOCKED:|FAIL:|panic:|fatal error:|test timed out|--- FAIL:)',ln)]
+          print('ATLAS_E3CDIAG_FAILURE_LINES='+repr(failures[-25:]))
+          if rc==0 and 'ATLAS_E3CN_VERDICT=REAL_TIMER_NATURAL_ORPHAN_PUBLIC_API_LIFECYCLE' in log:
+              verdict='NATIVE_PASS_IN_THIS_REPEAT_NOT_7556'
+          elif rc==0:
+              verdict='INCONCLUSIVE_ZERO_EXIT_MISSING_MARKERS'
+          else:
+              verdict='NATIVE_BLOCKED_OR_FAIL_CHECK_PRINTED_TEST_OUTPUT'
+          print('ATLAS_E3CDIAG_VERDICT='+verdict)
+          print('ATLAS_E3CDIAG_SCOPE=DIAGNOSTIC_ONLY_NOT_A_BUG_REPRO')
+          PY
+      - name: Hash reproducibility evidence
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          sha256sum atlas-e3c-native-diagnostic.log atlas-e3c-native-diagnostic.exit atlas-e3c-native-classification.txt nats/server/atlas_e3c_native_orphan_test.go > atlas-e3c-native-diagnostic-sha256.txt
+          sha256sum --check atlas-e3c-native-diagnostic-sha256.txt
+      - name: Archive diagnostic logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: atlas-nats-e3c-native-diagnostic
+          path: |
+            atlas-e3c-native-*
+            nats/server/atlas_e3c_native_orphan_test.go
+          if-no-files-found: warn
+          retention-days: 14
