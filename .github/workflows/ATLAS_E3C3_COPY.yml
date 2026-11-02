@@ -1,0 +1,126 @@
+# ATLAS E3-C3. Pin R1 to the original recovered host.
+# Unsupported standalone-to-cluster migration; no production bug claim.
+name: ATLAS E3C3 Pinned R1 Host Native Orphan
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  pinned-three-node:
+    runs-on: ubuntu-latest
+    timeout-minutes: 22
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: lucafranco1994pot-cloud/frei-pilot
+          ref: de2d22c2ee6a608127346caeee1967e9081884fe
+          path: pilot
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        with:
+          repository: nats-io/nats-server
+          ref: d163ae747ad050ea89054f8fb03c43e64e737aea
+          path: nats
+          persist-credentials: false
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.26.10'
+          cache: false
+      - name: Reconstruct frozen E3C2 and pin origin host for R1
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C pilot rev-parse HEAD)" = de2d22c2ee6a608127346caeee1967e9081884fe
+          test "$(git -C nats rev-parse HEAD)" = d163ae747ad050ea89054f8fb03c43e64e737aea
+          test "$(git -C pilot hash-object .github/workflows/ATLAS_E3C2_COPY.yml)" = 6b64abb5841e4744507fdeca04bb6f0ffe08aa54
+          python3 - <<'PY'
+          from pathlib import Path
+          import hashlib
+          f=Path('pilot/.github/workflows/ATLAS_E3C2_COPY.yml')
+          lines=f.read_text().splitlines()
+          op="python3 - <<'PY'"
+          a=[i for i,l in enumerate(lines) if l.strip()==op]
+          assert len(a)==1, a
+          b=[i for i in range(a[0]+1,len(lines)) if l.strip()=='PY']
+          assert len(b)==1,b
+          code='\n'.join(l[10:] if l.startswith('          ') else l for l in lines[a[0]+1:b[0]])+'\n'
+          assert hashlib.sha256(f.read_bytes()).hexdigest() == '77f3d1b2c04119dedb8055e857d5a7307db87da1c4d47b99f5e0b59aa86592e4'
+          exec(compile(code,str(f),'exec'),globals())
+          p=Path('nats/server/atlas_e3c_native_orphan_test.go')
+          import subprocess
+          subprocess.run(['gofmt','-w',str(p)],check=True)
+          s=p.read_text()
+          def patch(a,b):
+              global s
+              assert s.count(a)==1, (a,s.count(a))
+              s=s.replace(a,b,1)
+          patch('return strings.Replace(conf, newDir, dir, 1)',
+                'return strings.Replace(conf, newDir, dir, 1) + "\\nserver_tags: [atlas:e3c3host]\\n"')
+          patch('nc, api := jsClientConnect(t, s)\n\tdefer nc.Close()',
+                'nc, api := jsClientConnect(t, s)\n\tdefer nc.Close()\n\tcfg.Placement = &nats.Placement{Tags: []string{"atlas:e3c3host"}}\n\tt.Log("ATLAS_E3C3_R1_PLACEMENT_PINNED_TO_ORIGIN=true")')
+          a='''adopted, adoptErr := acc.lookupStream(name)
+          	js.mu.RLock()
+          	apiAssignment := js.cluster.streams[acc.Name][name]
+          	js.mu.RUnlock()
+          	if adoptErr != nil || adopted != g1 || apiAssignment == nil || g1.streamAssignment() != apiAssignment {
+          		t.Fatalf("BLOCKED: API did not adopt G1: live=%p old=%p assignment=%p err=%v", adopted, g1, apiAssignment, adoptErr)
+          	}'''
+          b='''var adopted *stream
+          	var adoptErr error
+          	var apiAssignment *streamAssignment
+          	untilAdopt := time.Now().Add(12*time.Second)
+          	for time.Now().Before(untilAdopt) {
+          		adopted, adoptErr = acc.lookupStream(name)
+          		js.mu.RLock()
+          		apiAssignment = js.cluster.streams[acc.Name][name]
+          		js.mu.RUnlock()
+          		if adoptErr == nil && adopted == g1 && apiAssignment != nil && g1.streamAssignment() == apiAssignment {
+          			break
+          		}
+          		time.Sleep(30*time.Millisecond)
+          	}
+          	if adoptErr != nil || adopted != g1 || apiAssignment == nil || g1.streamAssignment() != apiAssignment {
+          		var groupPeers []string
+          		if apiAssignment != nil && apiAssignment.Group != nil {groupPeers=apiAssignment.Group.Peers}
+          		t.Fatalf("BLOCKED_PINNED_ADOPTION: origin=%s live=%p old=%p assigned=%p peers=%v g1_closed=%t err=%v", s.Name(), adopted, g1, apiAssignment, groupPeers, g1.closed.Load(), adoptErr)
+          	}'''
+          patch(a,b)
+          p.write_text(s)
+          print('ATLAS_E3C3_TEST_SHA256='+hashlib.sha256(s.encode()).hexdigest())
+          PY
+          gofmt -w nats/server/atlas_e3c_native_orphan_test.go
+          test -z "$(gofmt -l nats/server/atlas_e3c_native_orphan_test.go)"
+          test -z "$(git -C nats diff --name-only)"
+          sha256sum nats/server/atlas_e3c_native_orphan_test.go | tee atlas-e3c3-source-sha256.txt
+      - name: Native three-node pinned reproduction, full diagnostics
+        shell: bash
+        run: |
+          set +e
+          set -o pipefail
+          (cd nats && go test ./server -run '^TestAtlasE3CNaturalOrphanMigration$' -count=1 -timeout=9m -v) 2>&1 | tee atlas-e3c3-run.log
+          rc=$?
+          echo "$rc" > atlas-e3c3-exit.txt
+          echo "ATLAS_E3C3_GO_EXIT=$rc"
+          exit 0
+      - name: Preserve E3C3 proof or blocker
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: atlas-nats-e3c3-pinned-host-evidence
+          path: |
+            atlas-e3c3-*
+            nats/server/atlas_e3c_native_orphan_test.go
+          if-no-files-found: warn
+      - name: Fail closed on missing native proof
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(cat atlas-e3c3-exit.txt)" = 0
+          grep -Fq 'ATLAS_E3CN_ORPHAN_FROM_REUSED_STANDALONE_STORE_NO_META_ASSIGNMENT=true' atlas-e3c3-run.log
+          grep -Fq 'ATLAS_E3CN_REAL_TIMER_SELECTED_RECOVERED_G1=true' atlas-e3c3-run.log
+          grep -Fq 'ATLAS_E3C3_R1_PLACEMENT_PINNED_TO_ORIGIN=true' atlas-e3c3-run.log
+          grep -Fq 'ATLAS_E3C2_G1_API_ADOPTION_VERIFIED=true' atlas-e3c3-run.log
+          grep -Fq 'ATLAS_E3C2_G2_PAUSED_CONTROL_VERIFIED=true' atlas-e3c3-run.log
+          grep -Fq 'ATLAS_E3CN_VERDICT=REAL_TIMER_NATURAL_ORPHAN_PUBLIC_API_LIFECYCLE' atlas-e3c3-run.log
+          echo 'ATLAS_E3C3_VERDICT=PASS_UNSUPPORTED_MIGRATION_ONLY'
