@@ -41,7 +41,7 @@ jobs:
           op="python3 - <<'PY'"
           a=[i for i,l in enumerate(lines) if l.strip()==op]
           assert len(a)==1, a
-          b=[i for i in range(a[0]+1,len(lines)) if l.strip()=='PY']
+          b=[i for i in range(a[0]+1,len(lines)) if lines[i].strip()=='PY']
           assert len(b)==1,b
           code='\n'.join(l[10:] if l.startswith('          ') else l for l in lines[a[0]+1:b[0]])+'\n'
           assert hashlib.sha256(f.read_bytes()).hexdigest() == '77f3d1b2c04119dedb8055e857d5a7307db87da1c4d47b99f5e0b59aa86592e4'
