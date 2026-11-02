@@ -1,0 +1,157 @@
+# ATLAS E4: supported R3 -> offline follower -> delete G1 -> recreate G2 R1
+# -> rejoin follower -> scale G2 to R3 -> full restart; no logger barrier.
+# Diagnostic safety control, NOT a confirmed production defect.
+name: ATLAS E4 Supported G1 G2 Rejoin Safety
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  generation-rejoin:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - name: Checkout pinned NATS revision
+        uses: actions/checkout@v4
+        with:
+          repository: nats-io/nats-server
+          ref: dc55f4b43293fd1a4906b9acd0060e3298ebac0f
+          path: nats
+          persist-credentials: false
+      - name: Setup Go from pinned go.mod
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: nats/go.mod
+          cache: false
+      - name: Build independent supported-lifecycle test
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C nats rev-parse HEAD)" = dc55f4b43293fd1a4906b9acd0060e3298ebac0f
+          # Gzip source is deterministic; the exact decoded Go file is SHA-256 pinned.
+          base64 -d <<'ATLAS_E4_GZIP' | gzip -dc > nats/server/atlas_e4_generation_rejoin_test.go
+          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
+          AAA=
+          ATLAS_E4_GZIP
+          echo '63f6607050fabc6e5d137e9edbd0c813428296bc1ff2d41236e08ae4bf7e839e  nats/server/atlas_e4_generation_rejoin_test.go' | sha256sum --check
+          test -z "$(gofmt -l nats/server/atlas_e4_generation_rejoin_test.go)"
+          test -z "$(git -C nats diff --name-only)"
+          git -C nats rev-parse HEAD | tee atlas-e4-upstream-commit.txt
+          go version | tee atlas-e4-go-version.txt
+          sha256sum nats/server/atlas_e4_generation_rejoin_test.go | tee atlas-e4-source-sha256.txt
+      - name: Run only supported generation-rejoin test
+        shell: bash
+        run: |
+          set +e
+          set -o pipefail
+          (cd nats && go test ./server -run '^TestAtlasE4SupportedGenerationRejoin$' -count=1 -timeout=13m -v) 2>&1 | tee atlas-e4-native.log
+          rc=${PIPESTATUS[0]}
+          echo "$rc" > atlas-e4-native.exit
+          echo "ATLAS_E4_GO_EXIT=$rc"
+          exit 0
+      - name: Independent classification from runtime evidence
+        if: always()
+        shell: bash
+        run: |
+          python3 - <<'ATLAS_E4_AUDIT' | tee atlas-e4-audit.txt
+          from pathlib import Path
+          import re
+          p=Path('atlas-e4-native.log')
+          s=p.read_text(errors='replace') if p.is_file() else ''
+          try: rc=int(Path('atlas-e4-native.exit').read_text().strip())
+          except (OSError,ValueError): rc=-999
+          name='TestAtlasE4SupportedGenerationRejoin'
+          starts=len(re.findall(r'^=== RUN\s+'+name+r'\s*$',s,re.M))
+          passed=len(re.findall(r'^--- PASS: '+name+r' \(',s,re.M))
+          failed=len(re.findall(r'^--- FAIL: '+name+r' \(',s,re.M))
+          required=[
+            'ATLAS_E4_G1_LOCAL_PROVEN=true',
+            'ATLAS_E4_G1_FOLLOWER_OFFLINE=true',
+            'ATLAS_E4_G1_PUBLIC_DELETE_ACKED=true',
+            'ATLAS_E4_G2_PUBLIC_CREATED_READABLE=true',
+            'ATLAS_E4_OLD_G1_FOLLOWER_REJOINED=true',
+            'ATLAS_E4_G2_LOCAL_GENERATION_PROVEN=true',
+            'ATLAS_E4_G2_PUBLIC_READABLE_AFTER_REJOIN=true',
+            'ATLAS_E4_G2_PUBLIC_READABLE_AFTER_FULL_RESTART=true',
+            'ATLAS_E4_VERDICT=SUPPORTED_GENERATION_REJOIN_SAFETY_CONTROL_PASS'
+          ]
+          # Log markers are derived from unique event lines; they cannot substitute for Go exit and test completion.
+          counts={m:s.count(m) for m in required}
+          fatal_events=any(('BLOCKED_' in line or 'SAFETY_VIOLATION' in line or 'INVALID_' in line) for line in s.splitlines())
+          complete=rc==0 and starts==1 and passed==1 and failed==0 and not fatal_events and all(n==1 for n in counts.values())
+          print('ATLAS_E4_GO_EXIT='+str(rc))
+          print('ATLAS_E4_TEST_STARTS='+str(starts))
+          print('ATLAS_E4_TEST_PASSES='+str(passed))
+          print('ATLAS_E4_TEST_FAILS='+str(failed))
+          for k,v in counts.items():print('ATLAS_E4_EVENT='+k+' count='+str(v))
+          for line in s.splitlines():
+            if 'BLOCKED_' in line or 'SAFETY_VIOLATION' in line or 'INVALID_' in line:
+              print('ATLAS_E4_ERROR='+line.strip()[:500])
+          print('ATLAS_E4_ORIGIN=SUPPORTED_R3_OFFLINE_PUBLIC_DELETE_R1_RECREATE_R3_SCALEUP')
+          print('ATLAS_E4_SCHEDULE=NO_LOGGER_BARRIER')
+          print('ATLAS_E4_PRODUCT_CODE=UNMODIFIED')
+          print('ATLAS_E4_VERDICT='+('SAFETY_CONTROL_PASS' if complete else 'BLOCKED_OR_POSSIBLE_VIOLATION_REQUIRES_LOG_REVIEW'))
+          ATLAS_E4_AUDIT
+      - name: Hash evidence
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          find . -maxdepth 1 -type f -name 'atlas-e4-*' ! -name 'atlas-e4-evidence-sha256.txt' -print0 | sort -z | xargs -0 -r sha256sum > atlas-e4-evidence-sha256.txt
+          sha256sum nats/server/atlas_e4_generation_rejoin_test.go >> atlas-e4-evidence-sha256.txt
+          sha256sum --check atlas-e4-evidence-sha256.txt | tee atlas-e4-hash-check.txt
+      - name: Archive regardless of outcome
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: atlas-nats-e4-supported-generation-rejoin
+          path: |
+            atlas-e4-*
+            nats/server/atlas_e4_generation_rejoin_test.go
+          if-no-files-found: warn
+          retention-days: 90
+      - name: Fail closed if safety control did not pass
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          grep -Fxq 'ATLAS_E4_VERDICT=SAFETY_CONTROL_PASS' atlas-e4-audit.txt
+          sha256sum --check atlas-e4-evidence-sha256.txt >/dev/null
+          echo 'ATLAS_E4_FINAL=PASS_ON_PINNED_COMMIT_ONLY'
