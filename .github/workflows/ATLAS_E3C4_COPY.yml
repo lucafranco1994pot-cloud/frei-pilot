@@ -1,0 +1,139 @@
+# ATLAS E3C4: same frozen E3C3 test on current-main pinned 2026-11-02
+# Timing countercontrol changes only when the old callback is released.
+# Unsupported standalone-to-cluster migration, not #7556.
+name: ATLAS NATS E3C4 Main And Timing Control
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+  actions: read
+jobs:
+  current-and-control:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - name: Checkout pinned upstream NATS main
+        uses: actions/checkout@v4
+        with:
+          repository: nats-io/nats-server
+          ref: dc55f4b43293fd1a4906b9acd0060e3298ebac0f
+          path: nats
+          persist-credentials: false
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: nats/go.mod
+          cache: false
+      - name: Download successful E3C3 original test artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: atlas-nats-e3c3-pinned-host-evidence
+          run-id: 41495477749
+          github-token: ${{ github.token }}
+          path: evidence
+      - name: Audit exact baseline and original source identity
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C nats rev-parse HEAD)" = dc55f4b43293fd1a4906b9acd0060e3298ebac0f
+          test -f evidence/nats/server/atlas_e3c_native_orphan_test.go
+          echo 'd6eb32fdc3f03f6f906e5cd3db7bab2089e41dce004f689dbca548da751eb71c  evidence/nats/server/atlas_e3c_native_orphan_test.go' | sha256sum --check
+          cp evidence/nats/server/atlas_e3c_native_orphan_test.go nats/server/atlas_e3c_native_orphan_test.go
+          test -z "$(gofmt -l nats/server/atlas_e3c_native_orphan_test.go)"
+          test -z "$(git -C nats diff --name-only)"
+          git -C nats rev-parse HEAD | tee atlas-e3c4-upstream-commit.txt
+          git -C nats hash-object server/jetstream_cluster.go | tee atlas-e3c4-upstream-orphan-blob.txt
+          sha256sum nats/server/atlas_e3c_native_orphan_test.go | tee atlas-e3c4-original-source-sha256.txt
+      - name: Reproduce original stale callback after new G2 on main
+        shell: bash
+        run: |
+          set +e
+          set -o pipefail
+          (cd nats && go test ./server -run '^TestAtlasE3CNaturalOrphanMigration$' -count=1 -timeout=8m -v) 2>&1 | tee atlas-e3c4-original.log
+          echo "${PIPESTATUS[0]}" > atlas-e3c4-original.exit
+          exit 0
+      - name: Create timing countercontrol from identical source
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          p=Path('nats/server/atlas_e3c_native_orphan_test.go')
+          s=p.read_text()
+          before='t.Log("ATLAS_E3CN_G1_PUBLIC_API_DELETION_COMPLETE=true")'
+          after=before+'\n\tunlock()\n\ttime.Sleep(2 * time.Second)\n\tt.Log("ATLAS_E3C4_OLD_CALLBACK_RELEASED_BEFORE_G2=true")'
+          assert s.count(before)==1
+          s=s.replace(before,after,1)
+          before='''if !mapLost || !pathLost {
+          \t\tt.Fatalf("NATURAL_INTERLEAVING_NOT_REPRODUCED map=%t disk=%t", mapLost, pathLost)
+          \t}
+          \tt.Log("ATLAS_E3CN_VERDICT=REAL_TIMER_NATURAL_ORPHAN_PUBLIC_API_LIFECYCLE")'''
+          after='''if mapLost || pathLost {
+          \t\tt.Fatalf("CONTROL_G2_WAS_LOST map=%t disk=%t", mapLost, pathLost)
+          \t}
+          \tt.Log("ATLAS_E3C4_CONTROL_G2_SURVIVED=true")'''
+          assert s.count(before)==1
+          s=s.replace(before,after,1)
+          p.write_text(s)
+          PY
+          gofmt -w nats/server/atlas_e3c_native_orphan_test.go
+          test -z "$(gofmt -l nats/server/atlas_e3c_native_orphan_test.go)"
+          test -z "$(git -C nats diff --name-only)"
+          sha256sum nats/server/atlas_e3c_native_orphan_test.go | tee atlas-e3c4-control-source-sha256.txt
+      - name: Timing countercontrol - finish old callback before G2 exists
+        shell: bash
+        run: |
+          set +e
+          set -o pipefail
+          (cd nats && go test ./server -run '^TestAtlasE3CNaturalOrphanMigration$' -count=1 -timeout=8m -v) 2>&1 | tee atlas-e3c4-control.log
+          echo "${PIPESTATUS[0]}" > atlas-e3c4-control.exit
+          exit 0
+      - name: Classify both tests without relying on green job status
+        if: always()
+        shell: bash
+        run: |
+          python3 - <<'PY' | tee atlas-e3c4-audit.txt
+          from pathlib import Path
+          import re
+          original=Path('atlas-e3c4-original.log').read_text(errors='replace') if Path('atlas-e3c4-original.log').exists() else ''
+          control=Path('atlas-e3c4-control.log').read_text(errors='replace') if Path('atlas-e3c4-control.log').exists() else ''
+          def result(name,log,marks):
+              try: rc=int(Path(f'atlas-e3c4-{name}.exit').read_text().strip())
+              except (OSError,ValueError): rc=-999
+              checks={"go_pass":rc==0 and bool(re.search(r'^--- PASS: TestAtlasE3CNaturalOrphanMigration ',log,re.M))}
+              for mark in marks: checks[mark]=log.count(mark)==1
+              print(f'ATLAS_E3C4_{name.upper()}_GO_EXIT={rc}')
+              for key,value in checks.items(): print(f'ATLAS_E3C4_{name.upper()}_CHECK={key}={str(value).lower()}')
+              return all(checks.values())
+          common=['ATLAS_E3CN_ORPHAN_FROM_REUSED_STANDALONE_STORE_NO_META_ASSIGNMENT=true','ATLAS_E3CN_REAL_TIMER_SELECTED_RECOVERED_G1=true','ATLAS_E3C2_G1_API_ADOPTION_VERIFIED=true','ATLAS_E3C2_G2_PAUSED_CONTROL_VERIFIED=true']
+          old=result('original',original,common+['ATLAS_E3CN_G2_REGISTER_ENTRY_LOST=true','ATLAS_E3CN_G2_DISK_DIRECTORY_LOST=true','ATLAS_E3CN_VERDICT=REAL_TIMER_NATURAL_ORPHAN_PUBLIC_API_LIFECYCLE'])
+          ctrl=result('control',control,common+['ATLAS_E3C4_OLD_CALLBACK_RELEASED_BEFORE_G2=true','ATLAS_E3CN_G2_REGISTER_ENTRY_LOST=false','ATLAS_E3CN_G2_DISK_DIRECTORY_LOST=false','ATLAS_E3C4_CONTROL_G2_SURVIVED=true'])
+          print('ATLAS_E3C4_VERDICT='+('PASS_CURRENT_MAIN_RACE_WITH_TIMING_COUNTERCONTROL' if old and ctrl else 'BLOCKED_OR_FAIL'))
+          print('ATLAS_E3C4_SCOPE=UNSUPPORTED_STANDALONE_TO_CLUSTER_MIGRATION_ONLY')
+          PY
+      - name: Hash and archive evidence regardless of outcome
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          find . -maxdepth 1 -name 'atlas-e3c4-*' -type f ! -name 'atlas-e3c4-sha256.txt' -print0 | sort -z | xargs -0 sha256sum > atlas-e3c4-sha256.txt
+          sha256sum nats/server/atlas_e3c_native_orphan_test.go >> atlas-e3c4-sha256.txt
+          sha256sum --check atlas-e3c4-sha256.txt
+      - name: Upload evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: atlas-nats-e3c4-current-main-and-timing-control
+          path: |
+            atlas-e3c4-*
+            nats/server/atlas_e3c_native_orphan_test.go
+          if-no-files-found: warn
+          retention-days: 90
+      - name: Fail closed unless both contrasts pass
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          grep -Fxq 'ATLAS_E3C4_VERDICT=PASS_CURRENT_MAIN_RACE_WITH_TIMING_COUNTERCONTROL' atlas-e3c4-audit.txt
+          sha256sum --check atlas-e3c4-sha256.txt > /dev/null
+          echo 'ATLAS_E3C4_FINAL=PASS_SCOPE_RESTRICTION_RETAINED'
