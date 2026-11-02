@@ -1,0 +1,123 @@
+# ATLAS E3-D1 DIAG. One supported R3 offline/delete/restart; observe meta convergence.
+# No internal meta mutation; logger barrier controls only the original orphan timer.
+name: ATLAS E3D1 Supported Meta Convergence Diagnosis
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+  actions: read
+jobs:
+  diagnose:
+    runs-on: ubuntu-latest
+    timeout-minutes: 18
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: nats-io/nats-server
+          ref: dc55f4b43293fd1a4906b9acd0060e3298ebac0f
+          path: nats
+          persist-credentials: false
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: nats/go.mod
+          cache: false
+      - uses: actions/download-artifact@v4
+        with:
+          name: atlas-e3d-supported-lifecycle-evidence
+          run-id: 41504010224
+          github-token: ${{ github.token }}
+          path: evidence
+      - name: Verify original and instrument only test observation
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C nats rev-parse HEAD)" = dc55f4b43293fd1a4906b9acd0060e3298ebac0f
+          echo 'b469044ebd39c46196b661d32e3b133ce8e99c655635fd9dcbdb7d7981f0682d  evidence/nats/server/atlas_e3c_native_orphan_test.go' | sha256sum --check
+          cp evidence/nats/server/atlas_e3c_native_orphan_test.go nats/server/atlas_e3c_native_orphan_test.go
+          python3 - <<'ATLAS_PATCH'
+          from pathlib import Path
+          import hashlib,subprocess
+          p=Path('nats/server/atlas_e3c_native_orphan_test.go')
+          s=p.read_text()
+          a=s.index('\tjs.mu.RLock()\n\tcc := js.cluster\n\tvar assigned *streamAssignment',s.index('func TestAtlasE3DSupportedClusterOfflineDeleteRestart'))
+          b=s.index('\tselect {\n\tcase notice := <-gate.selected:',a)
+          new='// Set the logger before observing convergence, so the real 30s cleanup\n// cannot pass our observation unnoticed.\ngate := &atlasE3CTimerLogger{name: name, selected: make(chan string, 1), release: make(chan struct{})}\nvar unlockOnce sync.Once\nunlock := func() { unlockOnce.Do(func() { close(gate.release) }) }\ndefer unlock()\ns.SetLogger(gate, false, false)\n\nvar healthy bool\nvar assigned *streamAssignment\nvar lastState string\nvar orphanReady bool\nconvergenceDeadline := time.Now().Add(40 * time.Second)\nfor time.Now().Before(convergenceDeadline) {\n    js.mu.RLock()\n    cc := js.cluster\n    healthy = cc != nil && cc.meta != nil && !cc.meta.Leaderless() && cc.meta.Healthy()\n    assigned = nil\n    if cc != nil { assigned = cc.streams[acc.Name][name] }\n    js.mu.RUnlock()\n    local, localErr := acc.lookupStream(name)\n    _, diskErr := os.Stat(oldDir)\n    state := fmt.Sprintf("healthy=%t assigned=%t local_old=%t local_new=%t lookup_ok=%t old_path=%t", healthy, assigned != nil, local == g1, local != nil && local != g1, localErr == nil, diskErr == nil)\n    if state != lastState {\n        t.Logf("ATLAS_E3D1_META_TRANSITION=%s", state)\n        lastState = state\n    }\n    if healthy && assigned == nil && local == g1 && diskErr == nil {\n        orphanReady = true\n        break\n    }\n    time.Sleep(40 * time.Millisecond)\n}\nif !orphanReady {\n    t.Logf("ATLAS_E3D1_FINAL_META=%s", lastState)\n    t.Log("ATLAS_E3D1_REACHABILITY=NOT_ESTABLISHED")\n    t.Log("ATLAS_E3D1_SCOPE=SUPPORTED_CLUSTER_SHUTDOWN_DELETE_RESTART")\n    return\n}\nt.Log("ATLAS_E3D1_REACHABILITY=ORPHAN_PRECONDITIONS_CONFIRMED")\nt.Log("ATLAS_E3D_SUPPORTED_ORPHAN_FROM_OFFLINE_API_DELETE=true")\nt.Log("ATLAS_E3CN_SYNTHETIC_METADATA_MUTATION=false")\n\n'
+          s=s[:a]+new+s[b:]
+          p.write_text(s)
+          subprocess.run(['gofmt','-w',str(p)],check=True)
+          s=p.read_text()
+          print('ATLAS_E3D1_TEST_SOURCE_SHA256='+hashlib.sha256(s.encode()).hexdigest())
+          assert hashlib.sha256(s.encode()).hexdigest() == '4684474e4a97ba2c5afae04ed8c9639ae6fdcbfff4613de179bdf6b3a9f3bcc6'
+          ATLAS_PATCH
+          echo '4684474e4a97ba2c5afae04ed8c9639ae6fdcbfff4613de179bdf6b3a9f3bcc6  nats/server/atlas_e3c_native_orphan_test.go' | sha256sum --check
+          test -z "$(gofmt -l nats/server/atlas_e3c_native_orphan_test.go)"
+          test -z "$(git -C nats diff --name-only)"
+          git -C nats rev-parse HEAD | tee atlas-e3d1-upstream-sha.txt
+      - name: Execute supported lifecycle once
+        shell: bash
+        run: |
+          set +e
+          set -o pipefail
+          (cd nats && go test ./server -run '^TestAtlasE3DSupportedClusterOfflineDeleteRestart$' -count=1 -timeout=9m -v) 2>&1 | tee atlas-e3d1-run.log
+          rc=${PIPESTATUS[0]}
+          echo "$rc" > atlas-e3d1-exit.txt
+          echo "ATLAS_E3D1_NATIVE_EXIT=$rc"
+          exit 0
+      - name: Independent classification
+        if: always()
+        shell: bash
+        run: |
+          python3 - <<'PY' | tee atlas-e3d1-audit.txt
+          from pathlib import Path
+          import re
+          x=Path('atlas-e3d1-run.log')
+          s=x.read_text(errors='replace') if x.is_file() else ''
+          try: rc=int(Path('atlas-e3d1-exit.txt').read_text().strip())
+          except (OSError,ValueError): rc=-999
+          runs=len(re.findall(r'^=== RUN\s+TestAtlasE3DSupportedClusterOfflineDeleteRestart\s*$',s,re.M))
+          ends=len(re.findall(r'^--- (?:PASS|FAIL): TestAtlasE3DSupportedClusterOfflineDeleteRestart',s,re.M))
+          markers=['ATLAS_E3D_G1_R3_PRESENT_ON_TARGET=true','ATLAS_E3D_ONE_CLUSTER_MEMBER_OFFLINE=true','ATLAS_E3D_PUBLIC_DELETE_ACKNOWLEDGED=true','ATLAS_E3C2_G1_PAYLOAD_VERIFIED=true']
+          basics=all(s.count(m)==1 for m in markers) and runs==1 and ends==1
+          completed=rc==0 and '--- PASS: TestAtlasE3DSupportedClusterOfflineDeleteRestart' in s
+          lost='ATLAS_E3D_VERDICT=SUPPORTED_CLUSTER_LOCAL_G2_DAMAGE_REPRODUCED' in s
+          reached='ATLAS_E3D1_REACHABILITY=ORPHAN_PRECONDITIONS_CONFIRMED' in s
+          negative='ATLAS_E3D1_REACHABILITY=NOT_ESTABLISHED' in s
+          valid_damage=lost and reached and completed and basics and all(s.count(x)==1 for x in ['ATLAS_E3D_G2_PUBLIC_API_READABLE_BEFORE_RELEASE=true','ATLAS_E3CN_G2_REGISTER_ENTRY_LOST=true','ATLAS_E3CN_G2_DISK_DIRECTORY_LOST=true'])
+          if not basics: verdict='INVALID_OR_BLOCKED_EARLY'
+          elif valid_damage: verdict='CONTROLLED_LOCAL_DAMAGE_SUPPORTED_LIFECYCLE'
+          elif negative and completed: verdict='REACHABILITY_NOT_ESTABLISHED_IN_40_SEC_WINDOW'
+          elif reached: verdict='ORPHAN_REACHED_FOLLOWUP_BLOCKED'
+          else: verdict='INCONCLUSIVE'
+          print('ATLAS_E3D1_GO_EXIT='+str(rc))
+          print('ATLAS_E3D1_TEST_SELECTED_ONCE='+str(runs==1))
+          print('ATLAS_E3D1_TEST_TERMINATED_ONCE='+str(ends==1))
+          print('ATLAS_E3D1_VERDICT='+verdict)
+          print('ATLAS_E3D1_SCOPE=SUPPORTED_R3_OFFLINE_DELETE_RESTART;LOGGER_BARRIER;NOT_PRODUCTION_REACHABILITY')
+          print('ATLAS_E3D1_PRODUCT_CODE=UNMODIFIED')
+          PY
+      - name: Hash and archive even blocked
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          find . -maxdepth 1 -type f -name 'atlas-e3d1-*' ! -name 'atlas-e3d1-sha256.txt' -print0 | sort -z | xargs -0 -r sha256sum > atlas-e3d1-sha256.txt
+          sha256sum nats/server/atlas_e3c_native_orphan_test.go >> atlas-e3d1-sha256.txt
+          sha256sum --check atlas-e3d1-sha256.txt
+      - name: Upload evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: atlas-e3d1-meta-convergence-evidence
+          path: |
+            atlas-e3d1-*
+            nats/server/atlas_e3c_native_orphan_test.go
+          if-no-files-found: warn
+          retention-days: 90
+      - name: Diagnostic completion, no false red for valid negative
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          grep -Eq '^ATLAS_E3D1_VERDICT=(REACHABILITY_NOT_ESTABLISHED_IN_40_SEC_WINDOW|CONTROLLED_LOCAL_DAMAGE_SUPPORTED_LIFECYCLE|ORPHAN_REACHED_FOLLOWUP_BLOCKED)$' atlas-e3d1-audit.txt
+          sha256sum --check atlas-e3d1-sha256.txt > /dev/null
+          echo 'ATLAS_E3D1_VALID_DIAGNOSIS=true'
