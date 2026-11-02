@@ -1,0 +1,321 @@
+# ATLAS NATS E3-B v2: two isolated mechanisms + two negative controls.
+# DOES NOT reproduce issue #7556; DOES NOT establish a naturally reached race.
+# No NATS production source modified. Four explicit test cases, -count=3.
+name: ATLAS NATS E3B Split Mechanism Proof
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  split-mechanism-proof:
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    steps:
+      - name: Checkout frozen original NATS
+        uses: actions/checkout@v4
+        with:
+          repository: nats-io/nats-server
+          ref: d163ae747ad050ea89054f8fb03c43e64e737aea
+          fetch-depth: 1
+          path: nats
+      - name: Set up Go toolchain
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.26.10'
+          cache: false
+      - name: Restore additive test; verify product source integrity
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C nats rev-parse HEAD)" = d163ae747ad050ea89054f8fb03c43e64e737aea
+          test "$(git -C nats hash-object server/jetstream_cluster.go)" = d4f7f413367d9f3c122955ce99e9e10da5b8214c
+          test "$(git -C nats hash-object server/stream.go)" = 685758e51460493aebe2d8db679983a0da259bf7
+          test "$(git -C nats hash-object server/filestore.go)" = acee437a0ff4dfb80197f288a78df4108f4db24b
+          test -z "$(git -C nats status --porcelain)"
+          cat > nats/server/atlas_e3b_split_mechanisms_test.go <<'ATLAS_E3B_SOURCE'
+          //go:build !skip_js_tests
+
+          // ATLAS E3-B split primitive tests. This test file is ADDITIVE to the unchanged
+          // NATS source commit. The stale call is deliberately forced; neither method
+          // proves the NATS cluster naturally schedules an orphan/restore race.
+          package server
+
+          import (
+          	"os"
+          	"testing"
+          )
+
+          func atlasE3BStreamConfig(name string, storage StorageType) *StreamConfig {
+          	return &StreamConfig{
+          		Name:     name,
+          		Subjects: []string{"atlas.e3b." + name},
+          		Storage:  storage,
+          		Replicas: 1,
+          	}
+          }
+
+          // Registry hazard independent of a file-system deletion.
+          func TestAtlasE3BRegistrySameName(t *testing.T) {
+          	s := RunBasicJetStreamServer(t)
+          	defer s.Shutdown()
+          	acc := s.GlobalAccount()
+          	cfg := atlasE3BStreamConfig("E3BREG", MemoryStorage)
+          	g1, err := acc.addStream(cfg)
+          	if err != nil {
+          		t.Fatalf("create G1: %v", err)
+          	}
+          	if err := g1.delete(); err != nil {
+          		t.Fatalf("delete G1: %v", err)
+          	}
+          	g2, err := acc.addStream(cfg)
+          	if err != nil {
+          		t.Fatalf("create G2: %v", err)
+          	}
+          	if g1 == g2 {
+          		t.Fatal("G1 and G2 point to the same object")
+          	}
+          	nc, js := jsClientConnect(t, s)
+          	defer nc.Close()
+          	ack, err := js.Publish(cfg.Subjects[0], []byte("ATLAS|G2|REGISTRY"))
+          	if err != nil || ack == nil {
+          		t.Fatalf("publish G2: ack=%v err=%v", ack, err)
+          	}
+          	if live, err := acc.lookupStream(cfg.Name); err != nil || live != g2 {
+          		t.Fatalf("precondition G2 registered: live=%p err=%v", live, err)
+          	}
+          	t.Log("ATLAS_E3B_REGISTRY_PRE=G2_REGISTERED_ACKED")
+          	if err := g1.delete(); err != nil {
+          		t.Logf("ATLAS_E3B_STALE_G1_STOP_ERROR=%v", err)
+          	}
+          	live, _ := acc.lookupStream(cfg.Name)
+          	preserved := live == g2
+          	t.Logf("ATLAS_E3B_REGISTRY_G2_PRESERVED=%t", preserved)
+          	if preserved {
+          		t.Fatal("registry hazard NOT reproduced")
+          	}
+          	if state := g2.state(); state.Msgs != 1 {
+          		t.Fatalf("G2 backing object unexpectedly changed: %d", state.Msgs)
+          	}
+          	t.Log("ATLAS_E3B_REGISTRY_VERDICT=FORCED_STALE_G1_REMOVED_G2_NAME_ENTRY_ONLY")
+          }
+
+          // Negative control: a stale G1 action with a DIFFERENT stream name cannot
+          // remove G2's registry name entry.
+          func TestAtlasE3BRegistryDifferentNameControl(t *testing.T) {
+          	s := RunBasicJetStreamServer(t)
+          	defer s.Shutdown()
+          	acc := s.GlobalAccount()
+          	g1, err := acc.addStream(atlasE3BStreamConfig("E3BOLD", MemoryStorage))
+          	if err != nil {
+          		t.Fatalf("create G1: %v", err)
+          	}
+          	if err := g1.delete(); err != nil {
+          		t.Fatalf("delete G1: %v", err)
+          	}
+          	g2, err := acc.addStream(atlasE3BStreamConfig("E3BNEW", MemoryStorage))
+          	if err != nil {
+          		t.Fatalf("create G2: %v", err)
+          	}
+          	if err := g1.delete(); err != nil {
+          		t.Logf("stale G1 control error: %v", err)
+          	}
+          	live, err := acc.lookupStream("E3BNEW")
+          	preserved := err == nil && live == g2
+          	t.Logf("ATLAS_E3B_REGISTRY_DIFFERENT_NAME_PRESERVED=%t", preserved)
+          	if !preserved {
+          		t.Fatalf("different-name control failed: live=%p err=%v", live, err)
+          	}
+          }
+
+          // Path hazard independent of a registry name removal. Directly call only the
+          // G1 fileStore primitive that was retained after G1 was normally deleted.
+          func TestAtlasE3BStoreSamePath(t *testing.T) {
+          	s := RunBasicJetStreamServer(t)
+          	defer s.Shutdown()
+          	acc := s.GlobalAccount()
+          	cfg := atlasE3BStreamConfig("E3BSTORE", FileStorage)
+          	g1, err := acc.addStream(cfg)
+          	if err != nil {
+          		t.Fatalf("create G1: %v", err)
+          	}
+          	fs1, ok := g1.store.(*fileStore)
+          	if !ok {
+          		t.Fatal("G1 not fileStore")
+          	}
+          	if err := g1.delete(); err != nil {
+          		t.Fatalf("delete G1: %v", err)
+          	}
+          	if !fs1.isClosed() {
+          		t.Fatal("G1 store must be closed before stale invocation")
+          	}
+          	g2, err := acc.addStream(cfg)
+          	if err != nil {
+          		t.Fatalf("create G2: %v", err)
+          	}
+          	fs2, ok := g2.store.(*fileStore)
+          	if !ok || fs1 == fs2 {
+          		t.Fatal("G2 not distinct fileStore")
+          	}
+          	if fs1.fcfg.StoreDir != fs2.fcfg.StoreDir {
+          		t.Fatalf("same-path precondition failed: %q / %q", fs1.fcfg.StoreDir, fs2.fcfg.StoreDir)
+          	}
+          	nc, js := jsClientConnect(t, s)
+          	defer nc.Close()
+          	ack, err := js.Publish(cfg.Subjects[0], []byte("ATLAS|G2|STORE"))
+          	if err != nil || ack == nil {
+          		t.Fatalf("publish G2: ack=%v err=%v", ack, err)
+          	}
+          	if _, err := os.Stat(fs2.fcfg.StoreDir); err != nil {
+          		t.Fatalf("G2 directory missing before stale call: %v", err)
+          	}
+          	t.Log("ATLAS_E3B_STORE_PRE=G2_DIRECTORY_EXISTS_ACKED")
+          	err = fs1.Delete(true)
+          	if err != ErrStoreClosed {
+          		t.Fatalf("unexpected stale closed-G1 result: %v", err)
+          	}
+          	_, statErr := os.Stat(fs2.fcfg.StoreDir)
+          	preserved := statErr == nil
+          	live, lookupErr := acc.lookupStream(cfg.Name)
+          	mapPreserved := lookupErr == nil && live == g2
+          	t.Logf("ATLAS_E3B_STORE_G2_DIRECTORY_PRESERVED=%t", preserved)
+          	t.Logf("ATLAS_E3B_STORE_G2_REGISTRY_PRESERVED=%t", mapPreserved)
+          	if !os.IsNotExist(statErr) {
+          		t.Fatalf("path hazard NOT reproduced: statErr=%v", statErr)
+          	}
+          	if !mapPreserved {
+          		t.Fatal("registry changed in store-only test; mechanisms not isolated")
+          	}
+          	t.Log("ATLAS_E3B_STORE_VERDICT=FORCED_STALE_G1_FILESTORE_DELETED_G2_DIRECTORY_ONLY")
+          }
+
+          // Negative control: stale G1 store delete with a DIFFERENT stream directory
+          // must not remove the new G2 file store path.
+          func TestAtlasE3BStoreDifferentPathControl(t *testing.T) {
+          	s := RunBasicJetStreamServer(t)
+          	defer s.Shutdown()
+          	acc := s.GlobalAccount()
+          	g1, err := acc.addStream(atlasE3BStreamConfig("E3BDISKOLD", FileStorage))
+          	if err != nil {
+          		t.Fatalf("create G1: %v", err)
+          	}
+          	fs1, ok := g1.store.(*fileStore)
+          	if !ok {
+          		t.Fatal("G1 not fileStore")
+          	}
+          	if err := g1.delete(); err != nil {
+          		t.Fatalf("delete G1: %v", err)
+          	}
+          	g2, err := acc.addStream(atlasE3BStreamConfig("E3BDISKNEW", FileStorage))
+          	if err != nil {
+          		t.Fatalf("create G2: %v", err)
+          	}
+          	fs2, ok := g2.store.(*fileStore)
+          	if !ok {
+          		t.Fatal("G2 not fileStore")
+          	}
+          	if fs1.fcfg.StoreDir == fs2.fcfg.StoreDir {
+          		t.Fatal("control paths identical")
+          	}
+          	if _, err := os.Stat(fs2.fcfg.StoreDir); err != nil {
+          		t.Fatalf("G2 dir not present before: %v", err)
+          	}
+          	if err := fs1.Delete(true); err != ErrStoreClosed {
+          		t.Fatalf("unexpected stale G1 result: %v", err)
+          	}
+          	_, statErr := os.Stat(fs2.fcfg.StoreDir)
+          	preserved := statErr == nil
+          	t.Logf("ATLAS_E3B_STORE_DIFFERENT_PATH_PRESERVED=%t", preserved)
+          	if !preserved {
+          		t.Fatalf("different-path control failed: %v", statErr)
+          	}
+          }
+          ATLAS_E3B_SOURCE
+          printf '%s\n' '7c01af3301efb95759b1425b818d01e8884f77eaa805b82838f92f74cb07e4b9  nats/server/atlas_e3b_split_mechanisms_test.go' | sha256sum --check
+          test -z "$(gofmt -l nats/server/atlas_e3b_split_mechanisms_test.go)"
+          test -z "$(git -C nats diff --name-only)"
+          printf '%s\n' 'ATLAS_E3B_PRODUCT_UNMODIFIED=true' | tee atlas-e3b-product.txt
+          go version
+          sha256sum nats/server/{jetstream_cluster.go,stream.go,filestore.go,atlas_e3b_split_mechanisms_test.go} | tee atlas-e3b-inputs.txt
+      - name: Verify all four test names selected exactly
+        shell: bash
+        run: |
+          set -euo pipefail
+          (cd nats && go test ./server -list '^TestAtlasE3B') > atlas-e3b-test-list.txt 2> atlas-e3b-list-stderr.txt
+          for name in TestAtlasE3BRegistrySameName TestAtlasE3BRegistryDifferentNameControl TestAtlasE3BStoreSamePath TestAtlasE3BStoreDifferentPathControl; do
+            test "$(grep -Fxc "$name" atlas-e3b-test-list.txt || true)" = 1
+          done
+          test "$(grep -c '^TestAtlasE3B' atlas-e3b-test-list.txt)" = 4
+          echo 'ATLAS_E3B_TEST_SELECTION=EXACT_FOUR' | tee atlas-e3b-selection.txt
+      - name: Run four tests three times (retain output even on failure)
+        shell: bash
+        run: |
+          set +e
+          (cd nats && go test ./server -run '^TestAtlasE3B' -count=3 -timeout=20m -v) > atlas-e3b-go-test.log 2>&1
+          rc=$?
+          echo "$rc" > atlas-e3b-go-test.exit
+          echo "ATLAS_E3B_GO_EXIT=$rc"
+          exit 0
+      - name: Independent strict output audit
+        if: always()
+        shell: bash
+        run: |
+          set +e
+          python3 - <<'ATLAS_E3B_AUDIT' | tee atlas-e3b-audit.txt
+          from pathlib import Path
+          import re, hashlib
+          root=Path('.')
+          log=(root/'atlas-e3b-go-test.log').read_text(errors='replace') if (root/'atlas-e3b-go-test.log').exists() else ''
+          names=['TestAtlasE3BRegistrySameName','TestAtlasE3BRegistryDifferentNameControl','TestAtlasE3BStoreSamePath','TestAtlasE3BStoreDifferentPathControl']
+          try: rc=int((root/'atlas-e3b-go-test.exit').read_text().strip())
+          except (OSError,ValueError): rc=-999
+          f=root/'nats/server/atlas_e3b_split_mechanisms_test.go'
+          checks={'go_exit_zero':rc==0,'test_source_sha':f.is_file() and hashlib.sha256(f.read_bytes()).hexdigest()=='7c01af3301efb95759b1425b818d01e8884f77eaa805b82838f92f74cb07e4b9',
+          'selection_exact_four':'ATLAS_E3B_TEST_SELECTION=EXACT_FOUR' in (root/'atlas-e3b-selection.txt').read_text() if (root/'atlas-e3b-selection.txt').exists() else False,
+          'product_unchanged':'ATLAS_E3B_PRODUCT_UNMODIFIED=true' in (root/'atlas-e3b-product.txt').read_text() if (root/'atlas-e3b-product.txt').exists() else False,
+          'no_skips_or_fails':not re.search(r'^--- (?:SKIP|FAIL): TestAtlasE3B',log,re.M)}
+          for name in names:
+              checks['run_3_'+name]=len(re.findall(r'^=== RUN\s+'+name+r'\s*$',log,re.M))==3
+              checks['pass_3_'+name]=len(re.findall(r'^--- PASS: '+name+r' \(',log,re.M))==3
+          for token in ['ATLAS_E3B_REGISTRY_PRE=G2_REGISTERED_ACKED','ATLAS_E3B_REGISTRY_G2_PRESERVED=false',
+          'ATLAS_E3B_REGISTRY_VERDICT=FORCED_STALE_G1_REMOVED_G2_NAME_ENTRY_ONLY',
+          'ATLAS_E3B_REGISTRY_DIFFERENT_NAME_PRESERVED=true',
+          'ATLAS_E3B_STORE_PRE=G2_DIRECTORY_EXISTS_ACKED',
+          'ATLAS_E3B_STORE_G2_DIRECTORY_PRESERVED=false',
+          'ATLAS_E3B_STORE_G2_REGISTRY_PRESERVED=true',
+          'ATLAS_E3B_STORE_VERDICT=FORCED_STALE_G1_FILESTORE_DELETED_G2_DIRECTORY_ONLY',
+          'ATLAS_E3B_STORE_DIFFERENT_PATH_PRESERVED=true']:
+              checks['log_'+token]=log.count(token)==3
+          print('ATLAS_E3B_SCOPE=FORCED_ISOLATED_PRIMITIVES_NO_REAL_CLUSTER_ORPHAN_RACE')
+          for key,val in checks.items(): print('ATLAS_E3B_CHECK='+key+' passed='+str(val).lower())
+          print('ATLAS_E3B_AUDIT_VERDICT='+('PASS_SPLIT_PRIMITIVES_AND_NEGATIVE_CONTROLS' if all(checks.values()) else 'BLOCKED_OR_FAIL'))
+          ATLAS_E3B_AUDIT
+          grep -E 'ATLAS_E3B_(REGISTRY|STORE)_' atlas-e3b-go-test.log 2>/dev/null || true
+      - name: Hash all evidence
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          find . -maxdepth 1 -type f -name 'atlas-e3b-*' ! -name 'atlas-e3b-evidence-sha256.txt' -print0 | sort -z | xargs -0 -r sha256sum > atlas-e3b-evidence-sha256.txt
+          sha256sum nats/server/atlas_e3b_split_mechanisms_test.go >> atlas-e3b-evidence-sha256.txt
+          sha256sum --check atlas-e3b-evidence-sha256.txt | tee atlas-e3b-hash-check.txt
+      - name: Preserve logs and hashes regardless of result
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: atlas-nats-e3b-split-mechanisms-proof
+          path: |
+            atlas-e3b-*
+            nats/server/atlas_e3b_split_mechanisms_test.go
+          if-no-files-found: warn
+          retention-days: 14
+      - name: Fail closed unless both mechanisms and controls passed
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          grep -Fxq 'ATLAS_E3B_AUDIT_VERDICT=PASS_SPLIT_PRIMITIVES_AND_NEGATIVE_CONTROLS' atlas-e3b-audit.txt
+          sha256sum --check atlas-e3b-evidence-sha256.txt > /dev/null
+          echo 'ATLAS_E3B_FINAL=PASS_SPLIT_PRIMITIVES_ONLY'
