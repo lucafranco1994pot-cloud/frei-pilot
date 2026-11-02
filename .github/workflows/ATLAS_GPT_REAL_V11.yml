@@ -1,0 +1,277 @@
+name: ATLAS GPT one-file real SDK probe v10
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Setup Python
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        with:
+          python-version: '3.12'
+      - name: Write and offline-check embedded probe
+        shell: bash
+        run: |
+          cat > atlas_probe.py <<'ATLAS_SCRIPT_END_104'
+          #!/usr/bin/env python3
+          """ATLAS REAL-GPT-BINDING-02: no-key Agents SDK pause/resume diagnostic.
+          
+          Selftests exercise the effect/identity/policy oracle without SDK; `--sdk` runs real
+          Agent/Runner/approval/reject/resume with a scripted model. The latter is NOT
+          locally executed when the pinned SDK cannot be installed. No financial or
+          production effects; SQLite files exist only in temporary directories.
+          """
+          from __future__ import annotations
+          
+          import argparse
+          import asyncio
+          import dataclasses
+          import hashlib
+          import json
+          import platform
+          import sqlite3
+          import sys
+          import tempfile
+          import traceback
+          from pathlib import Path
+          
+          EXPECTED_COMMIT = 'e355d69152d4f4730dfb03b63dbce53e8d9f5d8c'
+          
+          @dataclasses.dataclass(frozen=True)
+          class Case:
+              name: str
+              decision: str = 'approve'    # approve | reject
+              final_room: str = 'room_A'
+              replacement_asset: bool = False
+              revoked: bool = False
+              fence: str = 'none'          # none | pin_target | check_authority | both
+          
+          CASES = (
+              Case('baseline_approved'),
+              Case('target_drift_no_fence', final_room='room_B'),
+              Case('asset_replaced_same_room', replacement_asset=True),
+              Case('revoked_no_execution_check', revoked=True),
+              Case('revoked_with_execution_check', revoked=True, fence='check_authority'),
+              Case('target_drift_with_target_pin', final_room='room_B', fence='pin_target'),
+              Case('target_drift_revoked_both_checks', final_room='room_B', revoked=True, fence='both'),
+              Case('explicit_rejection', decision='reject'),
+              Case('rejection_after_target_drift', decision='reject', final_room='room_B'),
+          )
+          
+          
+          def open_test_database(folder: Path) -> sqlite3.Connection:
+              con = sqlite3.connect(str(folder/'audit.sqlite3'))
+              con.execute('CREATE TABLE object (room TEXT PRIMARY KEY, asset_id TEXT NOT NULL, units INTEGER NOT NULL)')
+              con.execute('CREATE TABLE alias (name TEXT PRIMARY KEY, room TEXT NOT NULL)')
+              con.execute('CREATE TABLE authority (grant_id TEXT PRIMARY KEY, valid INTEGER NOT NULL, reason TEXT NOT NULL)')
+              con.execute('CREATE TABLE effect (id INTEGER PRIMARY KEY AUTOINCREMENT, operation_id TEXT NOT NULL, room TEXT NOT NULL, asset_id TEXT NOT NULL, units INTEGER NOT NULL)')
+              con.executemany('INSERT INTO object VALUES (?,?,?)', [('room_A','chest_A',100),('room_B','chest_B',100)])
+              con.execute("INSERT INTO alias VALUES ('vault','room_A')")
+              con.execute("INSERT INTO authority VALUES ('royal-grant-1',1,'originally-authorized')")
+              con.commit()
+              return con
+          
+          
+          def actual_target(con: sqlite3.Connection) -> dict:
+              row = con.execute('SELECT o.room,o.asset_id,o.units FROM object o JOIN alias a ON a.room=o.room WHERE a.name=?', ('vault',)).fetchone()
+              assert row is not None
+              return {'room':row[0],'asset_id':row[1],'units':row[2]}
+          
+          
+          def facts(con: sqlite3.Connection) -> dict:
+              valid, reason = con.execute("SELECT valid,reason FROM authority WHERE grant_id='royal-grant-1'").fetchone()
+              return {**actual_target(con), 'permission_valid':bool(valid),'revocation_reason':reason}
+          
+          
+          def mutate_world(con: sqlite3.Connection, case: Case) -> None:
+              con.execute('UPDATE alias SET room=? WHERE name=?', (case.final_room, 'vault'))
+              if case.replacement_asset:
+                  con.execute("UPDATE object SET asset_id='replacement_A' WHERE room='room_A'")
+              if case.revoked:
+                  con.execute("UPDATE authority SET valid=0,reason='investigation-open-not-guilt' WHERE grant_id='royal-grant-1'")
+              con.commit()
+          
+          
+          def action_at_effect_boundary(con: sqlite3.Connection, *, approval_target: dict, fence: str) -> str:
+              """Application tool executor boundary, not a promised SDK invariant."""
+              now = facts(con)
+              if fence in ('check_authority','both') and not now['permission_valid']:
+                  return 'DENIED_AT_EXECUTOR_AUTHORITY'
+              if fence in ('pin_target','both') and (now['room'],now['asset_id']) != (approval_target['room'],approval_target['asset_id']):
+                  return 'DENIED_AT_EXECUTOR_TARGET_DRIFT'
+              con.execute('INSERT INTO effect(operation_id,room,asset_id,units) VALUES (?,?,?,?)',
+                          ('order-100',now['room'],now['asset_id'],now['units']))
+              con.commit()
+              return 'EXECUTED_TEST_EFFECT'
+          
+          
+          def read_effects(con: sqlite3.Connection) -> list[dict]:
+              return [dict(zip(('id','operation_id','room','asset_id','units'),row)) for row in con.execute('SELECT id,operation_id,room,asset_id,units FROM effect ORDER BY id')]
+          
+          
+          def expected_for(case: Case) -> str:
+              if case.decision=='reject': return 'NO_EFFECT_REJECTED'
+              if case.revoked and case.fence in ('check_authority','both'): return 'DENIED_AT_EXECUTOR_AUTHORITY'
+              if (case.final_room!='room_A' or case.replacement_asset) and case.fence in ('pin_target','both'):
+                  return 'DENIED_AT_EXECUTOR_TARGET_DRIFT'
+              return 'EXECUTED_TEST_EFFECT'
+          
+          
+          def evaluate_case(case: Case, before: dict, after: dict, effects: list[dict], action_status: str) -> dict:
+              intended = expected_for(case)
+              oracle_ok = action_status==intended
+              if intended=='EXECUTED_TEST_EFFECT':
+                  oracle_ok = oracle_ok and len(effects)==1 and effects[0]['room']==after['room'] and effects[0]['asset_id']==after['asset_id']
+              else:
+                  oracle_ok = oracle_ok and len(effects)==0
+              return {'case':case.name,'expected_application_oracle':intended,
+                      'observed_application_result':action_status,'oracle_pass':bool(oracle_ok),
+                      'before':before,'after':after,'effects':effects,
+                      'note':'Diagnostic of application/SDK integration, not proof of an SDK security promise'}
+          
+          
+          def selftest() -> dict:
+              observations=[]
+              for case in CASES:
+                  with tempfile.TemporaryDirectory(prefix='atlas-') as td:
+                      with open_test_database(Path(td)) as con:
+                          before=facts(con)
+                          assert before['room']=='room_A' and before['asset_id']=='chest_A'
+                          mutate_world(con,case)
+                          after=facts(con)
+                          action='NO_EFFECT_REJECTED' if case.decision=='reject' else action_at_effect_boundary(con,approval_target=before,fence=case.fence)
+                          row=evaluate_case(case,before,after,read_effects(con),action)
+                          assert row['oracle_pass'],row
+                          observations.append(row)
+              # Negative mutations check that oracle actually notices an incorrect effect.
+              fake = [{'id':1,'operation_id':'order-100','room':'room_B','asset_id':'chest_B','units':100}]
+              base=next(r for r in observations if r['case']=='baseline_approved')
+              assert evaluate_case(CASES[0],base['before'],base['after'],fake,'EXECUTED_TEST_EFFECT')['oracle_pass'] is False
+              rej=next(r for r in observations if r['case']=='explicit_rejection')
+              assert evaluate_case(CASES[7],rej['before'],rej['after'],fake,'NO_EFFECT_REJECTED')['oracle_pass'] is False
+              return {'mode':'offline_selftest','status':'PASS','scenario_count':len(observations),
+                      'oracle_mutations_detected':2,'scenarios':observations}
+          
+          
+          async def sdk_case(case: Case) -> dict:
+              from agents import Agent, RunConfig, Runner
+              from agents.decorators import tool
+              from agents.testing import ScriptedModel, assistant_message, function_call
+          
+              with tempfile.TemporaryDirectory(prefix='atlas-sdk-') as td:
+                  with open_test_database(Path(td)) as con:
+                      before=facts(con)
+                      executor_responses=[]
+                      @tool(needs_approval=True)
+                      async def mark_vault(path: str) -> str:
+                          """Write a harmless audit-only marker to the resolved test vault."""
+                          if path!='vault':
+                              return 'INVALID_TEST_ALIAS'
+                          outcome=action_at_effect_boundary(con,approval_target=before,fence=case.fence)
+                          executor_responses.append(outcome)
+                          return outcome
+          
+                      model=ScriptedModel([
+                          [function_call('mark_vault',{'path':'vault'},call_id='call-atlas-fixed')],
+                          [assistant_message('The request was processed.')],
+                      ])
+                      agent=Agent(name='ATLAS controlled test',model=model,tools=[mark_vault])
+                      cfg=RunConfig(tracing_disabled=True)
+                      initial=await Runner.run(agent,'Mark the vault in the isolated test.',run_config=cfg)
+                      assert len(initial.interruptions)==1,f'approval interruption expected, got {len(initial.interruptions)}'
+                      assert not read_effects(con),'effect before approval!'
+                      state=initial.to_state()
+                      if case.decision=='approve': state.approve(initial.interruptions[0])
+                      else: state.reject(initial.interruptions[0])
+                      # Isolation: mutate after the actual approval/rejection, before resume.
+                      mutate_world(con,case)
+                      after=facts(con)
+                      resumed=await Runner.run(agent,state,run_config=cfg)
+                      model.assert_complete()
+                      assert not resumed.interruptions,f'Unexpected interruption after decision: {resumed.interruptions}'
+                      if case.decision=='reject':
+                          assert executor_responses==[],f'Executor entered for rejected request {executor_responses}'
+                          status='NO_EFFECT_REJECTED'
+                      else:
+                          assert len(executor_responses)==1,f'Expected one executor entrance, got {executor_responses}'
+                          status=executor_responses[0]
+                      row=evaluate_case(case,before,after,read_effects(con),status)
+                      row['sdk_final_output']=resumed.final_output
+                      row['executor_entry_count']=len(executor_responses)
+                      assert row['oracle_pass'],row
+                      return row
+          
+          
+          async def sdk_main() -> dict:
+              rows=[]
+              for case in CASES:
+                  try:
+                      row=await sdk_case(case)
+                      rows.append(row)
+                  except Exception as exc:
+                      rows.append({'case':case.name,'status':'ERROR','exception':f'{type(exc).__name__}: {exc}',
+                                   'traceback':traceback.format_exc()})
+                      break
+              success=len(rows)==len(CASES) and all(row.get('oracle_pass') for row in rows)
+              return {'mode':'actual_sdk_no_api_key','status':'EXECUTED_DIAGNOSTIC_ONLY' if success else 'FAIL_OR_BLOCKED',
+                      'expected_sdk_source_commit':EXPECTED_COMMIT,'sdk_source_commit_proven_in_process':False,
+                      'scenarios':rows,'scenario_count':len(rows),'total':len(CASES),
+                      'python':platform.python_version()}
+          
+          
+          def main() -> int:
+              parser=argparse.ArgumentParser()
+              parser.add_argument('--mode',choices=['selftest','sdk'],required=True)
+              parser.add_argument('--output',default=None)
+              args=parser.parse_args()
+              try:
+                  if args.mode=='selftest': output=selftest()
+                  else: output=asyncio.run(sdk_main())
+              except Exception as exc:
+                  output={'mode':args.mode,'status':'FAIL_OR_BLOCKED','error':f'{type(exc).__name__}: {exc}',
+                          'traceback':traceback.format_exc()}
+              output['script_sha256']=hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
+              name=args.output or ('atlas_v10_offline.json' if args.mode=='selftest' else 'atlas_v10_sdk.json')
+              Path(name).write_text(json.dumps(output,indent=2,ensure_ascii=False)+'\n',encoding='utf-8')
+              print(json.dumps({'mode':output['mode'],'status':output['status'],
+                                'scenario_count':output.get('scenario_count',0),
+                                'output':name},ensure_ascii=False))
+              return 0 if output['status'] in ('PASS','EXECUTED_DIAGNOSTIC_ONLY') else 1
+          
+          
+          if __name__=='__main__':
+              raise SystemExit(main())
+          ATLAS_SCRIPT_END_104
+          python atlas_probe.py --mode selftest
+      - name: Install exact Agents SDK
+        run: |
+          python -m pip install 'git+https://github.com/openai/openai-agents-python.git@e355d69152d4f4730dfb03b63dbce53e8d9f5d8c'
+          python -m pip show openai-agents > sdk_version.txt
+      - name: Probe actual approval, resume, effect
+        run: python atlas_probe.py --mode sdk
+      - name: Record environment and evidence hashes
+        if: always()
+        run: |
+          python -m pip freeze > pip_freeze.txt
+          python --version > python_version.txt
+          sha256sum atlas_probe.py > SHA256SUMS
+          for f in atlas_v10_offline.json atlas_v10_sdk.json sdk_version.txt pip_freeze.txt python_version.txt; do
+            if [ -f "$f" ]; then sha256sum "$f" >> SHA256SUMS; fi
+          done
+      - name: Archive all evidence even when a step fails
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: atlas-gpt-real-v10
+          path: |
+            atlas_probe.py
+            atlas_v10_offline.json
+            atlas_v10_sdk.json
+            sdk_version.txt
+            pip_freeze.txt
+            python_version.txt
+            SHA256SUMS
+          if-no-files-found: warn
