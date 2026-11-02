@@ -1,0 +1,586 @@
+# ATLAS NATS E3-C: 1 native startup orphan + 1 synthetic fallback, scoped separately.
+# Native orphan: documented standalone -> cluster same-store migration, NOT #7556.
+# Synthetic fallback: manually altered metadata in test, NOT production repro.
+# Real 30s NATS monitor timers; genuine JS public API; no product-code changes.
+name: ATLAS NATS E3C Native Orphan Reachability
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  native-orphan-reachability:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout frozen original NATS
+        uses: actions/checkout@v4
+        with:
+          repository: nats-io/nats-server
+          ref: d163ae747ad050ea89054f8fb03c43e64e737aea
+          fetch-depth: 1
+          path: nats
+      - name: Set up Go 1.26.10
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.26.10'
+          cache: false
+      - name: Add tests and verify original product integrity
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C nats rev-parse HEAD)" = d163ae747ad050ea89054f8fb03c43e64e737aea
+          test "$(git -C nats hash-object server/jetstream_cluster.go)" = d4f7f413367d9f3c122955ce99e9e10da5b8214c
+          test "$(git -C nats hash-object server/stream.go)" = 685758e51460493aebe2d8db679983a0da259bf7
+          test "$(git -C nats hash-object server/filestore.go)" = acee437a0ff4dfb80197f288a78df4108f4db24b
+          test -z "$(git -C nats status --porcelain)"
+          cat > nats/server/atlas_e3c_native_orphan_test.go <<'ATLAS_E3C_SOURCE'
+          //go:build !skip_js_tests && !skip_js_cluster_tests_2
+          
+          // ATLAS NATS E3-C1: REAL 30s timer/real public API, deliberately SYNTHETIC
+          // metadata gap. This is a CONDITIONAL INTERLEAVING TEST, NOT a #7556 repro.
+          // No NATS product code is modified. All servers are temporary test instances.
+          package server
+          
+          import (
+          	"fmt"
+          	"os"
+          	"strings"
+          	"sync"
+          	"testing"
+          	"time"
+          
+          	"github.com/nats-io/nats.go"
+          )
+          
+          type atlasE3CTimerLogger struct {
+          	name     string
+          	selected chan string
+          	release  chan struct{}
+          	once     sync.Once
+          }
+          
+          func (l *atlasE3CTimerLogger) Noticef(string, ...any) {}
+          func (l *atlasE3CTimerLogger) Fatalf(string, ...any)  {}
+          func (l *atlasE3CTimerLogger) Errorf(string, ...any)  {}
+          func (l *atlasE3CTimerLogger) Debugf(string, ...any)  {}
+          func (l *atlasE3CTimerLogger) Tracef(string, ...any)  {}
+          func (l *atlasE3CTimerLogger) Warnf(format string, args ...any) {
+          	msg := fmt.Sprintf(format, args...)
+          	if strings.Contains(msg, "Detected orphaned stream '") && strings.Contains(msg, " > "+l.name+"'") {
+          		l.once.Do(func() { l.selected <- msg })
+          		<-l.release // pause the actual timer callback after selection, before mset.delete
+          	}
+          }
+          
+          func TestAtlasE3CNativeTimerWithSyntheticMetadataGap(t *testing.T) {
+          	// IMPORTANT LIMITATION: a synthetic metadata gap is deliberately created
+          	// in the test only. This does not prove a bad metadata view can occur in
+          	// production. G1/G2 are removed/recreated through the real JetStream API.
+          	c := createJetStreamClusterExplicit(t, "ATLAS_E3C", 3)
+          	defer c.shutdown()
+          	c.waitOnLeader()
+          	nc, api := jsClientConnect(t, c.randomServer())
+          	defer nc.Close()
+          
+          	const name, subject = "ATLAS_E3C", "atlas.e3c"
+          	cfg := &nats.StreamConfig{Name: name, Subjects: []string{subject}, Replicas: 3, Storage: nats.FileStorage}
+          	if _, err := api.AddStream(cfg); err != nil {
+          		t.Fatalf("API create G1: %v", err)
+          	}
+          
+          	// Collect local G1 objects and their directories for all replicas.
+          	original := make(map[*Server]*stream)
+          	oldPaths := make(map[*Server]string)
+          	until := time.Now().Add(15 * time.Second)
+          	for time.Now().Before(until) {
+          		ok := true
+          		for _, s := range c.servers {
+          			ms, err := s.GlobalAccount().lookupStream(name)
+          			if err != nil || ms == nil {
+          				ok = false
+          				break
+          			}
+          			fs, typed := ms.store.(*fileStore)
+          			if !typed {
+          				t.Fatalf("node G1 is not fileStore")
+          			}
+          			original[s], oldPaths[s] = ms, fs.fcfg.StoreDir
+          		}
+          		if ok {
+          			break
+          		}
+          		time.Sleep(25 * time.Millisecond)
+          	}
+          	if len(original) != 3 {
+          		t.Fatalf("G1 was not installed on all three nodes: %d", len(original))
+          	}
+          
+          	// Choose a node where the 30-second monitor timer will run. The warning
+          	// logger blocks ONLY after real checkForOrphans has selected this stream.
+          	s := c.servers[0]
+          	acc := s.GlobalAccount()
+          	js := s.getJetStream()
+          	if js == nil {
+          		t.Fatal("target JetStream nil")
+          	}
+          	gate := &atlasE3CTimerLogger{name: name, selected: make(chan string, 1), release: make(chan struct{})}
+          	var unlockOnce sync.Once
+          	unlock := func() { unlockOnce.Do(func() { close(gate.release) }) }
+          	defer unlock()
+          	s.SetLogger(gate, false, false)
+          
+          	js.mu.Lock()
+          	cc := js.cluster
+          	if cc == nil || cc.meta == nil || cc.meta.Leaderless() || !cc.meta.Healthy() {
+          		js.mu.Unlock()
+          		t.Fatal("meta not healthy before synthetic gap")
+          	}
+          	perAccount := cc.streams[acc.Name]
+          	var saved *streamAssignment
+          	if perAccount != nil {
+          		saved = perAccount[name]
+          	}
+          	if saved == nil {
+          		js.mu.Unlock()
+          		t.Fatal("local metadata assignment missing before synthetic gap")
+          	}
+          	if live, err := acc.lookupStream(name); err != nil || live != original[s] {
+          		js.mu.Unlock()
+          		t.Fatalf("G1 local identity changed before synthetic gap: %p %v", live, err)
+          	}
+          	// Artificial precondition, conspicuously logged. This must NOT be
+          	// mistaken for a naturally corrupted snapshot or real NATS defect.
+          	delete(perAccount, name)
+          	js.mu.Unlock()
+          	t.Log("ATLAS_E3C_SYNTHETIC_METADATA_GAP=true")
+          	t.Log("ATLAS_E3C_PRODUCT_TIMER_EXPECTED=30S_AFTER_META_RECOVERY")
+          
+          	select {
+          	case notice := <-gate.selected:
+          		t.Logf("ATLAS_E3C_REAL_TIMER_WARN=%q", notice)
+          		t.Log("ATLAS_E3C_TIMER_SELECTED_G1=TRUE")
+          	case <-time.After(55 * time.Second):
+          		t.Fatal("BLOCKED: real timer did not select synthetic orphan during window")
+          	}
+          
+          	// Restore the artificial assignment gap BEFORE ordinary public API
+          	// deletion. The timer callback is still blocked at its real Warnf call.
+          	js.mu.Lock()
+          	if js.cluster.streams[acc.Name] == nil {
+          		js.cluster.streams[acc.Name] = make(map[string]*streamAssignment)
+          	}
+          	if now := js.cluster.streams[acc.Name][name]; now != nil && now != saved {
+          		js.mu.Unlock()
+          		t.Fatal("assignment changed unexpectedly while gate held")
+          	}
+          	js.cluster.streams[acc.Name][name] = saved
+          	js.mu.Unlock()
+          	t.Log("ATLAS_E3C_SYNTHETIC_ASSIGNMENT_RESTORED=true")
+          
+          	if err := api.DeleteStream(name); err != nil {
+          		t.Fatalf("real API delete G1: %v", err)
+          	}
+          	// Wait until ALL normal G1 deletions finish. This excludes leftover
+          	// legitimate G1 deletion as an alternative explanation for G2 removal.
+          	until = time.Now().Add(15 * time.Second)
+          	gone := false
+          	for time.Now().Before(until) {
+          		gone = true
+          		for _, node := range c.servers {
+          			ms, _ := node.GlobalAccount().lookupStream(name)
+          			if ms != nil {
+          				gone = false
+          				break
+          			}
+          			if _, err := os.Stat(oldPaths[node]); !os.IsNotExist(err) {
+          				gone = false
+          				break
+          			}
+          		}
+          		if gone {
+          			break
+          		}
+          		time.Sleep(30 * time.Millisecond)
+          	}
+          	if !gone {
+          		t.Fatal("BLOCKED: G1 not fully deleted by real API on all nodes")
+          	}
+          	if !original[s].closed.Load() {
+          		t.Fatal("old G1 not closed after real API deletion")
+          	}
+          	t.Log("ATLAS_E3C_G1_REGULAR_API_DELETION=COMPLETE_ALL_3")
+          
+          	if _, err := api.AddStream(cfg); err != nil {
+          		t.Fatalf("real API create G2: %v", err)
+          	}
+          	until = time.Now().Add(15 * time.Second)
+          	var g2 *stream
+          	var fs2 *fileStore
+          	for time.Now().Before(until) {
+          		live, _ := acc.lookupStream(name)
+          		if live != nil && live != original[s] {
+          			typed, yes := live.store.(*fileStore)
+          			if yes {
+          				g2, fs2 = live, typed
+          				break
+          			}
+          		}
+          		time.Sleep(25 * time.Millisecond)
+          	}
+          	if g2 == nil {
+          		t.Fatal("BLOCKED: G2 not recreated on targeted replica")
+          	}
+          	if fs2.fcfg.StoreDir != oldPaths[s] {
+          		t.Fatalf("G1 G2 paths differ: %q vs %q", oldPaths[s], fs2.fcfg.StoreDir)
+          	}
+          	ack, err := api.Publish(subject, []byte("ATLAS_E3C_G2_ACKED_UNIQUE_CONTENT"))
+          	if err != nil || ack == nil {
+          		t.Fatalf("G2 publish not acknowledged: %v", err)
+          	}
+          	if _, err := os.Stat(fs2.fcfg.StoreDir); err != nil {
+          		t.Fatalf("G2 path missing before resuming old timer: %v", err)
+          	}
+          	if live, _ := acc.lookupStream(name); live != g2 {
+          		t.Fatal("G2 not registered before timer release")
+          	}
+          	t.Log("ATLAS_E3C_G2_REGISTERED_ACKED_SAME_PATH_BEFORE_RELEASE=true")
+          
+          	// Allow the REAL orphan timer callback to proceed to its original
+          	// mset.delete on saved G1. NO direct stale delete is issued by the test.
+          	unlock()
+          	t.Log("ATLAS_E3C_REAL_TIMER_RELEASED=true")
+          	until = time.Now().Add(12 * time.Second)
+          	mapLost, pathLost := false, false
+          	for time.Now().Before(until) {
+          		live, _ := acc.lookupStream(name)
+          		_, statErr := os.Stat(fs2.fcfg.StoreDir)
+          		mapLost, pathLost = live != g2, os.IsNotExist(statErr)
+          		if mapLost && pathLost {
+          			break
+          		}
+          		time.Sleep(10 * time.Millisecond)
+          	}
+          	t.Logf("ATLAS_E3C_G2_REGISTER_ENTRY_LOST=%t", mapLost)
+          	t.Logf("ATLAS_E3C_G2_DISK_DIRECTORY_LOST=%t", pathLost)
+          	if !mapLost || !pathLost {
+          		t.Fatalf("CONDITIONAL_TIMER_INTERLEAVING_NOT_CONFIRMED: mapLost=%t pathLost=%t", mapLost, pathLost)
+          	}
+          	t.Log("ATLAS_E3C_VERDICT=REAL_TIMER_REAL_API_SYNTHETIC_META_GAP_CONDITIONAL_PROOF")
+          	t.Log("ATLAS_E3C_SCOPE=NOT_NATURAL_ORPHAN_NOT_7556_REPRO_NOT_PRODUCTION_BUG")
+          }
+          
+          // A stronger, naturally produced orphan candidate using the documented
+          // standalone -> clustered transition (nats-io/nats-server issue #5467).
+          // The migration itself is NOT the recommended way to migrate JetStream data.
+          // Unlike the other test, this method DOES NOT modify cc.streams manually.
+          // It attempts to show that public API assignment/delete/recreate can occur
+          // while a real startup-orphan timer still retains G1.
+          func TestAtlasE3CNaturalOrphanMigration(t *testing.T) {
+          	const name, subject = "ATLAS_E3CN", "atlas.e3c.natural"
+          	dir := t.TempDir()
+          	standaloneConf := fmt.Sprintf(`
+                  listen: 127.0.0.1:-1
+                  server_name: ATLAS_E3C_SINGLE
+                  jetstream: {max_mem_store: 2GB, max_file_store: 2GB, store_dir: '%s'}
+                  accounts { $SYS { users = [ { user: "admin", pass: "s3cr3t!" } ] } }
+              `, dir)
+          	single, _ := RunServerWithConfig(createConfFile(t, []byte(standaloneConf)))
+          	singleNC, singleAPI := jsClientConnect(t, single)
+          	cfg := &nats.StreamConfig{Name: name, Subjects: []string{subject}, Replicas: 1, Storage: nats.FileStorage}
+          	if _, err := singleAPI.AddStream(cfg); err != nil {
+          		t.Fatalf("standalone create G1: %v", err)
+          	}
+          	if ack, err := singleAPI.Publish(subject, []byte("ATLAS_E3C_NATURAL_STANDALONE_G1")); err != nil || ack == nil {
+          		t.Fatalf("standalone G1 publish failed: %v", err)
+          	}
+          	singleNC.Close()
+          	single.Shutdown()
+          	single.WaitForShutdown()
+          	t.Log("ATLAS_E3CN_G1_STANDALONE_CREATED_ACKED_STOPPED=true")
+          
+          	// Reuse the SAME store directory only after the standalone server is
+          	// completely stopped. The new NATS instance runs in clustered mode, but
+          	// starts with no stream assignment for previously standalone G1.
+          	var changed bool
+          	modify := func(serverName, clusterName, newDir, conf string) string {
+          		if !changed {
+          			changed = true
+          			return strings.Replace(conf, newDir, dir, 1)
+          		}
+          		return conf
+          	}
+          	c := createJetStreamClusterWithTemplateAndModHook(t, jsClusterTempl, "ATLAS_E3C_NATURAL", 1, modify)
+          	defer c.shutdown()
+          	if !changed || len(c.servers) != 1 {
+          		t.Fatal("native migration cluster configuration not applied")
+          	}
+          	c.waitOnLeader()
+          	s := c.servers[0]
+          	acc := s.GlobalAccount()
+          	js := s.getJetStream()
+          	if js == nil {
+          		t.Fatal("cluster node missing JetStream")
+          	}
+          
+          	g1, err := acc.lookupStream(name)
+          	if err != nil || g1 == nil {
+          		t.Fatalf("BLOCKED: standalone G1 not recovered from reused directory: %v", err)
+          	}
+          	fs1, typed := g1.store.(*fileStore)
+          	if !typed {
+          		t.Fatal("recovered G1 store is not fileStore")
+          	}
+          	oldDir := fs1.fcfg.StoreDir
+          	if _, err := os.Stat(oldDir); err != nil {
+          		t.Fatalf("old G1 path absent: %v", err)
+          	}
+          
+          	js.mu.RLock()
+          	cc := js.cluster
+          	var assigned *streamAssignment
+          	healthy := cc != nil && cc.meta != nil && !cc.meta.Leaderless() && cc.meta.Healthy()
+          	if cc != nil {
+          		assigned = cc.streams[acc.Name][name]
+          	}
+          	js.mu.RUnlock()
+          	if !healthy || assigned != nil {
+          		t.Fatalf("BLOCKED: natural orphan preconditions false; healthy=%t assigned=%t", healthy, assigned != nil)
+          	}
+          	t.Log("ATLAS_E3CN_ORPHAN_FROM_REUSED_STANDALONE_STORE_NO_META_ASSIGNMENT=true")
+          	t.Log("ATLAS_E3CN_SYNTHETIC_METADATA_MUTATION=false")
+          
+          	gate := &atlasE3CTimerLogger{name: name, selected: make(chan string, 1), release: make(chan struct{})}
+          	var unlockOnce sync.Once
+          	unlock := func() { unlockOnce.Do(func() { close(gate.release) }) }
+          	defer unlock()
+          	s.SetLogger(gate, false, false)
+          	select {
+          	case notice := <-gate.selected:
+          		t.Logf("ATLAS_E3CN_NATURAL_ORPHAN_TIMER_WARNING=%q", notice)
+          		t.Log("ATLAS_E3CN_REAL_TIMER_SELECTED_RECOVERED_G1=true")
+          	case <-time.After(55 * time.Second):
+          		t.Fatal("BLOCKED: real timer did not select recovered standalone G1")
+          	}
+          
+          	// At this point the real callback has a pointer to orphan G1. Try to
+          	// establish a legitimate metadata assignment using the PUBLIC API, then
+          	// delete and recreate. No direct stream pointer methods are called.
+          	nc, api := jsClientConnect(t, s)
+          	defer nc.Close()
+          	if _, err := api.AddStream(cfg); err != nil {
+          		t.Fatalf("BLOCKED: public API could not adopt/assign naturally orphaned G1: %v", err)
+          	}
+          	if _, err := api.StreamInfo(name); err != nil {
+          		t.Fatalf("BLOCKED: assigned stream unavailable before delete: %v", err)
+          	}
+          	t.Log("ATLAS_E3CN_PUBLIC_API_REASSIGNED_ORPHAN_NAME=true")
+          	if err := api.DeleteStream(name); err != nil {
+          		t.Fatalf("BLOCKED: public API delete G1 after reassignment: %v", err)
+          	}
+          	until := time.Now().Add(15 * time.Second)
+          	deleted := false
+          	for time.Now().Before(until) {
+          		live, _ := acc.lookupStream(name)
+          		_, statErr := os.Stat(oldDir)
+          		if live == nil && os.IsNotExist(statErr) {
+          			deleted = true
+          			break
+          		}
+          		time.Sleep(25 * time.Millisecond)
+          	}
+          	if !deleted || !g1.closed.Load() {
+          		t.Fatal("BLOCKED: prior G1 not fully deleted by public API")
+          	}
+          	t.Log("ATLAS_E3CN_G1_PUBLIC_API_DELETION_COMPLETE=true")
+          
+          	if _, err := api.AddStream(cfg); err != nil {
+          		t.Fatalf("G2 public API creation: %v", err)
+          	}
+          	until = time.Now().Add(15 * time.Second)
+          	var g2 *stream
+          	var fs2 *fileStore
+          	for time.Now().Before(until) {
+          		candidate, _ := acc.lookupStream(name)
+          		if candidate != nil && candidate != g1 {
+          			fs, ok := candidate.store.(*fileStore)
+          			if ok {
+          				g2, fs2 = candidate, fs
+          				break
+          			}
+          		}
+          		time.Sleep(25 * time.Millisecond)
+          	}
+          	if g2 == nil {
+          		t.Fatal("BLOCKED: distinct G2 not locally registered")
+          	}
+          	if fs2.fcfg.StoreDir != oldDir {
+          		t.Fatalf("G1 G2 path not reused: %q vs %q", oldDir, fs2.fcfg.StoreDir)
+          	}
+          	ack, err := api.Publish(subject, []byte("ATLAS_E3CN_G2_UNIQUE_ACKED_PAYLOAD"))
+          	if err != nil || ack == nil {
+          		t.Fatalf("G2 publish not acknowledged: %v", err)
+          	}
+          	if _, err := os.Stat(fs2.fcfg.StoreDir); err != nil {
+          		t.Fatalf("G2 directory not present before timer release: %v", err)
+          	}
+          	if live, _ := acc.lookupStream(name); live != g2 {
+          		t.Fatal("G2 not current before release")
+          	}
+          	t.Log("ATLAS_E3CN_G2_PUBLIC_API_CREATED_ACKED_SAME_PATH=true")
+          
+          	unlock()
+          	t.Log("ATLAS_E3CN_NATIVE_TIMER_RELEASED=true")
+          	until = time.Now().Add(12 * time.Second)
+          	mapLost, pathLost := false, false
+          	for time.Now().Before(until) {
+          		live, _ := acc.lookupStream(name)
+          		_, stErr := os.Stat(fs2.fcfg.StoreDir)
+          		mapLost, pathLost = live != g2, os.IsNotExist(stErr)
+          		if mapLost && pathLost {
+          			break
+          		}
+          		time.Sleep(10 * time.Millisecond)
+          	}
+          	t.Logf("ATLAS_E3CN_G2_REGISTER_ENTRY_LOST=%t", mapLost)
+          	t.Logf("ATLAS_E3CN_G2_DISK_DIRECTORY_LOST=%t", pathLost)
+          	if !mapLost || !pathLost {
+          		t.Fatalf("NATURAL_INTERLEAVING_NOT_REPRODUCED map=%t disk=%t", mapLost, pathLost)
+          	}
+          	t.Log("ATLAS_E3CN_VERDICT=REAL_TIMER_NATURAL_ORPHAN_PUBLIC_API_LIFECYCLE")
+          	t.Log("ATLAS_E3CN_SCOPE=STANDALONE_TO_SINGLE_NODE_CLUSTER_MIGRATION_NOT_7556_SNAPSHOT_REPRO")
+          }
+          ATLAS_E3C_SOURCE
+          printf '%s\n' '9933c17e42c6fa6461c3f483e91d16a3c05db1bbf00234f52dd6db4c3959b5cc  nats/server/atlas_e3c_native_orphan_test.go' | sha256sum --check
+          test -z "$(gofmt -l nats/server/atlas_e3c_native_orphan_test.go)"
+          test -z "$(git -C nats diff --name-only)"
+          echo 'ATLAS_E3C_PRODUCT_SOURCE_UNMODIFIED=true' | tee atlas-e3c-product.txt
+          go version | tee atlas-e3c-go-version.txt
+          sha256sum nats/server/{jetstream_cluster.go,stream.go,filestore.go,atlas_e3c_native_orphan_test.go} | tee atlas-e3c-inputs.txt
+      - name: Verify exactly two named tests compile
+        shell: bash
+        run: |
+          set -euo pipefail
+          (cd nats && go test ./server -list '^TestAtlasE3C') > atlas-e3c-test-list.txt 2> atlas-e3c-list-stderr.txt
+          test "$(grep -Fxc 'TestAtlasE3CNaturalOrphanMigration' atlas-e3c-test-list.txt || true)" = 1
+          test "$(grep -Fxc 'TestAtlasE3CNativeTimerWithSyntheticMetadataGap' atlas-e3c-test-list.txt || true)" = 1
+          test "$(grep -c '^TestAtlasE3C' atlas-e3c-test-list.txt)" = 2
+          echo 'ATLAS_E3C_TEST_SELECTION=EXACT_TWO' | tee atlas-e3c-selection.txt
+      - name: Primary - native orphan from standalone to cluster
+        shell: bash
+        run: |
+          set +e
+          (cd nats && go test ./server -run '^TestAtlasE3CNaturalOrphanMigration$' -count=1 -timeout=9m -v) > atlas-e3c-native.log 2>&1
+          rc=$?
+          echo "$rc" > atlas-e3c-native.exit
+          echo "ATLAS_E3C_NATIVE_EXIT=$rc"
+          exit 0
+      - name: Secondary - timer bridge with synthetic metadata precondition
+        shell: bash
+        run: |
+          set +e
+          (cd nats && go test ./server -run '^TestAtlasE3CNativeTimerWithSyntheticMetadataGap$' -count=1 -timeout=9m -v) > atlas-e3c-conditional.log 2>&1
+          rc=$?
+          echo "$rc" > atlas-e3c-conditional.exit
+          echo "ATLAS_E3C_CONDITIONAL_EXIT=$rc"
+          exit 0
+      - name: Independently classify native vs conditional evidence
+        if: always()
+        shell: bash
+        run: |
+          set +e
+          python3 - <<'ATLAS_E3C_AUDIT' | tee atlas-e3c-audit.txt
+          from pathlib import Path
+          import hashlib,re
+          root=Path('.')
+          source=root/'nats/server/atlas_e3c_native_orphan_test.go'
+          source_ok=source.is_file() and hashlib.sha256(source.read_bytes()).hexdigest()=='9933c17e42c6fa6461c3f483e91d16a3c05db1bbf00234f52dd6db4c3959b5cc'
+          product_ok=(root/'atlas-e3c-product.txt').is_file() and 'ATLAS_E3C_PRODUCT_SOURCE_UNMODIFIED=true' in (root/'atlas-e3c-product.txt').read_text()
+          selection_ok=(root/'atlas-e3c-selection.txt').is_file() and 'ATLAS_E3C_TEST_SELECTION=EXACT_TWO' in (root/'atlas-e3c-selection.txt').read_text()
+          def audit(test, prefix, markers):
+              p=root/f'atlas-e3c-{prefix}.log'
+              log=p.read_text(errors='replace') if p.is_file() else ''
+              ex=root/f'atlas-e3c-{prefix}.exit'
+              try: rc=int(ex.read_text().strip())
+              except (OSError,ValueError): rc=-999
+              checks={'go_exit_zero':rc==0,
+                     'one_run':len(re.findall(r'^=== RUN\s+'+test+r'\s*$',log,re.M))==1,
+                     'one_pass':len(re.findall(r'^--- PASS: '+test+r' \(',log,re.M))==1,
+                     'no_skip_or_fail':not re.search(r'^--- (?:FAIL|SKIP): '+test,log,re.M)}
+              for mark in markers: checks['marker_'+mark]=log.count(mark)==1
+              for k,v in checks.items():print(f'ATLAS_E3C_{prefix.upper()}_CHECK={k} passed={str(v).lower()}')
+              print(f'ATLAS_E3C_{prefix.upper()}_GO_EXIT={rc}')
+              return all(checks.values())
+          native_markers=[
+             'ATLAS_E3CN_G1_STANDALONE_CREATED_ACKED_STOPPED=true',
+             'ATLAS_E3CN_ORPHAN_FROM_REUSED_STANDALONE_STORE_NO_META_ASSIGNMENT=true',
+             'ATLAS_E3CN_SYNTHETIC_METADATA_MUTATION=false',
+             'ATLAS_E3CN_REAL_TIMER_SELECTED_RECOVERED_G1=true',
+             'ATLAS_E3CN_PUBLIC_API_REASSIGNED_ORPHAN_NAME=true',
+             'ATLAS_E3CN_G1_PUBLIC_API_DELETION_COMPLETE=true',
+             'ATLAS_E3CN_G2_PUBLIC_API_CREATED_ACKED_SAME_PATH=true',
+             'ATLAS_E3CN_NATIVE_TIMER_RELEASED=true',
+             'ATLAS_E3CN_G2_REGISTER_ENTRY_LOST=true',
+             'ATLAS_E3CN_G2_DISK_DIRECTORY_LOST=true',
+             'ATLAS_E3CN_VERDICT=REAL_TIMER_NATURAL_ORPHAN_PUBLIC_API_LIFECYCLE',
+             'ATLAS_E3CN_SCOPE=STANDALONE_TO_SINGLE_NODE_CLUSTER_MIGRATION_NOT_7556_SNAPSHOT_REPRO'
+          ]
+          conditional_markers=[
+             'ATLAS_E3C_SYNTHETIC_METADATA_GAP=true',
+             'ATLAS_E3C_TIMER_SELECTED_G1=TRUE',
+             'ATLAS_E3C_SYNTHETIC_ASSIGNMENT_RESTORED=true',
+             'ATLAS_E3C_G1_REGULAR_API_DELETION=COMPLETE_ALL_3',
+             'ATLAS_E3C_G2_REGISTERED_ACKED_SAME_PATH_BEFORE_RELEASE=true',
+             'ATLAS_E3C_REAL_TIMER_RELEASED=true',
+             'ATLAS_E3C_G2_REGISTER_ENTRY_LOST=true',
+             'ATLAS_E3C_G2_DISK_DIRECTORY_LOST=true',
+             'ATLAS_E3C_VERDICT=REAL_TIMER_REAL_API_SYNTHETIC_META_GAP_CONDITIONAL_PROOF',
+             'ATLAS_E3C_SCOPE=NOT_NATURAL_ORPHAN_NOT_7556_REPRO_NOT_PRODUCTION_BUG'
+          ]
+          native=audit('TestAtlasE3CNaturalOrphanMigration','native',native_markers)
+          conditional=audit('TestAtlasE3CNativeTimerWithSyntheticMetadataGap','conditional',conditional_markers)
+          print('ATLAS_E3C_SOURCE_OK='+str(source_ok).lower())
+          print('ATLAS_E3C_PRODUCT_OK='+str(product_ok).lower())
+          print('ATLAS_E3C_SELECTION_OK='+str(selection_ok).lower())
+          print('ATLAS_E3C_NATIVE_VERDICT='+('PASS_NATURAL_ORPHAN_MIGRATION_INTERLEAVING' if native else 'BLOCKED_OR_FAIL'))
+          print('ATLAS_E3C_CONDITIONAL_VERDICT='+('PASS_SYNTHETIC_PRECONDITION_ONLY' if conditional else 'BLOCKED_OR_FAIL'))
+          print('ATLAS_E3C_SCOPE=NO_7556_MINORORITY_SNAPSHOT_CORRUPTION_REPRO')
+          if not (source_ok and product_ok and selection_ok):
+              print('ATLAS_E3C_FINAL_VERDICT=BLOCKED_SOURCE_OR_SELECTION')
+          elif native:
+              print('ATLAS_E3C_FINAL_VERDICT=PASS_NATURAL_MIGRATION_CASE_NOT_7556')
+          elif conditional:
+              print('ATLAS_E3C_FINAL_VERDICT=CONDITIONAL_ONLY_NATURAL_NOT_PROVEN')
+          else:
+              print('ATLAS_E3C_FINAL_VERDICT=BLOCKED_NO_VALID_INTERLEAVING')
+          ATLAS_E3C_AUDIT
+          grep -E 'ATLAS_E3C[N_]' atlas-e3c-native.log 2>/dev/null || true
+          grep -E 'ATLAS_E3C[N_]' atlas-e3c-conditional.log 2>/dev/null || true
+      - name: Hash evidence files
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          find . -maxdepth 1 -type f -name 'atlas-e3c-*' ! -name 'atlas-e3c-evidence-sha256.txt' ! -name 'atlas-e3c-hash-check.txt' -print0 | sort -z | xargs -0 -r sha256sum > atlas-e3c-evidence-sha256.txt
+          sha256sum nats/server/atlas_e3c_native_orphan_test.go >> atlas-e3c-evidence-sha256.txt
+          sha256sum --check atlas-e3c-evidence-sha256.txt | tee atlas-e3c-hash-check.txt
+      - name: Upload evidence regardless of outcome
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: atlas-nats-e3c-native-and-conditional-evidence
+          path: |
+            atlas-e3c-*
+            nats/server/atlas_e3c_native_orphan_test.go
+          if-no-files-found: warn
+          retention-days: 14
+      - name: Fail closed unless native migration case is proven
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          grep -Fxq 'ATLAS_E3C_FINAL_VERDICT=PASS_NATURAL_MIGRATION_CASE_NOT_7556' atlas-e3c-audit.txt
+          sha256sum --check atlas-e3c-evidence-sha256.txt > /dev/null
+          echo 'ATLAS_E3C_FINAL=PASS_REAL_TIMER_NATURAL_MIGRATION_ONLY'
