@@ -1,0 +1,172 @@
+# ATLAS E3-D / supported cluster lifecycle. No standalone migration.
+# Two metadata-surviving nodes delete R3 stream while original member is offline;
+# recovery and a 30s timer must arise naturally; ordering uses a logger barrier.
+name: ATLAS E3D Supported Cluster Orphan Reachability
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+  actions: read
+jobs:
+  supported-lifecycle:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout frozen NATS main
+        uses: actions/checkout@v4
+        with:
+          repository: nats-io/nats-server
+          ref: dc55f4b43293fd1a4906b9acd0060e3298ebac0f
+          path: nats
+          persist-credentials: false
+      - name: Setup Go from frozen project
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: nats/go.mod
+          cache: false
+      - name: Restore previously verified source for logger gate
+        uses: actions/download-artifact@v4
+        with:
+          name: atlas-nats-e3c3-pinned-host-evidence
+          run-id: 41495477749
+          github-token: ${{ github.token }}
+          path: evidence
+      - name: Generate supported-lifecycle test without product changes
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C nats rev-parse HEAD)" = dc55f4b43293fd1a4906b9acd0060e3298ebac0f
+          echo 'd6eb32fdc3f03f6f906e5cd3db7bab2089e41dce004f689dbca548da751eb71c  evidence/nats/server/atlas_e3c_native_orphan_test.go' | sha256sum --check
+          cp evidence/nats/server/atlas_e3c_native_orphan_test.go nats/server/atlas_e3c_native_orphan_test.go
+          python3 - <<'ATLAS_E3D_PATCH'
+          from pathlib import Path
+          import subprocess,hashlib
+          baseline=Path('nats/server/atlas_e3c_native_orphan_test.go').read_text()
+          s=baseline
+          preamble='''func TestAtlasE3DSupportedClusterOfflineDeleteRestart(t *testing.T) {
+          	const name, subject = "ATLAS_E3D", "atlas.e3d.supported"
+          	c := createJetStreamClusterExplicit(t, "ATLAS_E3D_CLUSTER", 3)
+          	defer c.shutdown()
+          	c.waitOnLeader()
+          	s := c.servers[0]
+          	cfg := &nats.StreamConfig{Name: name, Subjects: []string{subject}, Replicas: 3, Storage: nats.FileStorage}
+          	{
+          		nc, api := jsClientConnect(t, c.servers[1])
+          		defer nc.Close()
+          		if _, err := api.AddStream(cfg); err != nil { t.Fatalf("BLOCKED_G1_CREATE: %v", err) }
+          		if ack, err := api.Publish(subject, []byte("ATLAS_E3D_G1_CONFIRMED")); err != nil || ack == nil { t.Fatalf("BLOCKED_G1_PUBLISH: %v", err) }
+          		c.waitOnStreamCurrent(s, s.GlobalAccount().Name, name)
+          		g1Initial, err := s.GlobalAccount().lookupStream(name)
+          		if err != nil || g1Initial == nil { t.Fatalf("BLOCKED_G1_NOT_ON_OFFLINE_TARGET: %v", err) }
+          		msg, err := g1Initial.getMsg(1)
+          		if err != nil || msg == nil || string(msg.Data) != "ATLAS_E3D_G1_CONFIRMED" { t.Fatalf("BLOCKED_G1_MESSAGE: %v", err) }
+          		t.Log("ATLAS_E3D_G1_R3_PRESENT_ON_TARGET=true")
+          		s.Shutdown()
+          		s.WaitForShutdown()
+          		t.Log("ATLAS_E3D_ONE_CLUSTER_MEMBER_OFFLINE=true")
+          		c.waitOnStreamLeader(s.GlobalAccount().Name, name)
+          		if err := api.DeleteStream(name); err != nil { t.Fatalf("BLOCKED_DELETE_WHILE_MEMBER_OFFLINE: %v", err) }
+          		t.Log("ATLAS_E3D_PUBLIC_DELETE_ACKNOWLEDGED=true")
+          	}
+          	s = c.restartServer(s)
+          	c.waitOnServerCurrent(s)
+          	acc := s.GlobalAccount()
+          	js := s.getJetStream()
+          	if js == nil { t.Fatal("BLOCKED_RESTART_JETSTREAM_DISABLED") }
+          '''
+          a=s.index('func TestAtlasE3CNaturalOrphanMigration(t *testing.T) {')
+          b=s.index('\n\tg1, err := acc.lookupStream(name)',a)
+          s=s[:a]+preamble.rstrip('\n')+s[b:]
+          replacements={
+           '"ATLAS_E3C_NATURAL_STANDALONE_G1"':'"ATLAS_E3D_G1_CONFIRMED"',
+           't.Log("ATLAS_E3CN_ORPHAN_FROM_REUSED_STANDALONE_STORE_NO_META_ASSIGNMENT=true")':'t.Log("ATLAS_E3D_SUPPORTED_ORPHAN_FROM_OFFLINE_API_DELETE=true")',
+           'cfg.Placement = &nats.Placement{Tags: []string{"atlas:e3c3host"}}\n\tt.Log("ATLAS_E3C3_R1_PLACEMENT_PINNED_TO_ORIGIN=true")':'t.Log("ATLAS_E3D_R3_ALL_THREE_NODES=true")',
+           '"ATLAS_E3CN_G2_UNIQUE_ACKED_PAYLOAD"':'"ATLAS_E3D_G2_CONFIRMED"',
+           't.Log("ATLAS_E3CN_SCOPE=STANDALONE_TO_SINGLE_NODE_CLUSTER_MIGRATION_NOT_7556_SNAPSHOT_REPRO")':'t.Log("ATLAS_E3D_SCOPE=SUPPORTED_CLUSTER_R3_OFFLINE_DELETE_RESTART_WITH_LOGGER_BARRIER")',
+          }
+          for x,y in replacements.items():
+           assert s.count(x)==(2 if x=='"ATLAS_E3CN_G2_UNIQUE_ACKED_PAYLOAD"' else 1),(x,s.count(x)); s=s.replace(x,y,2 if x=='"ATLAS_E3CN_G2_UNIQUE_ACKED_PAYLOAD"' else 1)
+          key='t.Log("ATLAS_E3CN_G2_PUBLIC_API_CREATED_ACKED_SAME_PATH=true")'
+          assert s.count(key)==1
+          s=s.replace(key,'''t.Log("ATLAS_E3CN_G2_PUBLIC_API_CREATED_ACKED_SAME_PATH=true")
+          	apiMsg, apiErr := api.GetMsg(name, 1)
+          	if apiErr != nil || apiMsg == nil || string(apiMsg.Data) != "ATLAS_E3D_G2_CONFIRMED" { t.Fatalf("BLOCKED_G2_PUBLIC_API_NOT_READABLE: %v", apiErr) }
+          	t.Log("ATLAS_E3D_G2_PUBLIC_API_READABLE_BEFORE_RELEASE=true")''',1)
+          key='t.Log("ATLAS_E3CN_VERDICT=REAL_TIMER_NATURAL_ORPHAN_PUBLIC_API_LIFECYCLE")'
+          assert s.count(key)==1
+          s=s.replace(key,'''postMsg, postErr := api.GetMsg(name, 1)
+          	postReadable := postErr == nil && postMsg != nil && string(postMsg.Data) == "ATLAS_E3D_G2_CONFIRMED"
+          	t.Logf("ATLAS_E3D_G2_PUBLIC_API_READABLE_AFTER_RELEASE=%t error=%v", postReadable, postErr)
+          	t.Log("ATLAS_E3D_VERDICT=SUPPORTED_CLUSTER_LOCAL_G2_DAMAGE_REPRODUCED")''',1)
+          p=Path('nats/server/atlas_e3c_native_orphan_test.go');p.write_text(s)
+          subprocess.run(['gofmt','-w',str(p)],check=True)
+          s=p.read_text();print('ATLAS_E3D_GENERATED_TEST_SHA256='+hashlib.sha256(s.encode()).hexdigest())
+          ATLAS_E3D_PATCH
+          echo 'b469044ebd39c46196b661d32e3b133ce8e99c655635fd9dcbdb7d7981f0682d  nats/server/atlas_e3c_native_orphan_test.go' | sha256sum --check
+          test -z "$(gofmt -l nats/server/atlas_e3c_native_orphan_test.go)"
+          test -z "$(git -C nats diff --name-only)"
+          git -C nats rev-parse HEAD | tee atlas-e3d-commit.txt
+          git -C nats hash-object server/jetstream_cluster.go | tee atlas-e3d-source-blob.txt
+          sha256sum nats/server/atlas_e3c_native_orphan_test.go | tee atlas-e3d-test-sha256.txt
+      - name: Run one supported lifecycle test, log complete evidence
+        shell: bash
+        run: |
+          set +e
+          set -o pipefail
+          (cd nats && go test ./server -run '^TestAtlasE3DSupportedClusterOfflineDeleteRestart$' -count=1 -timeout=9m -v) 2>&1 | tee atlas-e3d-native.log
+          rc=${PIPESTATUS[0]}
+          echo "$rc" > atlas-e3d-exit.txt
+          echo "ATLAS_E3D_NATIVE_EXIT=$rc"
+          exit 0
+      - name: Independent fail-closed classification
+        if: always()
+        shell: bash
+        run: |
+          python3 - <<'PY' | tee atlas-e3d-audit.txt
+          from pathlib import Path
+          import re
+          p=Path('atlas-e3d-native.log')
+          s=p.read_text(errors='replace') if p.exists() else ''
+          try: rc=int(Path('atlas-e3d-exit.txt').read_text().strip())
+          except (OSError,ValueError): rc=-999
+          test='TestAtlasE3DSupportedClusterOfflineDeleteRestart'
+          one_run=len(re.findall(r'^=== RUN\s+'+test+r'\s*$',s,re.M))==1
+          one_pass=len(re.findall(r'^--- PASS: '+test+r' \(',s,re.M))==1
+          markers=['ATLAS_E3D_ONE_CLUSTER_MEMBER_OFFLINE=true','ATLAS_E3D_PUBLIC_DELETE_ACKNOWLEDGED=true','ATLAS_E3D_SUPPORTED_ORPHAN_FROM_OFFLINE_API_DELETE=true','ATLAS_E3CN_REAL_TIMER_SELECTED_RECOVERED_G1=true','ATLAS_E3D_G2_PUBLIC_API_READABLE_BEFORE_RELEASE=true','ATLAS_E3CN_G2_REGISTER_ENTRY_LOST=true','ATLAS_E3CN_G2_DISK_DIRECTORY_LOST=true','ATLAS_E3D_VERDICT=SUPPORTED_CLUSTER_LOCAL_G2_DAMAGE_REPRODUCED']
+          valid=rc==0 and one_run and one_pass and all(s.count(m)==1 for m in markers)
+          print('ATLAS_E3D_EXECUTION='+('COMPLETED' if one_run else 'NOT_REACHED'))
+          print('ATLAS_E3D_TEST_EXIT='+str(rc))
+          for m in markers:print('ATLAS_E3D_MARKER='+m+' count='+str(s.count(m)))
+          print('ATLAS_E3D_BLOCKERS='+repr([l.strip() for l in s.splitlines() if 'BLOCKED' in l or '--- FAIL:' in l][-15:]))
+          print('ATLAS_E3D_ORPHAN_ORIGIN=SUPPORTED_CLUSTER_OFFLINE_MEMBER_API_DELETE_RESTART')
+          print('ATLAS_E3D_SCHEDULE=LOGGER_BARRIER')
+          print('ATLAS_E3D_PRODUCT_CODE=UNMODIFIED')
+          print('ATLAS_E3D_PRODUCTION_REACHABILITY=NOT_ESTABLISHED')
+          print('ATLAS_E3D_VERDICT='+('SUPPORTED_LIFECYCLE_CONTROLLED_INTERLEAVING_LOCAL_DAMAGE' if valid else 'BLOCKED_OR_FAIL'))
+          PY
+      - name: Hash evidence independently
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          find . -maxdepth 1 -type f -name 'atlas-e3d-*' ! -name 'atlas-e3d-sha256.txt' -print0 | sort -z | xargs -0 -r sha256sum > atlas-e3d-sha256.txt
+          sha256sum nats/server/atlas_e3c_native_orphan_test.go >> atlas-e3d-sha256.txt
+          sha256sum --check atlas-e3d-sha256.txt
+      - name: Upload full source and proof regardless of outcome
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: atlas-e3d-supported-lifecycle-evidence
+          path: |
+            atlas-e3d-*
+            nats/server/atlas_e3c_native_orphan_test.go
+          if-no-files-found: warn
+          retention-days: 90
+      - name: Fail closed unless supported interleaving proved
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          grep -Fxq 'ATLAS_E3D_VERDICT=SUPPORTED_LIFECYCLE_CONTROLLED_INTERLEAVING_LOCAL_DAMAGE' atlas-e3d-audit.txt
+          sha256sum --check atlas-e3d-sha256.txt > /dev/null
+          echo 'ATLAS_E3D_FINAL=PASS_CONDITIONAL_SUPPORTED_SCENARIO'
