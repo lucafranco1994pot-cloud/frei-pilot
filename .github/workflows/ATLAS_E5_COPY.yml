@@ -1,0 +1,142 @@
+# ATLAS E5: independent A/B of upstream NATS PR #8766.
+# Exact same upstream regression test on pinned PR base and fix.
+# Source of regression test: PR head; baseline receives test-only function.
+# A failing baseline is NOT itself proof of lost acknowledged messages.
+name: ATLAS E5 NATS R1 Scaling A B Regression
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  pinned-ab:
+    runs-on: ubuntu-latest
+    timeout-minutes: 28
+    steps:
+      - name: Checkout PR base unmodified product
+        uses: actions/checkout@v4
+        with:
+          repository: nats-io/nats-server
+          ref: c66ad94a4d83c26a6a3216d51506a2de50148855
+          path: baseline
+          persist-credentials: false
+      - name: Checkout PR fix and test source
+        uses: actions/checkout@v4
+        with:
+          repository: nats-io/nats-server
+          ref: 123193bb8205fb15309fcf98e6d304fda6e20327
+          path: patched
+          persist-credentials: false
+      - name: Setup Go from pinned project
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: baseline/go.mod
+          cache: false
+      - name: Copy identical test onto original baseline without patching product
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C baseline rev-parse HEAD)" = c66ad94a4d83c26a6a3216d51506a2de50148855
+          test "$(git -C patched rev-parse HEAD)" = 123193bb8205fb15309fcf98e6d304fda6e20327
+          test "$(git -C baseline hash-object server/jetstream_cluster_2_test.go)" = 9dad4b65bd55639c2038cb30fa76120060b82925
+          test "$(git -C patched hash-object server/jetstream_cluster_2_test.go)" = c62afdde4f75464a19ab0de25714e349c23c415a
+          python3 - <<'PY'
+          from pathlib import Path
+          old=Path('baseline/server/jetstream_cluster_2_test.go')
+          src=Path('patched/server/jetstream_cluster_2_test.go')
+          a=old.read_text(); b=src.read_text()
+          fn='func TestJetStreamClusterScaleDownAndUpUnderLoad(t *testing.T) {'
+          assert a.count(fn)==0 and b.count(fn)==1
+          pos=b.index(fn)
+          end=b.find('\nfunc Test',pos+len(fn))
+          assert end>pos
+          test=b[pos:end].rstrip()+'\n'
+          assert 'func Test' not in test[len(fn):]
+          assert 'AckSync()' in test and 'UpdateStream(' in test and 'UpdateConsumer(' in test
+          old.write_text(a.rstrip()+'\n\n'+test)
+          Path('atlas-e5-test-source.go').write_text(test)
+          PY
+          test -z "$(gofmt -l baseline/server/jetstream_cluster_2_test.go)"
+          test -z "$(gofmt -l patched/server/jetstream_cluster_2_test.go)"
+          test -z "$(git -C baseline diff --name-only -- server/jetstream_cluster.go server/stream.go server/raft.go server/consumer.go server/filestore.go)"
+          printf 'BASELINE=%s\nPATCHED=%s\n' "$(git -C baseline rev-parse HEAD)" "$(git -C patched rev-parse HEAD)" | tee atlas-e5-pins.txt
+          sha256sum atlas-e5-test-source.go | tee atlas-e5-test-source.sha256
+          go version | tee atlas-e5-go-version.txt
+      - name: Run exact same test on unpatched PR base twice
+        shell: bash
+        run: |
+          set +e
+          set -o pipefail
+          (cd baseline && go test ./server -run '^TestJetStreamClusterScaleDownAndUpUnderLoad$' -count=2 -timeout=11m -v) 2>&1 | tee atlas-e5-baseline.log
+          echo "${PIPESTATUS[0]}" > atlas-e5-baseline.exit
+          exit 0
+      - name: Run exact same test on proposed PR fix twice
+        shell: bash
+        run: |
+          set +e
+          set -o pipefail
+          (cd patched && go test ./server -run '^TestJetStreamClusterScaleDownAndUpUnderLoad$' -count=2 -timeout=11m -v) 2>&1 | tee atlas-e5-patched.log
+          echo "${PIPESTATUS[0]}" > atlas-e5-patched.exit
+          exit 0
+      - name: Independently classify execution and diagnostic evidence
+        if: always()
+        shell: bash
+        run: |
+          python3 - <<'PY' | tee atlas-e5-audit.txt
+          from pathlib import Path
+          import re
+          name='TestJetStreamClusterScaleDownAndUpUnderLoad'
+          def inspect(side):
+              path=Path(f'atlas-e5-{side}.log')
+              log=path.read_text(errors='replace') if path.exists() else ''
+              try: rc=int(Path(f'atlas-e5-{side}.exit').read_text())
+              except (OSError, ValueError): rc=-999
+              starts=len(re.findall(r'^=== RUN\s+'+name+r'\s*$',log,re.M))
+              passes=len(re.findall(r'^--- PASS: '+name+r' \(',log,re.M))
+              fails=len(re.findall(r'^--- FAIL: '+name+r' \(',log,re.M))
+              compile_error=starts==0 and rc!=0
+              complete=starts==2 and passes+fails==2
+              if complete and rc==0 and fails==0: status='PASS'
+              elif complete and rc!=0 and fails>=1: status='TEST_FAILURE'
+              elif compile_error: status='BUILD_OR_SETUP_FAILURE'
+              else: status='INCONCLUSIVE'
+              print(f'ATLAS_E5_{side.upper()}_GO_EXIT={rc}')
+              print(f'ATLAS_E5_{side.upper()}_RUNS={starts} PASSES={passes} FAILS={fails}')
+              print(f'ATLAS_E5_{side.upper()}_STATUS={status}')
+              for line in log.splitlines():
+                  if '--- FAIL:' in line or 'panic:' in line or 'FAIL\t' in line:
+                      print('ATLAS_E5_'+side.upper()+'_FAILURE='+line[:280])
+              return status
+          a,b=inspect('baseline'),inspect('patched')
+          if a=='TEST_FAILURE' and b=='PASS': verdict='REGRESSION_CONTRAST_CONFIRMED'
+          elif a=='PASS' and b=='PASS': verdict='BASELINE_NOT_REPRODUCED'
+          elif a=='TEST_FAILURE' and b=='TEST_FAILURE': verdict='BOTH_VERSIONS_FAILED'
+          else: verdict='INCONCLUSIVE_OR_HARNESS_FAILURE'
+          print('ATLAS_E5_VERDICT='+verdict)
+          print('ATLAS_E5_CLAIM=PR_8766_INDEPENDENT_AB_ONLY_NOT_NEW_BUG')
+          print('ATLAS_E5_SCHEDULE=UPSTREAM_TEST_RECONCILE_INTERCEPTION')
+          print('ATLAS_E5_CONFIRMED_ACKED_MESSAGE_LOSS=NOT_ESTABLISHED')
+          PY
+      - name: Hash and preserve all evidence regardless of outcome
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          find . -maxdepth 1 -type f -name 'atlas-e5-*' ! -name 'atlas-e5-manifest.sha256' -print0 | sort -z | xargs -0 -r sha256sum > atlas-e5-manifest.sha256
+          sha256sum --check atlas-e5-manifest.sha256
+      - name: Publish proof archive
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: atlas-e5-nats-r1-scaling-ab-evidence
+          path: atlas-e5-*
+          if-no-files-found: warn
+          retention-days: 90
+      - name: Report diagnostic status without falsely claiming a fixed bug
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -f atlas-e5-audit.txt
+          grep -Eq '^ATLAS_E5_VERDICT=(REGRESSION_CONTRAST_CONFIRMED|BASELINE_NOT_REPRODUCED|BOTH_VERSIONS_FAILED)$' atlas-e5-audit.txt
+          sha256sum --check atlas-e5-manifest.sha256 >/dev/null
+          echo 'ATLAS_E5_COMPLETED_TWO_VERSION_DIAGNOSIS=true'
