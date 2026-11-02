@@ -1,0 +1,306 @@
+name: ATLAS LangGraph Persistent Crash Replay 02
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - '.github/workflows/ATLAS_LANGGRAPH_CAUSAL_02.yaml'
+
+permissions:
+  contents: read
+
+jobs:
+  persistent-replay:
+    name: SQLite SIGKILL / LangGraph ${{ matrix.version }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        version: ['1.2.18', '1.2.19']
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install exact tested versions
+        run: |
+          python -m pip install --disable-pip-version-check "langgraph==${{ matrix.version }}" "langgraph-checkpoint-sqlite==3.1.2"
+          python -m pip freeze | grep -E '^(langgraph|langchain-core)'
+      - name: Run durable process-kill replay diagnostic
+        env:
+          LANGGRAPH_STRICT_MSGPACK: 'true'
+        run: |
+          cat > atlas_causal_02_probe.py <<'ATLAS_PYTHON_SCRIPT'
+          #!/usr/bin/env python3
+          """ATLAS-DEPENDENCY-REPLAY-02: durable checkpoint + real process SIGKILL.
+          
+          Controller runs two separate Python processes per scenario. The first worker is
+          killed only AFTER the dependent task result can be observed in SQLite pending
+          writes. A new worker then resumes with the original thread_id and database.
+          
+          No live APIs; all effects are local test files. This is a diagnostic: it reports
+          RED/GREEN/BLOCKED explicitly rather than treating a green Actions tick as proof.
+          """
+          from __future__ import annotations
+          
+          import hashlib
+          import importlib.metadata
+          import json
+          import os
+          from pathlib import Path
+          import signal
+          import sqlite3
+          import subprocess
+          import sys
+          import time
+          import traceback
+          
+          CASE = "ATLAS-DEPENDENCY-REPLAY-02"
+          BASE = Path("atlas_causal_02_evidence")
+          THREAD = "atlas-causal-replay-thread"
+          MAX_WAIT_SECONDS = 25
+          
+          
+          def append_event(path: Path, kind: str, **fields) -> None:
+              path.parent.mkdir(parents=True, exist_ok=True)
+              with path.open("a", encoding="utf-8") as handle:
+                  handle.write(json.dumps({"kind": kind, **fields}, sort_keys=True) + "\n")
+                  handle.flush()
+                  os.fsync(handle.fileno())
+          
+          
+          def events_from(path: Path) -> list[dict]:
+              if not path.exists():
+                  return []
+              return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line]
+          
+          
+          def has_durable_result(db: Path, expected_text: str) -> tuple[bool, list[dict]]:
+              """Inspect the actual SQLite pending writes, not merely an event log."""
+              if not db.exists():
+                  return False, []
+              try:
+                  with sqlite3.connect(f"file:{db.resolve()}?mode=ro", uri=True, timeout=0.3) as con:
+                      rows = con.execute("SELECT channel, value FROM writes").fetchall()
+                  summary = []
+                  found = False
+                  for channel, value in rows:
+                      payload = bytes(value) if isinstance(value, (bytes, memoryview)) else str(value).encode()
+                      matched = expected_text.encode() in payload
+                      summary.append({"channel": channel, "bytes": len(payload), "matches_alert": matched})
+                      if matched:
+                          found = True
+                  return found, summary
+              except (sqlite3.Error, OSError):
+                  return False, []
+          
+          
+          def worker(stage: str, scenario: str, base_path: str) -> None:
+              # Imports only in workers: the controller should still save diagnostics if
+              # an import fails after installation.
+              from langgraph.checkpoint.sqlite import SqliteSaver
+              from langgraph.func import entrypoint, task
+          
+              base = Path(base_path)
+              db = base / "checkpoints.sqlite"
+              event_file = base / "events.jsonl"
+              fail_once = scenario == "fault"
+              config = {"configurable": {"thread_id": THREAD}}
+          
+              @task
+              def check_status() -> str:
+                  call_num = sum(e["kind"] == "check_status" for e in events_from(event_file)) + 1
+                  append_event(event_file, "check_status", attempt=call_num)
+                  if fail_once and call_num == 1:
+                      raise ConnectionError("simulated transient status read error")
+                  return "up"
+          
+              @task
+              def draft_alert(status: str) -> str:
+                  append_event(event_file, "draft_alert", status=status)
+                  return f"Alert: status={status}"
+          
+              with SqliteSaver.from_conn_string(str(db)) as saver:
+                  @entrypoint(checkpointer=saver)
+                  def flow(_):
+                      try:
+                          status = check_status().result()
+                      except ConnectionError:
+                          status = "down"
+                      alert = draft_alert(status).result()
+                      append_event(event_file, "parent_after_dependent_task", stage=stage,
+                                   status=status, alert=alert)
+                      if stage == "start":
+                          # This is deliberately not a Python exception. Controller
+                          # sends SIGKILL to the LIVE process after a SQLite write barrier.
+                          while True:
+                              time.sleep(0.1)
+                      result = {"status": status, "alert": alert}
+                      append_event(event_file, "parent_completed", **result)
+                      return result
+          
+                  if stage == "start":
+                      flow.invoke("check", config, durability="sync")
+                      raise AssertionError("initial worker unexpectedly returned")
+                  result = flow.invoke(None, config, durability="sync")
+                  print("ATLAS_WORKER_RESULT=" + json.dumps(result, sort_keys=True), flush=True)
+          
+          
+          def checksum(path: Path) -> str | None:
+              if not path.is_file():
+                  return None
+              return hashlib.sha256(path.read_bytes()).hexdigest()
+          
+          
+          def run_case(scenario: str) -> dict:
+              base = BASE / scenario
+              base.mkdir(parents=True, exist_ok=True)
+              db = base / "checkpoints.sqlite"
+              events_path = base / "events.jsonl"
+              first_log = base / "worker_first.log"
+              resume_log = base / "worker_resume.log"
+              expected_alert = "Alert: status=down" if scenario == "fault" else "Alert: status=up"
+              command = [sys.executable, str(Path(__file__).resolve()), "--worker", "start", scenario, str(base.resolve())]
+              with first_log.open("w", encoding="utf-8") as output:
+                  proc = subprocess.Popen(command, stdout=output, stderr=subprocess.STDOUT)
+                  observed = False
+                  before_kill_writes = []
+                  reason = None
+                  deadline = time.monotonic() + MAX_WAIT_SECONDS
+                  while time.monotonic() < deadline:
+                      current_events = events_from(events_path)
+                      waiting = any(e["kind"] == "parent_after_dependent_task" and
+                                    e.get("stage") == "start" and e.get("alert") == expected_alert
+                                    for e in current_events)
+                      observed_write, before_kill_writes = has_durable_result(db, expected_alert)
+                      if waiting and observed_write:
+                          observed = True
+                          break
+                      if proc.poll() is not None:
+                          reason = f"worker exited before barrier (returncode={proc.returncode})"
+                          break
+                      time.sleep(0.08)
+                  if not observed and not reason:
+                      reason = "SQLite dependent-result write barrier not reached in time"
+                  if proc.poll() is None:
+                      proc.kill()  # POSIX SIGKILL, not exception handling within LangGraph.
+                  try:
+                      exit_code = proc.wait(timeout=5)
+                  except subprocess.TimeoutExpired:
+                      proc.kill()
+                      exit_code = proc.wait(timeout=5)
+          
+              details = {
+                  "scenario": scenario,
+                  "barrier_observed": observed,
+                  "initial_worker_exit_code": exit_code,
+                  "initial_writes": before_kill_writes,
+                  "initial_events": events_from(events_path),
+                  "initial_worker_log_sha256": checksum(first_log),
+              }
+              if not observed:
+                  details.update({"blocked": reason, "initial_worker_log_tail": first_log.read_text()[-2500:]})
+                  return details
+              if exit_code != -signal.SIGKILL:
+                  details["blocked"] = f"first worker not SIGKILLed as expected: exit={exit_code}"
+                  return details
+              survived, after_kill_writes = has_durable_result(db, expected_alert)
+              details["dependent_write_survived_sigkill"] = survived
+              details["writes_after_sigkill"] = after_kill_writes
+              if not survived:
+                  details["blocked"] = "dependent write was not recoverable from SQLite after SIGKILL"
+                  return details
+          
+              resume_command = [sys.executable, str(Path(__file__).resolve()), "--worker", "resume", scenario, str(base.resolve())]
+              try:
+                  completed = subprocess.run(resume_command, text=True, capture_output=True, timeout=30)
+              except subprocess.TimeoutExpired:
+                  details["blocked"] = "resume worker timed out"
+                  return details
+              resume_log.write_text(completed.stdout + "\nSTDERR:\n" + completed.stderr, encoding="utf-8")
+              details["resume_worker_exit_code"] = completed.returncode
+              details["resume_worker_log_sha256"] = checksum(resume_log)
+              details["events"] = events_from(events_path)
+              if completed.returncode != 0:
+                  details["blocked"] = "resume worker failed; see resume worker log"
+                  details["resume_log_tail"] = resume_log.read_text()[-2500:]
+                  return details
+              results = [line.split("=", 1)[1] for line in completed.stdout.splitlines()
+                         if line.startswith("ATLAS_WORKER_RESULT=")]
+              if len(results) != 1:
+                  details["blocked"] = "missing or duplicate structured worker result"
+                  return details
+              result = json.loads(results[0])
+              details["result"] = result
+              details["consistent"] = result.get("alert") == f"Alert: status={result.get('status')}"
+              details["status_executions"] = sum(e["kind"] == "check_status" for e in details["events"])
+              details["alert_executions"] = sum(e["kind"] == "draft_alert" for e in details["events"])
+              details["checkpoint_db_sha256"] = checksum(db)
+              return details
+          
+          
+          def controller() -> int:
+              BASE.mkdir(exist_ok=True)
+              report = {"case": CASE, "test_kind": "SIGKILL of live worker after verified SQLite pending write; fresh process resumes",
+                        "python": sys.version.split()[0], "git_sha": os.getenv("GITHUB_SHA"),
+                        "versions": {}, "scenarios": []}
+              for pkg in ("langgraph", "langgraph-checkpoint", "langgraph-checkpoint-sqlite", "langchain-core"):
+                  try:
+                      report["versions"][pkg] = importlib.metadata.version(pkg)
+                  except importlib.metadata.PackageNotFoundError:
+                      report["versions"][pkg] = "MISSING"
+              for scenario in ("control", "fault"):
+                  try:
+                      report["scenarios"].append(run_case(scenario))
+                  except Exception as error:
+                      report["scenarios"].append({"scenario": scenario, "blocked": repr(error),
+                                                  "traceback": traceback.format_exc()})
+              control, fault = report["scenarios"]
+              if control.get("blocked") or fault.get("blocked"):
+                  status = "BLOCKED"
+              elif not control.get("consistent"):
+                  status = "INVALID_CONTROL"
+              elif not fault.get("consistent") and fault.get("status_executions") == 2 and fault.get("alert_executions") == 1:
+                  status = "RED_PERSISTENT_SIGKILL_CONFIRMED"
+              elif not fault.get("consistent"):
+                  status = "RED_OTHER_INCONSISTENCY"
+              else:
+                  status = "GREEN_NO_DIVERGENCE"
+              report["status"] = status
+              report["script_sha256"] = checksum(Path(__file__))
+              (BASE / "report.json").write_text(json.dumps(report, indent=2, sort_keys=True), encoding="utf-8")
+              print("ATLAS_RESULT=" + json.dumps({"status": status,
+                    "scenarios": [{k: v for k, v in case.items() if k in
+                                   ("scenario", "blocked", "consistent", "result", "status_executions", "alert_executions", "barrier_observed", "initial_worker_exit_code")}
+                                  for case in report["scenarios"]]}, sort_keys=True), flush=True)
+              print("ATLAS_STATUS=" + status, flush=True)
+              # Diagnostic-red is intentionally success; blocked and invalid control fail CI.
+              return 2 if status in ("BLOCKED", "INVALID_CONTROL") else 0
+          
+          
+          if __name__ == "__main__":
+              if len(sys.argv) > 1 and sys.argv[1] == "--worker":
+                  worker(sys.argv[2], sys.argv[3], sys.argv[4])
+              else:
+                  sys.exit(controller())
+          ATLAS_PYTHON_SCRIPT
+          python -m py_compile atlas_causal_02_probe.py
+          python atlas_causal_02_probe.py
+      - name: Summarize result
+        if: always()
+        run: |
+          if [ -f atlas_causal_02_evidence/report.json ]; then
+            python -c 'import json,os; r=json.load(open("atlas_causal_02_evidence/report.json")); open(os.environ["GITHUB_STEP_SUMMARY"],"a").write("# ATLAS Persistent Replay 02\n\n**Diagnostic:** "+r["status"]+"\n\n**Version:** "+r["versions"].get("langgraph","unknown")+"\n\nSee uploaded evidence for SQLite, event traces and SHA-256.\n")'
+          else
+            echo "No report produced: see job logs." >> "$GITHUB_STEP_SUMMARY"
+          fi
+      - name: Upload evidence bundle
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: ATLAS-Persistent-Replay-02-${{ matrix.version }}
+          path: |
+            atlas_causal_02_probe.py
+            atlas_causal_02_evidence/
+          if-no-files-found: warn
