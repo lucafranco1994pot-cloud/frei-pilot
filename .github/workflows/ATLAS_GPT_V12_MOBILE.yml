@@ -1,0 +1,133 @@
+
+name: ATLAS GPT Approval Boundary v12 Mobile
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  approval-boundary:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Python
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065
+        with:
+          python-version: '3.12'
+
+      - name: Install pinned OpenAI Agents SDK
+        run: |
+          python -m pip install 'git+https://github.com/openai/openai-agents-python.git@e355d69152d4f4730dfb03b63dbce53e8d9f5d8c'
+          python -m pip show openai-agents > sdk-version.txt
+          python -m pip freeze > dependencies.txt
+
+      - name: Test independent approvals
+        shell: bash
+        run: |
+          cat > probe.py <<'PY'
+          import asyncio, json, traceback
+          from pathlib import Path
+          from agents import Agent, Runner, RunState, RunConfig
+          from agents.decorators import tool
+          from agents.testing import ScriptedModel, function_call, assistant_message
+
+          CONFIG = RunConfig(tracing_disabled=True)
+          CASES = ('current_approve','current_reject','no_decision',
+                   'stale_other_agent','stale_changed_args',
+                   'stale_changed_id','stale_same_agent',
+                   'restore_current')
+
+          async def scenario(case):
+              effects = []
+              @tool(needs_approval=True)
+              async def record_marker(target: str) -> str:
+                  """Record a harmless event locally."""
+                  effects.append(target)
+                  return 'MARKED:'+target
+
+              def scripted(target='A', call_id='call-1'):
+                  return ScriptedModel([
+                      [function_call('record_marker', {'target':target}, call_id=call_id)],
+                      [assistant_message('Done')],
+                  ])
+
+              old_agent=Agent(name='same name',tools=[record_marker],model=scripted())
+              prior=await Runner.run(old_agent,'original',run_config=CONFIG)
+              assert len(prior.interruptions)==1 and not effects
+              old_item=prior.interruptions[0]
+              old_state=prior.to_state()
+              old_state.approve(old_item)
+              await Runner.run(old_agent,old_state,run_config=CONFIG)
+              assert effects==['A']
+
+              target='B' if case=='stale_changed_args' else 'A'
+              call_id='call-2' if case=='stale_changed_id' else 'call-1'
+              agent=(Agent(name='same name',tools=[record_marker],model=scripted(target,call_id))
+                     if case=='stale_other_agent' else old_agent)
+              if agent is old_agent: agent.model=scripted(target,call_id)
+              result=await Runner.run(agent,'new run',run_config=CONFIG)
+              assert len(result.interruptions)==1 and effects==['A']
+              state=result.to_state()
+              error=None
+              if case=='current_approve': state.approve(result.interruptions[0])
+              elif case=='current_reject': state.reject(result.interruptions[0])
+              elif case=='restore_current':
+                  state=await RunState.from_json(agent,state.to_json())
+                  pending=state.get_interruptions()
+                  assert len(pending)==1
+                  state.approve(pending[0])
+              elif case!='no_decision':
+                  try: state.approve(old_item)
+                  except Exception as exc: error=type(exc).__name__+': '+str(exc)
+              if case!='no_decision' and not error:
+                  try: await Runner.run(agent,state,run_config=CONFIG)
+                  except Exception as exc: error=type(exc).__name__+': '+str(exc)
+              new_effects=effects[1:]
+              expected={'current_approve':['A'],'restore_current':['A'],
+                        'current_reject':[],'no_decision':[],
+                        'stale_other_agent':[],'stale_changed_args':[],
+                        'stale_changed_id':[]}
+              status=('REFERENCE_ONLY' if case=='stale_same_agent' else
+                      'PASS' if new_effects==expected[case] and
+                      (case not in ('current_approve','restore_current') or not error)
+                      else 'FAIL')
+              return dict(case=case,status=status,effects=new_effects,error=error)
+
+          async def main():
+              rows=[]
+              for case in CASES:
+                  try: rows.append(await scenario(case))
+                  except Exception as exc:
+                      rows.append(dict(case=case,status='BLOCKED',error=str(exc),
+                                       traceback=traceback.format_exc()))
+              summary=dict(cases=rows,checked=len(rows),
+                           failures=[r['case'] for r in rows if r['status']=='FAIL'],
+                           blocked=[r['case'] for r in rows if r['status']=='BLOCKED'],
+                           verdict='DIAGNOSTIC_ONLY_NOT_A_BUG_CLAIM')
+              Path('results.json').write_text(json.dumps(summary,indent=2))
+              print(json.dumps(summary,indent=2))
+              assert not summary['failures'] and not summary['blocked']
+
+          asyncio.run(main())
+          PY
+          python probe.py
+
+      - name: SHA-256 evidence
+        if: always()
+        run: |
+          sha256sum probe.py sdk-version.txt dependencies.txt results.json 2>/dev/null > SHA256SUMS || true
+
+      - name: Archive evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: atlas-gpt-approval-v12-mobile-evidence
+          path: |
+            probe.py
+            sdk-version.txt
+            dependencies.txt
+            results.json
+            SHA256SUMS
+          if-no-files-found: warn
