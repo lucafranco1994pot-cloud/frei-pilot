@@ -1,0 +1,415 @@
+name: ATLAS LangGraph Causal Replay 03 (fixed entrypoint)
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - '.github/workflows/ATLAS_LANGGRAPH_CAUSAL_03.yaml'
+
+permissions:
+  contents: read
+
+jobs:
+  causal-replay:
+    name: Fixed-entrypoint replay / LangGraph ${{ matrix.version }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        version: ['1.2.18', '1.2.19']
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install pinned LangGraph and SQLite saver
+        run: |
+          python -m pip install --disable-pip-version-check "langgraph==${{ matrix.version }}" "langgraph-checkpoint-sqlite==3.1.2"
+          python -m pip freeze | grep -E '^(langgraph|langchain-core)'
+      - name: Fixed-entrypoint SIGKILL and uncaught-parent test
+        run: |
+          cat > atlas_causal_03_probe.py <<'ATLAS_CAUSAL03_PY'
+          #!/usr/bin/env python3
+          """ATLAS CAUSAL-03: fixed-entrypoint SIGKILL replay and separate uncaught-error probe.
+          
+          Local-only deterministic harness. Task bodies own all changing observations.
+          No process-stage flag is read by the entrypoint. This file is embedded in a
+          single GitHub Actions YAML; do not present results as executed until CI runs.
+          """
+          from __future__ import annotations
+          
+          import hashlib
+          import importlib.metadata
+          import json
+          import os
+          from pathlib import Path
+          import signal
+          import sqlite3
+          import subprocess
+          import sys
+          import time
+          import traceback
+          
+          BASE = Path("atlas_causal_03_evidence")
+          THREAD = "atlas-causal-03-fixed-entrypoint"
+          WAIT_SECS = 30
+          
+          
+          def sha_file(p: Path) -> str | None:
+              return hashlib.sha256(p.read_bytes()).hexdigest() if p.exists() and p.is_file() else None
+          
+          
+          def event(path: Path, kind: str, **kw: object) -> None:
+              path.parent.mkdir(parents=True, exist_ok=True)
+              with path.open("a", encoding="utf8") as f:
+                  f.write(json.dumps({"kind": kind, **kw}, sort_keys=True) + "\n")
+                  f.flush()
+                  os.fsync(f.fileno())
+          
+          
+          def events(path: Path) -> list[dict]:
+              if not path.exists():
+                  return []
+              return [json.loads(line) for line in path.read_text().splitlines() if line]
+          
+          
+          def exact_contains(obj: object, expected: str, depth: int = 0) -> bool:
+              if depth > 7:
+                  return False
+              if isinstance(obj, str):
+                  return obj == expected
+              if isinstance(obj, (tuple, list)):
+                  return any(exact_contains(value, expected, depth + 1) for value in obj)
+              if isinstance(obj, dict):
+                  return any(exact_contains(value, expected, depth + 1) for value in obj.values())
+              return False
+          
+          
+          def snapshot(db: Path, expected_alert: str) -> dict:
+              """Read only committed SQLite rows; retain checkpoint/task provenance.
+          
+              Decode with official serializer; substring-only BLOB matches are not proof.
+              """
+              if not db.is_file():
+                  return {"exists": False, "rows": [], "matches": [], "error_rows": []}
+              from langgraph.checkpoint.serde.jsonplus import JsonPlusSerializer
+              serde = JsonPlusSerializer()
+              result = {"exists": True, "rows": [], "matches": [], "error_rows": [], "checkpoints": []}
+              with sqlite3.connect(f"file:{db.resolve()}?mode=ro", uri=True, timeout=0.4) as con:
+                  con.row_factory = sqlite3.Row
+                  result["checkpoints"] = [dict(row) for row in con.execute(
+                      "SELECT thread_id, checkpoint_ns, checkpoint_id, parent_checkpoint_id "
+                      "FROM checkpoints WHERE thread_id=? AND checkpoint_ns='' ORDER BY checkpoint_id", (THREAD,)
+                  )]
+                  rows = con.execute(
+                      "SELECT thread_id, checkpoint_ns, checkpoint_id, task_id, task_path, "
+                      "idx, channel, type, value FROM writes WHERE thread_id=? AND checkpoint_ns='' "
+                      "ORDER BY checkpoint_id, task_id, idx", (THREAD,)
+                  ).fetchall()
+                  for row in rows:
+                      info = {key: row[key] for key in ("thread_id", "checkpoint_ns", "checkpoint_id", "task_id", "task_path", "idx", "channel", "type")}
+                      blob = bytes(row["value"]) if row["value"] is not None else b""
+                      info["serialized_sha256"] = hashlib.sha256(blob).hexdigest()
+                      info["serialized_bytes"] = len(blob)
+                      try:
+                          decoded = serde.loads_typed((row["type"], blob))
+                          info["decoded_type"] = type(decoded).__name__
+                          info["decoded_preview"] = repr(decoded)[:240]
+                          info["exact_dependent_output"] = exact_contains(decoded, expected_alert)
+                      except Exception as exc:
+                          info["decode_error"] = f"{type(exc).__name__}: {str(exc)[:160]}"
+                          info["exact_dependent_output"] = False
+                      result["rows"].append(info)
+                      if info["exact_dependent_output"]:
+                          result["matches"].append(info)
+                      if row["channel"] == "__error__":
+                          result["error_rows"].append(info)
+              result["latest_checkpoint_id"] = result["checkpoints"][-1]["checkpoint_id"] if result["checkpoints"] else None
+              return result
+          
+          
+          def matched_keys(snap: dict) -> set[tuple[str, str, str, str]]:
+              return {(r["checkpoint_id"], r["task_id"], r["channel"], r["serialized_sha256"]) for r in snap.get("matches", [])}
+          
+          
+          def worker(scenario: str, base_dir: str) -> None:
+              from langgraph.checkpoint.sqlite import SqliteSaver
+              from langgraph.func import entrypoint, task
+          
+              base = Path(base_dir)
+              db = base / "checkpoint.sqlite"
+              ev = base / "events.jsonl"
+              release = base / "RELEASE"
+              config = {"configurable": {"thread_id": THREAD}}
+              fault = scenario in ("fault", "uncaught_parent")
+          
+              @task
+              def check_status() -> str:
+                  ordinal = sum(e["kind"] == "check_status_body" for e in events(ev)) + 1
+                  event(ev, "check_status_body", ordinal=ordinal)
+                  if fault and ordinal == 1:
+                      raise ConnectionError("transient simulated status read error")
+                  return "up"
+          
+              @task
+              def draft_alert(status: str) -> str:
+                  event(ev, "draft_alert_body", input_status=status)
+                  return f"Alert: status={status}"
+          
+              @task
+              def completion_gate() -> str:
+                  event(ev, "completion_gate_body_entered")
+                  if scenario == "uncaught_parent":
+                      if not release.exists():
+                          raise RuntimeError("intentional uncaught entrypoint error via task")
+                  else:
+                      while not release.exists():
+                          time.sleep(0.06)
+                  event(ev, "completion_gate_body_released")
+                  return "released"
+          
+              with SqliteSaver.from_conn_string(str(db)) as saver:
+                  @entrypoint(checkpointer=saver)
+                  def flow(_input):
+                      try:
+                          status = check_status().result()
+                      except ConnectionError:
+                          status = "down"
+                      # Observational instrumentation only; it does not change control flow.
+                      event(ev, "entrypoint_calls_draft_alert", status=status)
+                      alert = draft_alert(status).result()
+                      event(ev, "entrypoint_observed_alert", status=status, returned_alert=alert)
+                      completion_gate().result()
+                      result = {"status": status, "alert": alert}
+                      event(ev, "entrypoint_complete", **result)
+                      return result
+          
+                  checkpoint_before = saver.get_tuple(config)
+                  if checkpoint_before is not None:
+                      checkpoint_id = checkpoint_before.config.get("configurable", {}).get("checkpoint_id")
+                      event(ev, "worker_resuming_checkpoint", checkpoint_id=checkpoint_id)
+                      print("ATLAS_LOADED_CHECKPOINT=" + str(checkpoint_id), flush=True)
+                      result = flow.invoke(None, config, durability="sync")
+                  else:
+                      event(ev, "worker_initial_invocation")
+                      result = flow.invoke("check", config, durability="sync")
+                  print("ATLAS_WORKER_RESULT=" + json.dumps(result, sort_keys=True), flush=True)
+          
+          
+          def run_case(scenario: str) -> dict:
+              base = BASE / scenario
+              base.mkdir(parents=True, exist_ok=True)
+              ev = base / "events.jsonl"
+              db = base / "checkpoint.sqlite"
+              release = base / "RELEASE"
+              log0 = base / "initial.log"
+              log1 = base / "resume.log"
+              expected = "Alert: status=up" if scenario == "control" else "Alert: status=down"
+              args = [sys.executable, str(Path(__file__).resolve()), "--worker", scenario, str(base.resolve())]
+          
+              info = {"scenario": scenario, "thread_id": THREAD, "checkpoint_ns": "", "expected_dependent_output": expected}
+              with log0.open("w") as outfile:
+                  p = subprocess.Popen(args, stdout=outfile, stderr=subprocess.STDOUT)
+                  barrier = False
+                  pre = None
+                  reason = None
+                  deadline = time.monotonic() + WAIT_SECS
+                  while time.monotonic() < deadline:
+                      try:
+                          pre = snapshot(db, expected)
+                      except (OSError, sqlite3.Error):
+                          pre = None
+                      evs = events(ev)
+                      gate_started = any(x["kind"] == "completion_gate_body_entered" for x in evs)
+                      alert_body_done = any(x["kind"] == "draft_alert_body" and x.get("input_status") == ("up" if scenario == "control" else "down") for x in evs)
+                      barrier = bool(pre and pre.get("matches") and gate_started and alert_body_done)
+                      if scenario == "uncaught_parent":
+                          if p.poll() is not None:
+                              break
+                      else:
+                          if barrier and p.poll() is None:
+                              break
+                          if p.poll() is not None:
+                              reason = f"worker unexpectedly exited before SIGKILL; code={p.returncode}"
+                              break
+                      time.sleep(0.08)
+          
+                  if scenario != "uncaught_parent" and p.poll() is None:
+                      if barrier:
+                          p.kill()
+                      else:
+                          reason = "no durable dependent-result barrier before timeout"
+                          p.kill()
+                  if scenario == "uncaught_parent" and p.poll() is None:
+                      reason = "uncaught-parent worker did not exit within timeout"
+                      p.kill()
+                  p.wait(timeout=5)
+          
+              # Acquire complete post-exit committed SQLite snapshot. For the uncaught
+              # exception path the worker may exit between polling iterations, so the
+              # post-exit snapshot is the authoritative barrier observation.
+              after = snapshot(db, expected)
+              if scenario == "uncaught_parent":
+                  pre = after
+                  evs = events(ev)
+                  barrier = bool(
+                      after.get("matches")
+                      and any(x["kind"] == "completion_gate_body_entered" for x in evs)
+                      and any(x["kind"] == "draft_alert_body" and x.get("input_status") == "down" for x in evs)
+                  )
+              info["first_exit_code"] = p.returncode
+              info["barrier_observed"] = barrier
+              info["checkpoint_before_termination"] = pre.get("latest_checkpoint_id") if pre else None
+              info["write_provenance_before_termination"] = pre.get("matches", []) if pre else []
+              info["checkpoint_after_termination"] = after.get("latest_checkpoint_id")
+              info["write_provenance_after_termination"] = after.get("matches", [])
+              info["error_rows_after_termination"] = after.get("error_rows", [])
+              info["same_dependent_write_survived"] = bool(pre and matched_keys(pre) & matched_keys(after))
+              info["initial_log_sha256"] = sha_file(log0)
+              info["initial_events"] = events(ev)
+              (base / "db_before_resume.json").write_text(json.dumps(after, indent=2, sort_keys=True))
+          
+              if reason:
+                  info["blocked"] = reason
+              elif not barrier:
+                  info["blocked"] = "dependent task output was not verified in SQLite with exact serializer decode"
+              elif not info["same_dependent_write_survived"]:
+                  info["blocked"] = "exact dependent write was not preserved under same checkpoint/task identity"
+              elif scenario != "uncaught_parent" and p.returncode != -signal.SIGKILL:
+                  info["blocked"] = "SIGKILL was not confirmed"
+              elif scenario == "uncaught_parent" and p.returncode == 0:
+                  info["blocked"] = "uncaught entrypoint error did not fail initial worker"
+              elif scenario == "uncaught_parent" and not after.get("error_rows"):
+                  info["blocked"] = "no persisted __error__ write found for uncaught parent error path"
+          
+              if info.get("blocked"):
+                  info["initial_log_tail"] = log0.read_text()[-1800:]
+                  return info
+          
+              # Only after the first worker was killed or failed do we release the gate.
+              release.write_text("controller release after termination\n")
+              with log1.open("w") as outfile:
+                  try:
+                      p2 = subprocess.run(args, stdout=outfile, stderr=subprocess.STDOUT, timeout=30)
+                  except subprocess.TimeoutExpired:
+                      info["blocked"] = "resume process timed out"
+                      return info
+              info["resume_exit_code"] = p2.returncode
+              info["resume_log_sha256"] = sha_file(log1)
+              info["events"] = events(ev)
+              info["checkpoint_db_sha256"] = sha_file(db)
+              info["resume_log_tail"] = log1.read_text()[-2000:]
+              if p2.returncode != 0:
+                  info["blocked"] = f"resume exited with code {p2.returncode}"
+                  return info
+              raw_results = [x.split("=", 1)[1] for x in log1.read_text().splitlines() if x.startswith("ATLAS_WORKER_RESULT=")]
+              loaded = [x.split("=", 1)[1] for x in log1.read_text().splitlines() if x.startswith("ATLAS_LOADED_CHECKPOINT=")]
+              if len(raw_results) != 1 or len(loaded) != 1:
+                  info["blocked"] = "missing structured resume output or checkpoint identifier"
+                  return info
+              info["resumed_from_checkpoint_id"] = loaded[0]
+              info["loaded_latest_checkpoint"] = loaded[0] == info["checkpoint_after_termination"]
+              if not info["loaded_latest_checkpoint"]:
+                  info["blocked"] = "resume did not load observed latest checkpoint"
+                  return info
+              info["result"] = json.loads(raw_results[0])
+              info["consistent"] = info["result"].get("alert") == f"Alert: status={info['result'].get('status')}"
+              info["status_body_executions"] = sum(x["kind"] == "check_status_body" for x in info["events"])
+              info["alert_body_executions"] = sum(x["kind"] == "draft_alert_body" for x in info["events"])
+              info["parent_draft_call_statuses"] = [x["status"] for x in info["events"] if x["kind"] == "entrypoint_calls_draft_alert"]
+              info["parent_retrieved_alerts"] = [x["returned_alert"] for x in info["events"] if x["kind"] == "entrypoint_observed_alert"]
+              info["gate_body_executions"] = sum(x["kind"] == "completion_gate_body_entered" for x in info["events"])
+              return info
+          
+          
+          def main() -> int:
+              BASE.mkdir(exist_ok=True)
+              pkgs = ["langgraph", "langgraph-checkpoint", "langgraph-checkpoint-sqlite", "langchain-core"]
+              report = {"case": "ATLAS-DEPENDENCY-REPLAY-03", "versions": {}, "cases": [],
+                        "semantics": "same entrypoint/task-call sequence; gate observes release within @task; distinct SIGKILL vs uncaught propagated task-error cases",
+                        "git_sha": os.getenv("GITHUB_SHA"), "python": sys.version.split()[0]}
+              for pkg in pkgs:
+                  try:
+                      report["versions"][pkg] = importlib.metadata.version(pkg)
+                  except importlib.metadata.PackageNotFoundError:
+                      report["versions"][pkg] = "MISSING"
+              for scenario in ("control", "fault", "uncaught_parent"):
+                  try:
+                      report["cases"].append(run_case(scenario))
+                  except Exception as exc:
+                      report["cases"].append({"scenario": scenario, "blocked": repr(exc), "traceback": traceback.format_exc()})
+              control, fault, parent = report["cases"]
+              blocked = [r["scenario"] for r in report["cases"] if r.get("blocked")]
+              report["harness_status"] = "BLOCKED" if blocked else ("INVALID_CONTROL" if not control.get("consistent") else "PASS")
+              if report["harness_status"] != "PASS":
+                  report["consistency_status"] = "NOT_EVALUABLE"
+              elif not fault.get("consistent") and fault.get("status_body_executions") == 2 and fault.get("alert_body_executions") == 1 and fault.get("parent_draft_call_statuses") == ["down", "up"]:
+                  report["consistency_status"] = "FAIL_CONFIRMED_REPLAY_MISMATCH"
+              elif not fault.get("consistent"):
+                  report["consistency_status"] = "FAIL_OTHER_MISMATCH"
+              else:
+                  report["consistency_status"] = "PASS_NO_MISMATCH"
+              report["parent_error_status"] = "BLOCKED" if parent.get("blocked") else ("MISMATCH" if not parent.get("consistent") else "CONSISTENT")
+              report["script_sha256"] = sha_file(Path(__file__))
+              (BASE / "report.json").write_text(json.dumps(report, sort_keys=True, indent=2))
+              compact = {"harness_status": report["harness_status"], "consistency_status": report["consistency_status"],
+                         "parent_error_status": report["parent_error_status"],
+                         "cases": [{k: c.get(k) for k in ("scenario", "blocked", "first_exit_code", "barrier_observed", "same_dependent_write_survived", "loaded_latest_checkpoint", "result", "status_body_executions", "alert_body_executions", "parent_draft_call_statuses") if k in c} for c in report["cases"]]}
+              print("ATLAS_RESULT=" + json.dumps(compact, sort_keys=True), flush=True)
+              print("ATLAS_HARNESS_STATUS=" + report["harness_status"], flush=True)
+              print("ATLAS_CONSISTENCY_STATUS=" + report["consistency_status"], flush=True)
+              print("ATLAS_PARENT_ERROR_STATUS=" + report["parent_error_status"], flush=True)
+              return 2 if report["harness_status"] != "PASS" else 0
+          
+          
+          if __name__ == "__main__":
+              if len(sys.argv) >= 2 and sys.argv[1] == "--worker":
+                  worker(sys.argv[2], sys.argv[3])
+              else:
+                  sys.exit(main())
+          ATLAS_CAUSAL03_PY
+          python -m py_compile atlas_causal_03_probe.py
+          python atlas_causal_03_probe.py
+      - name: GitHub Step Summary (diagnostic green is not runtime green)
+        if: always()
+        run: |
+          if [ -f atlas_causal_03_evidence/report.json ]; then
+            python - <<'PY_SUMMARY'
+          import json, os
+          from pathlib import Path
+          r = json.loads(Path('atlas_causal_03_evidence/report.json').read_text())
+          lines = [
+              '# ATLAS Causal Replay 03',
+              '',
+              '**Harness:** '+r['harness_status'],
+              '',
+              '**Consistency:** '+r['consistency_status'],
+              '',
+              '**Uncaught propagated parent-error probe:** '+r['parent_error_status'],
+              '',
+              '**LangGraph:** '+r['versions'].get('langgraph', 'unknown'),
+              '',
+              'A green Actions job means only that the diagnostic harness finished successfully.',
+              'Do not interpret it as a LangGraph PASS.',
+              '',
+              '| Scenario | Result |',
+              '| --- | --- |',
+          ]
+          for c in r['cases']:
+              label = 'BLOCKED: '+c['blocked'] if c.get('blocked') else 'consistent='+str(c.get('consistent'))
+              lines.append('| '+c['scenario']+' | '+label.replace('|','/')+' |')
+          Path(os.environ['GITHUB_STEP_SUMMARY']).open('a').write('\n'.join(lines)+'\n')
+          PY_SUMMARY
+          else
+            echo 'No report produced; inspect job logs.' >> "$GITHUB_STEP_SUMMARY"
+          fi
+      - name: Upload complete reproducibility evidence
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: ATLAS-Causal-Replay-03-${{ matrix.version }}
+          path: |
+            atlas_causal_03_probe.py
+            atlas_causal_03_evidence/
+          if-no-files-found: warn
