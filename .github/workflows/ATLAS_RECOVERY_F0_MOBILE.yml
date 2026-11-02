@@ -1,0 +1,123 @@
+
+name: ATLAS Recovery F0 mobile calibration
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  calibrate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        contract: [guardrail, terminal]
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          repository: openai/openai-agents-python
+          ref: ${{ matrix.contract == 'guardrail' && '3603dc92c90d0d9aebf382e6c0e7dbc6b22d430a' || 'e51633133e671e82df221e1f1713f7cb1cef9711' }}
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065
+        with:
+          python-version: '3.12'
+      - name: Compare fixed test corpus against historical source
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p proof
+          python -m pip install -e . 'pytest>=8,<10' 'pytest-asyncio>=0.25,<2' 'pytest-mock>=3.14,<4'
+          python -m pip freeze > proof/dependencies.txt
+          python -c 'import agents; print(agents.__file__)' > proof/sdk_path.txt
+          if [ '${{ matrix.contract }}' = guardrail ]; then
+            printf '%s\n' \
+              'before|a624e17956bfeac0599aa3f6b12a97a0ea689fc6^' \
+              'session_fixed|a624e17956bfeac0599aa3f6b12a97a0ea689fc6' \
+              'both_fixed|3603dc92c90d0d9aebf382e6c0e7dbc6b22d430a' > proof/stages.txt
+            TESTS=(
+              tests/test_run_impl_resume_paths.py::test_renewed_interruption_recovers_failed_resumed_session_append
+              tests/test_runner_guardrail_resume.py::test_resumed_session_failure_publishes_durable_tool_guardrails
+            )
+          else
+            printf '%s\n' \
+              'before|e51633133e671e82df221e1f1713f7cb1cef9711^' \
+              'fixed|e51633133e671e82df221e1f1713f7cb1cef9711' > proof/stages.txt
+            TESTS=(tests/test_run_impl_resume_paths.py::test_terminal_session_append_failure_rejects_every_later_resume)
+          fi
+          sha256sum tests/test_run_impl_resume_paths.py > proof/test_file_sha.txt
+          if [ '${{ matrix.contract }}' = guardrail ]; then
+            sha256sum tests/test_runner_guardrail_resume.py >> proof/test_file_sha.txt
+          fi
+          while IFS='|' read -r stage revision; do
+            mkdir -p "proof/$stage"
+            git rev-parse "$revision" > "proof/$stage/source_sha.txt"
+            git restore --source="$revision" --staged --worktree -- src
+            git diff --exit-code "$revision" -- src > "proof/$stage/source_diff.txt" || exit 5
+            sha256sum tests/test_run_impl_resume_paths.py > "proof/$stage/test_sha.txt"
+            if [ '${{ matrix.contract }}' = guardrail ]; then
+              sha256sum tests/test_runner_guardrail_resume.py >> "proof/$stage/test_sha.txt"
+            fi
+            set +e
+            python -m pytest -q --disable-warnings --junitxml="proof/$stage/junit.xml" "${TESTS[@]}" > "proof/$stage/log.txt" 2>&1
+            echo "$?" > "proof/$stage/exit.txt"
+            set -e
+          done < proof/stages.txt
+          cat > proof/check.py <<'PY'
+          import json, pathlib, xml.etree.ElementTree as ET
+          root=pathlib.Path('proof'); contract='${{ matrix.contract }}'
+          specs=(
+            {'before':('RED','RED'),'session_fixed':('GREEN','RED'),'both_fixed':('GREEN','GREEN')}
+            if contract=='guardrail' else {'before':('RED',),'fixed':('GREEN',)}
+          )
+          names=('test_renewed_interruption_recovers_failed_resumed_session_append',
+                 'test_resumed_session_failure_publishes_durable_tool_guardrails') if contract=='guardrail' else (
+                 'test_terminal_session_append_failure_rejects_every_later_resume',)
+          counts=(4,4) if contract=='guardrail' else (16,)
+          checks=('function_call_output','_assert_guardrail_results') if contract=='guardrail' else ('terminal_unrecoverable',)
+          rows=[]; allok=True; frozen=None; frozen_hash=None
+          for phase, goals in specs.items():
+            base=root/phase; cases=ET.parse(base/'junit.xml').findall('.//testcase')
+            grouped=[[] for _ in names]
+            for c in cases:
+              indices=[i for i,n in enumerate(names) if c.get('name','').startswith(n+'[')]
+              if len(indices)!=1: allok=False; continue
+              grouped[indices[0]].append(c)
+            ids=sorted(c.get('classname','')+'::'+c.get('name','') for c in cases)
+            manifest=(base/'test_sha.txt').read_text()
+            if frozen_hash is None: frozen_hash=manifest
+            if manifest!=frozen_hash: allok=False
+            if frozen is None: frozen=ids
+            if frozen!=ids or len(ids)!=len(set(ids)): allok=False
+            phase_rows=[]
+            for i,(expected,tests) in enumerate(zip(goals,grouped)):
+              if len(tests)!=counts[i]: allok=False
+              for case in tests:
+                failed=case.find('failure'); err=case.find('error'); skip=case.find('skipped')
+                trace='' if failed is None else (failed.text or '')+(failed.get('message') or '')
+                valid=(err is None and skip is None and (
+                  (expected=='GREEN' and failed is None) or
+                  (expected=='RED' and failed is not None and checks[i].lower() in trace.lower() and 'assert' in trace.lower())
+                ))
+                if not valid: allok=False
+                phase_rows.append(dict(test=case.get('name'),goal=expected,valid=valid,
+                  failure_excerpt=trace[-700:] if failed is not None else None))
+            rows.append(dict(phase=phase,source=(base/'source_sha.txt').read_text().strip(),cases=phase_rows))
+          result=dict(contract=contract,calibrated=allok,stages=rows,novel_bug_claim=False)
+          (root/'result.json').write_text(json.dumps(result,indent=2)+'\n')
+          print(json.dumps({'contract':contract,'calibrated':allok,
+            'counts':[len(s['cases']) for s in rows]},indent=2))
+          raise SystemExit(0 if allok else 2)
+          PY
+          python proof/check.py
+      - name: Hash evidence
+        if: always()
+        run: |
+          find proof -type f ! -name SHA256SUMS -print0 | sort -z | xargs -0 -r sha256sum > proof/SHA256SUMS
+      - name: Upload evidence even on failure
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: atlas-f0-mobile-${{ matrix.contract }}
+          path: proof/
+          if-no-files-found: warn
