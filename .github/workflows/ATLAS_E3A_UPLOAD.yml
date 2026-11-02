@@ -1,0 +1,181 @@
+# ATLAS E3-A: REAL 5-node NATS baseline. No NATS product code changes.
+# Does NOT reproduce nats-io/nats-server #7556 or prove an orphan race.
+# Frozen original source commit d163ae747ad050ea89054f8fb03c43e64e737aea
+name: ATLAS NATS E3A Five Node Generation Baseline
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  five-node-control:
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    env:
+      GOTOOLCHAIN: auto
+      TEST: TestAtlasE3AClusterGenerationBaseline
+    steps:
+      - name: Checkout frozen original NATS
+        uses: actions/checkout@v4
+        with:
+          repository: nats-io/nats-server
+          ref: d163ae747ad050ea89054f8fb03c43e64e737aea
+          fetch-depth: 1
+          path: nats
+      - name: Set up Go toolchain
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.26.10'
+          cache: false
+      - name: Restore additive test and verify frozen product
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C nats rev-parse HEAD)" = d163ae747ad050ea89054f8fb03c43e64e737aea
+          test "$(git -C nats hash-object server/jetstream_cluster.go)" = d4f7f413367d9f3c122955ce99e9e10da5b8214c
+          test "$(git -C nats hash-object server/stream.go)" = 685758e51460493aebe2d8db679983a0da259bf7
+          test "$(git -C nats hash-object server/filestore.go)" = acee437a0ff4dfb80197f288a78df4108f4db24b
+          test -z "$(git -C nats status --porcelain)"
+          mkdir -p atlas-e3a-raw
+          base64 -d <<'ATLAS_E3A_SOURCE_B64' | gzip -dc > nats/server/atlas_e3a_cluster_generation_test.go
+          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
+          ATLAS_E3A_SOURCE_B64
+          printf '%s\n' '16f6c28d6acdc6b8ebd4b4da4ec15b88c7053c26e19a438cb280fcae7d1240c6  nats/server/atlas_e3a_cluster_generation_test.go' | sha256sum --check
+          test -z "$(gofmt -l nats/server/atlas_e3a_cluster_generation_test.go)"
+          test -z "$(git -C nats diff --name-only)"
+          {
+            echo 'ATLAS_E3A_PRODUCT_SHA=d163ae747ad050ea89054f8fb03c43e64e737aea'
+            echo 'ATLAS_E3A_PRODUCT_SOURCES_UNMODIFIED=true'
+            go version
+            sha256sum nats/server/jetstream_cluster.go nats/server/stream.go nats/server/filestore.go nats/server/atlas_e3a_cluster_generation_test.go
+          } | tee atlas-e3a-inputs.txt
+      - name: Verify the exact Go test is selected
+        shell: bash
+        run: |
+          set -euo pipefail
+          (cd nats && go test ./server -list '^TestAtlasE3AClusterGenerationBaseline$') > atlas-e3a-test-list.txt 2> atlas-e3a-list-stderr.txt
+          test "$(grep -Fxc "$TEST" atlas-e3a-test-list.txt || true)" = 1
+          echo 'ATLAS_E3A_TEST_SELECTION=EXACT_ONE' | tee atlas-e3a-selection.txt
+      - name: Execute real five-node API generation/restart control
+        shell: bash
+        working-directory: nats
+        env:
+          ATLAS_E3A_EVIDENCE_DIR: ${{ github.workspace }}/atlas-e3a-raw
+        run: |
+          set +e
+          go test ./server -run '^TestAtlasE3AClusterGenerationBaseline$' -count=1 -timeout=22m -v > ../atlas-e3a-test.log 2> ../atlas-e3a-stderr.txt
+          rc=$?
+          echo "$rc" > ../atlas-e3a-go-test.exit
+          echo "ATLAS_E3A_GO_EXIT=$rc"
+          exit "$rc"
+      - name: Independent strict audit
+        if: always()
+        shell: bash
+        run: |
+          set +e
+          python3 - <<'ATLAS_E3A_AUDIT' > atlas-e3a-audit.txt
+          from pathlib import Path
+          import hashlib, re, sys
+          name='TestAtlasE3AClusterGenerationBaseline'
+          log=Path('atlas-e3a-test.log').read_text(errors='replace') if Path('atlas-e3a-test.log').exists() else ''
+          raw=Path('atlas-e3a-raw')
+          results={}
+          try: rc=int(Path('atlas-e3a-go-test.exit').read_text().strip())
+          except (OSError,ValueError): rc=-999
+          listing=Path('atlas-e3a-test-list.txt').read_text(errors='replace').splitlines() if Path('atlas-e3a-test-list.txt').exists() else []
+          results['selected_once']=listing.count(name)==1
+          results['executed_passed_no_skip']=rc==0 and len(re.findall(r'^=== RUN\s+'+name+r'\s*$',log,re.M))==1 and len(re.findall(r'^--- PASS: '+name+r'\s+\(',log,re.M))==1 and not re.search(r'^--- (?:SKIP|FAIL): '+name+r'\s+\(',log,re.M)
+          results['G1_deleted_before_G2']=log.find('ATLAS_E3A_G1_DELETE_ACK=TRUE')>=0 and 0 <= log.find('ATLAS_E3A_G1_DELETE_ACK=TRUE') < log.find('ATLAS_E3A_G2_CREATED=')
+          results['100_acknowledged_G2']= 'ATLAS_E3A_G2_MANIFEST=100_ACKED_UNIQUE_MESSAGES' in log
+          results['100_verified_before_restart']='ATLAS_E3A_BEFORE_RESTART=G2_IDENTITY_AND_100_PAYLOADS_MATCH' in log
+          results['100_verified_after_restart']='ATLAS_E3A_AFTER_RESTART=G2_IDENTITY_AND_100_PAYLOADS_MATCH' in log
+          results['exact_verdict']='ATLAS_E3A_VERDICT=CONTROL_PASS_G2_100_AFTER_FULL_RESTART' in log
+          src=Path('nats/server/atlas_e3a_cluster_generation_test.go')
+          results['test_source_sha256']=src.is_file() and hashlib.sha256(src.read_bytes()).hexdigest()=='16f6c28d6acdc6b8ebd4b4da4ec15b88c7053c26e19a438cb280fcae7d1240c6'
+          manifest=raw/'g2-manifest.tsv'
+          ops=raw/'operations.tsv'
+          if manifest.is_file():
+            rows=[r.split('\t') for r in manifest.read_text(errors='replace').splitlines()]
+            results['external_manifest_100_valid']=len(rows)==100 and all(len(row)==3 and row[0]==f'{i:03d}' and row[2].endswith(f'|G2|{i:03d}') and hashlib.sha256(row[2].encode()).hexdigest()==row[1] for i,row in enumerate(rows))
+          else: results['external_manifest_100_valid']=False
+          if ops.is_file():
+            rows=[r.split('\t') for r in ops.read_text(errors='replace').splitlines()]
+            events=[r[2] for r in rows if len(r)==4]
+            g2i=events.index('ADD_STREAM') if False else next((i for i,r in enumerate(rows) if len(r)==4 and r[1]=='G2' and r[2]=='ADD_STREAM'),-1)
+            deletes=[r for r in rows if len(r)==4 and r[2] in ('DELETE_STREAM','PURGE_STREAM','DELETE_MESSAGE')]
+            results['harness_only_one_explicit_delete_before_G2']=len(deletes)==1 and deletes[0][1]=='G1' and g2i>0 and all(not (len(r)==4 and r[2] in ('DELETE_STREAM','PURGE_STREAM','DELETE_MESSAGE')) for r in rows[g2i+1:])
+            results['harness_phase_guard']=len(rows)==4 and [r[2] for r in rows]==['ADD_STREAM','DELETE_STREAM','ADD_STREAM','NO_DESTRUCTIVE_REQUESTS_AFTER_G2']
+          else:
+            results['harness_only_one_explicit_delete_before_G2']=False
+            results['harness_phase_guard']=False
+          print('ATLAS_E3A_GO_EXIT='+str(rc))
+          print('ATLAS_E3A_SCOPE=CONTROL_ONLY_NO_RACE_NO_SNAPSHOT_NO_HOOK')
+          for k,v in results.items(): print(f'ATLAS_E3A_CHECK={k} passed={str(v).lower()}')
+          verdict='CONTROL_PASS_NO_PRODUCTION_BUG_CLAIM' if all(results.values()) else 'BLOCKED_OR_RED_CANDIDATE_REQUIRES_REVIEW'
+          print('ATLAS_E3A_AUDIT_VERDICT='+verdict)
+          sys.exit(0 if all(results.values()) else 3)
+          ATLAS_E3A_AUDIT
+          cat atlas-e3a-audit.txt
+          grep -E 'ATLAS_E3A_(G1_|G2_|BEFORE_|AFTER_|RUN_ID|VERDICT)' atlas-e3a-test.log 2>/dev/null || true
+      - name: SHA256 evidence manifest and check
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'ATLAS_E3A_SHA'
+          from pathlib import Path
+          import hashlib
+          root=Path('.')
+          files=[p for p in root.glob('atlas-e3a-*') if p.is_file() and p.name!='atlas-e3a-evidence-sha256.txt']
+          files += [p for p in (root/'atlas-e3a-raw').glob('*') if p.is_file()]
+          p=root/'nats/server/atlas_e3a_cluster_generation_test.go'
+          if p.is_file(): files.append(p)
+          (root/'atlas-e3a-evidence-sha256.txt').write_text(''.join(f'{hashlib.sha256(p.read_bytes()).hexdigest()}  {p.as_posix()}\n' for p in sorted(files)))
+          print('ATLAS_E3A_HASH_FILE_COUNT='+str(len(files)))
+          ATLAS_E3A_SHA
+          sha256sum --check atlas-e3a-evidence-sha256.txt | tee atlas-e3a-hash-check.txt
+      - name: Preserve original evidence even on failure
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: atlas-nats-e3a-five-node-identity-baseline
+          path: |
+            atlas-e3a-*
+            nats/server/atlas_e3a_cluster_generation_test.go
+          if-no-files-found: warn
+          retention-days: 14
+      - name: Fail closed unless original test and independent audit pass
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          grep -Fxq 'ATLAS_E3A_AUDIT_VERDICT=CONTROL_PASS_NO_PRODUCTION_BUG_CLAIM' atlas-e3a-audit.txt
+          sha256sum --check atlas-e3a-evidence-sha256.txt > /dev/null
+          echo 'ATLAS_E3A_FINAL_GATE=PASS_CONTROL_ONLY'
