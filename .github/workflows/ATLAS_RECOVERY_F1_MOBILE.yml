@@ -1,0 +1,137 @@
+
+name: ATLAS Recovery F1 nested reachability
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065
+        with:
+          python-version: '3.12'
+      - name: Install exact SDK
+        run: |
+          pip install 'git+https://github.com/openai/openai-agents-python.git@e355d69152d4f4730dfb03b63dbce53e8d9f5d8c'
+          pip show openai-agents > sdk.txt
+      - name: Run no-fault F1
+        shell: bash
+        run: |
+          cat > f1.py <<'PY'
+          import asyncio,sqlite3,json,traceback,hashlib
+          from pathlib import Path
+          from agents import Agent,Runner,RunConfig
+          from agents.decorators import tool
+          from agents.testing import ScriptedModel,function_call,assistant_message
+          from agents.tool_guardrails import tool_input_guardrail,tool_output_guardrail,ToolGuardrailFunctionOutput
+
+          E='effects.db'; S='session.db'
+          def sql(db,q,args=()):
+              with sqlite3.connect(db) as c:
+                  return c.execute(q,args).fetchall()
+          def record(kind):sql(E,'INSERT INTO events(kind) VALUES (?)',(kind,))
+          def counts():return dict(sql(E,'SELECT kind,count(*) FROM events GROUP BY kind'))
+          def normalized(x):return x.model_dump(mode='json') if hasattr(x,'model_dump') else x
+          def types(items,call):return [i.get('type') for i in items if i.get('call_id')==call]
+
+          class Session:
+              session_id='atlas-nested-f1'
+              async def get_items(self,limit=None):
+                  items=[json.loads(x[0]) for x in sql(S,'SELECT value FROM items ORDER BY id')]
+                  return items[-limit:] if limit is not None else items
+              async def add_items(self,items):
+                  payload=[normalized(i) for i in items]
+                  sql(S,'INSERT INTO batches(value) VALUES (?)',(json.dumps(payload),))
+                  for item in payload:sql(S,'INSERT INTO items(value) VALUES (?)',(json.dumps(item),))
+              async def pop_item(self):
+                  row=sql(S,'SELECT id,value FROM items ORDER BY id DESC LIMIT 1')
+                  if not row:return None
+                  sql(S,'DELETE FROM items WHERE id=?',(row[0][0],))
+                  return json.loads(row[0][1])
+              async def clear_session(self):sql(S,'DELETE FROM items')
+
+          async def run():
+              sql(E,'CREATE TABLE events (id INTEGER PRIMARY KEY,kind TEXT)')
+              sql(S,'CREATE TABLE items (id INTEGER PRIMARY KEY,value TEXT)')
+              sql(S,'CREATE TABLE batches (id INTEGER PRIMARY KEY,value TEXT)')
+              @tool_input_guardrail
+              async def input_check(_):
+                  record('input_guardrail_A')
+                  return ToolGuardrailFunctionOutput.allow()
+              @tool_output_guardrail
+              async def output_check(_):
+                  record('output_guardrail_A')
+                  return ToolGuardrailFunctionOutput.allow()
+              @tool(needs_approval=True,tool_input_guardrails=[input_check],tool_output_guardrails=[output_check])
+              async def action_a()->str:
+                  """Record isolated action A."""
+                  record('entry_A');record('effect_A');return 'receipt-A'
+              @tool(needs_approval=True)
+              async def action_b()->str:
+                  """Record isolated action B."""
+                  record('entry_B');record('effect_B');return 'receipt-B'
+              inner=ScriptedModel([[function_call('action_a',{},call_id='inner-A'),
+                                    function_call('action_b',{},call_id='inner-B')],
+                                   [assistant_message('inner done')]])
+              outer=ScriptedModel([[function_call('delegate',{'input':'run'},call_id='outer-1')],
+                                   [assistant_message('outer done')]])
+              subordinate=Agent(name='subordinate',model=inner,tools=[action_a,action_b])
+              main=Agent(name='main',model=outer,tools=[subordinate.as_tool(
+                  tool_name='delegate',tool_description='test nested',session=Session())])
+              cfg=RunConfig(tracing_disabled=True)
+              first=await Runner.run(main,'go',run_config=cfg)
+              pending=lambda result:[getattr(i.raw_item,'call_id',None) for i in result.interruptions]
+              assert sorted(pending(first))==['inner-A','inner-B'],pending(first)
+              state=first.to_state()
+              state.approve(next(i for i in first.interruptions if getattr(i.raw_item,'call_id',None)=='inner-A'))
+              second=await Runner.run(main,state,run_config=cfg)
+              c=counts(); history=await Session().get_items()
+              batches=[json.loads(x[0]) for x in sql(S,'SELECT value FROM batches ORDER BY id')]
+              conditions={
+                  'A_executor_once':c.get('entry_A',0)==1,
+                  'A_effect_once':c.get('effect_A',0)==1,
+                  'B_not_executed':c.get('entry_B',0)==c.get('effect_B',0)==0,
+                  'A_guardrails_once':c.get('input_guardrail_A',0)==c.get('output_guardrail_A',0)==1,
+                  'B_still_pending':pending(second)==['inner-B'],
+                  'A_output_in_session_once':types(history,'inner-A').count('function_call_output')==1,
+                  'A_output_in_real_write_batch':any('function_call_output' in types(b,'inner-A') for b in batches),
+                  'no_next_model_call':len(inner.calls)==len(outer.calls)==1,
+                  'outer_state_serializable':isinstance(second.to_state().to_json(),dict),
+              }
+              return dict(status='REACHABLE' if all(conditions.values()) else 'NOT_PROVEN',
+                          checks=conditions,counters=c,pending=pending(second),
+                          session_A=types(history,'inner-A'),session_B=types(history,'inner-B'),
+                          write_batches=len(batches),sdk_commit='e355d69152d4f4730dfb03b63dbce53e8d9f5d8c',
+                          note='No error injected; not proof of a new SDK defect')
+          try:result=asyncio.run(run())
+          except Exception as e:result={'status':'BLOCKED','error':str(e),'traceback':traceback.format_exc()}
+          result['script_sha256']=hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
+          Path('report.json').write_text(json.dumps(result,indent=2))
+          print(json.dumps({k:v for k,v in result.items() if k!='traceback'}))
+          raise SystemExit(0 if result['status']=='REACHABLE' else 2)
+          PY
+          python -m py_compile f1.py
+          python f1.py
+      - name: Capture evidence
+        if: always()
+        run: |
+          pip freeze > dependencies.txt
+          for f in f1.py report.json effects.db session.db sdk.txt dependencies.txt; do
+            if [ -f "$f" ]; then sha256sum "$f" >> SHA256SUMS; fi
+          done
+      - name: Publish evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: atlas-recovery-f1
+          path: |
+            f1.py
+            report.json
+            effects.db
+            session.db
+            sdk.txt
+            dependencies.txt
+            SHA256SUMS
+          if-no-files-found: warn
