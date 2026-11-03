@@ -1,0 +1,532 @@
+name: ATLAS F1G Effect Boundary - four fixed cases
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  f1g-effect-boundary:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Python 3.12
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065
+        with:
+          python-version: '3.12'
+      - name: Install pinned Agents SDK
+        run: |
+          python -m pip install 'git+https://github.com/openai/openai-agents-python.git@e355d69152d4f4730dfb03b63dbce53e8d9f5d8c'
+          python -m pip show openai-agents > sdk.txt
+          python -m pip freeze > dependencies.txt
+      - name: Materialize pinned F1G sources (self-contained workflow)
+        shell: bash
+        run: |
+          mkdir -p atlas/f1g proof/f1g
+          touch atlas/__init__.py
+          cat > atlas/f1g/__init__.py <<'ATLAS_F1G___INIT___PY_END'
+          """ATLAS F1G synthetic external-effect proof."""
+          ATLAS_F1G___INIT___PY_END
+          cat > atlas/f1g/receiver.py <<'ATLAS_F1G_RECEIVER_PY_END'
+          """ATLAS F1G: isolated single-writer synthetic effect receiver (standard library only)."""
+          import argparse
+          import json
+          import sqlite3
+          import threading
+          import uuid
+          from http.server import BaseHTTPRequestHandler, HTTPServer
+          from pathlib import Path
+          
+          
+          def canon(obj):
+              return json.dumps(obj, sort_keys=True, separators=(',', ':'), ensure_ascii=False, allow_nan=False)
+          
+          
+          def serve(database, rendezvous, run_id, case_id):
+              instance = str(uuid.uuid4())
+              db = sqlite3.connect(database)
+              db.execute('PRAGMA journal_mode=DELETE')
+              db.execute('PRAGMA synchronous=FULL')
+              db.execute('CREATE TABLE controls(seq INTEGER PRIMARY KEY AUTOINCREMENT, event TEXT NOT NULL, details TEXT NOT NULL)')
+              db.execute('CREATE TABLE effects(effect_seq INTEGER PRIMARY KEY AUTOINCREMENT, run_id TEXT NOT NULL, case_id TEXT NOT NULL, receiver_instance_id TEXT NOT NULL, sdk_call_id_claim TEXT NOT NULL, attempt_id TEXT NOT NULL, action TEXT NOT NULL, emission_origin TEXT NOT NULL, arguments_json TEXT NOT NULL, approval_snapshot_digest TEXT NOT NULL)')
+          
+              def control(event, details):
+                  with db:
+                      db.execute('INSERT INTO controls(event,details) VALUES (?,?)', (event, canon(details)))
+          
+              control('READY', {'run_id': run_id, 'case_id': case_id, 'receiver_instance_id': instance})
+              sealed = False
+          
+              class Handler(BaseHTTPRequestHandler):
+                  def log_message(self, fmt, *args):
+                      pass
+          
+                  def respond(self, status, body):
+                      data = canon(body).encode('utf-8')
+                      self.send_response(status)
+                      self.send_header('Content-Type', 'application/json')
+                      self.send_header('Content-Length', str(len(data)))
+                      self.end_headers()
+                      self.wfile.write(data)
+          
+                  def do_GET(self):
+                      if self.path != '/ready':
+                          return self.respond(404, {'error': 'not_found'})
+                      return self.respond(200, {'run_id': run_id, 'case_id': case_id,
+                                                'receiver_instance_id': instance, 'sealed': sealed})
+          
+                  def do_POST(self):
+                      nonlocal sealed
+                      try:
+                          length = int(self.headers.get('Content-Length', '-1'))
+                          if length < 0 or length > 16384:
+                              return self.respond(400, {'error': 'invalid_length'})
+                          request = json.loads(self.rfile.read(length))
+                          if not isinstance(request, dict):
+                              return self.respond(400, {'error': 'invalid_body'})
+                          if self.path == '/effect':
+                              if sealed:
+                                  control('LATE_REQUEST', {'sdk_call_id_claim': str(request.get('sdk_call_id_claim'))})
+                                  return self.respond(409, {'error': 'sealed'})
+                              required = ('run_id','case_id','sdk_call_id_claim','attempt_id',
+                                          'action','emission_origin','arguments','approval_snapshot_digest')
+                              if any(k not in request for k in required):
+                                  return self.respond(400, {'error': 'missing_field'})
+                              if request['run_id'] != run_id or request['case_id'] != case_id:
+                                  return self.respond(403, {'error': 'wrong_case'})
+                              if request['action'] not in ('A','B') or request['emission_origin'] not in ('SDK_TOOL','LOCAL_NEGATIVE_CONTROL') or not isinstance(request['arguments'], dict):
+                                  return self.respond(400, {'error': 'invalid_action'})
+                              for k in ('sdk_call_id_claim','attempt_id','approval_snapshot_digest'):
+                                  if not isinstance(request[k], str) or not request[k] or len(request[k]) > 128:
+                                      return self.respond(400, {'error': 'invalid_'+k})
+                              arguments = canon(request['arguments'])
+                              # No fachliche Autorisierung oder Deduplizierung: Diagnoseempfänger!
+                              with db:
+                                  cursor = db.execute('INSERT INTO effects(run_id,case_id,receiver_instance_id,sdk_call_id_claim,attempt_id,action,emission_origin,arguments_json,approval_snapshot_digest) VALUES (?,?,?,?,?,?,?,?,?)',
+                                      (run_id,case_id,instance,request['sdk_call_id_claim'],request['attempt_id'],
+                                       request['action'],request['emission_origin'],arguments,request['approval_snapshot_digest']))
+                                  seq = cursor.lastrowid
+                              return self.respond(200, {'effect_seq': seq, 'receiver_instance_id': instance, 'committed': True})
+                          if self.path == '/seal':
+                              if sealed:
+                                  return self.respond(409, {'error': 'already_sealed'})
+                              sealed = True
+                              n = db.execute('SELECT COUNT(*) FROM effects').fetchone()[0]
+                              control('SEALED', {'effect_count': n, 'receiver_instance_id': instance})
+                              return self.respond(200, {'sealed': True, 'effect_count': n, 'receiver_instance_id': instance})
+                          if self.path == '/shutdown':
+                              if not sealed:
+                                  return self.respond(409, {'error': 'not_sealed'})
+                              control('SHUTDOWN', {'receiver_instance_id': instance})
+                              self.respond(200, {'shutdown': True})
+                              threading.Thread(target=self.server.shutdown, daemon=True).start()
+                              return
+                          return self.respond(404, {'error': 'not_found'})
+                      except (ValueError, TypeError, json.JSONDecodeError):
+                          return self.respond(400, {'error': 'invalid_request'})
+                      except (sqlite3.Error, OSError):
+                          # An exception must never produce a false committed receipt.
+                          return self.respond(500, {'error': 'storage_or_io_error'})
+          
+              server = HTTPServer(('127.0.0.1',0), Handler)
+              server.timeout = 1
+              address = {'port':server.server_port, 'run_id':run_id, 'case_id':case_id,
+                         'receiver_instance_id':instance}
+              path = Path(rendezvous)
+              path.write_text(canon(address)+'\n',encoding='utf-8')
+              try:
+                  server.serve_forever(poll_interval=0.05)
+              finally:
+                  server.server_close()
+                  db.close()
+          
+          
+          if __name__ == '__main__':
+              p = argparse.ArgumentParser()
+              p.add_argument('--db', required=True)
+              p.add_argument('--rendezvous', required=True)
+              p.add_argument('--run-id', required=True)
+              p.add_argument('--case-id', required=True)
+              a = p.parse_args()
+              serve(a.db, a.rendezvous, a.run_id, a.case_id)
+          ATLAS_F1G_RECEIVER_PY_END
+          cat > atlas/f1g/reader.py <<'ATLAS_F1G_READER_PY_END'
+          """ATLAS F1G: independent read-only final-state observer; never imports agents."""
+          import argparse
+          import json
+          import sqlite3
+          
+          
+          def read(path):
+              db = sqlite3.connect('file:'+str(path)+'?mode=ro',uri=True)
+              try:
+                  db.row_factory = sqlite3.Row
+                  controls = [dict(x) for x in db.execute('SELECT seq,event,details FROM controls ORDER BY seq')]
+                  effects = [dict(x) for x in db.execute('SELECT * FROM effects ORDER BY effect_seq')]
+                  for row in controls:
+                      row['details'] = json.loads(row['details'])
+                  for row in effects:
+                      row['arguments'] = json.loads(row.pop('arguments_json'))
+                  return {'controls': controls, 'effects': effects,
+                          'db_integrity': db.execute('PRAGMA integrity_check').fetchone()[0]}
+              finally:
+                  db.close()
+          
+          
+          if __name__ == '__main__':
+              p=argparse.ArgumentParser()
+              p.add_argument('--db', required=True)
+              a=p.parse_args()
+              print(json.dumps(read(a.db),sort_keys=True,ensure_ascii=False))
+          ATLAS_F1G_READER_PY_END
+          cat > atlas/f1g/driver.py <<'ATLAS_F1G_DRIVER_PY_END'
+          """ATLAS F1G: 4-case SDK probe with synthetic effect receiver; never uses an API key."""
+          import argparse
+          import asyncio
+          import hashlib
+          import json
+          import os
+          from pathlib import Path
+          import subprocess
+          import sys
+          import time
+          import urllib.request
+          import uuid
+          
+          SDK_PIN = 'e355d69152d4f4730dfb03b63dbce53e8d9f5d8c'
+          CASES = ('DIRECT', 'NESTED', 'B_POSITIVE', 'UNSAFE_LOCAL')
+          
+          
+          def canonical(obj):
+              return json.dumps(obj, ensure_ascii=False, sort_keys=True,
+                                separators=(',', ':'), default=str, allow_nan=False)
+          
+          
+          def sha(obj):
+              return hashlib.sha256(canonical(obj).encode('utf-8')).hexdigest()
+          
+          
+          def post(port, path, value):
+              req = urllib.request.Request('http://127.0.0.1:%d%s' % (port,path),
+                          data=canonical(value).encode(), headers={'Content-Type':'application/json'},
+                          method='POST')
+              with urllib.request.urlopen(req, timeout=5) as response:
+                  return json.load(response)
+          
+          
+          def get(port):
+              with urllib.request.urlopen('http://127.0.0.1:%d/ready' % port,timeout=5) as response:
+                  return json.load(response)
+          
+          
+          def start_receiver(folder, run_id, case_id):
+              db = folder/'receiver.db'
+              rendezvous = folder/'rendezvous.json'
+              command = [sys.executable,'-m','atlas.f1g.receiver','--db',str(db),
+                         '--rendezvous',str(rendezvous),'--run-id',run_id,'--case-id',case_id]
+              stdout = (folder/'receiver.stdout').open('w')
+              stderr = (folder/'receiver.stderr').open('w')
+              proc = subprocess.Popen(command,stdout=stdout,stderr=stderr)
+              stdout.close(); stderr.close()
+              start=time.monotonic()
+              while time.monotonic()-start<6:
+                  if proc.poll() is not None:
+                      raise RuntimeError('Receiver terminated before READY')
+                  if rendezvous.exists():
+                      ref=json.loads(rendezvous.read_text())
+                      ready=get(ref['port'])
+                      if ready != {k:v for k,v in ref.items() if k!='port'} | {'sealed':False}:
+                          raise RuntimeError('Receiver identity mismatched')
+                      return proc,ref,db
+                  time.sleep(0.05)
+              proc.terminate()
+              raise TimeoutError('Receiver never became READY')
+          
+          
+          def effect(port, run_id, case_id, action, digest, origin='SDK_TOOL'):
+              # This claimed ID is cross-checked against ScriptedModel interruptions;
+              # it is NOT an independently provided SDK execution-context identity.
+              return post(port,'/effect',{'run_id':run_id,'case_id':case_id,
+                  'sdk_call_id_claim':'inner-'+action,
+                  'attempt_id':str(uuid.uuid4()),'action':action,'arguments':{},
+                  'emission_origin':origin,'approval_snapshot_digest':digest})
+          
+          
+          def final_read(db):
+              p = subprocess.run([sys.executable,'-m','atlas.f1g.reader','--db',str(db)],
+                                 capture_output=True,text=True,timeout=10)
+              if p.returncode:
+                  raise RuntimeError('Reader failed: '+p.stderr[-1000:])
+              return json.loads(p.stdout)
+          
+          
+          async def run_case(case, root):
+              # sdk imports stay out of receiver + reader processes.
+              from agents import Agent, Runner, RunConfig
+              from agents.decorators import tool
+              from agents.testing import ScriptedModel, assistant_message, function_call
+              from agents.tool_guardrails import (
+                  tool_input_guardrail, tool_output_guardrail, ToolGuardrailFunctionOutput,
+              )
+          
+              folder = root/case
+              folder.mkdir(parents=True,exist_ok=False)
+              run_id=str(uuid.uuid4())
+              proc=None
+              summary={'case_id':case,'run_id':run_id,'sdk_commit':SDK_PIN,
+                       'measurement_validity':'INCOMPLETE','authorization':'UNKNOWN',
+                       'progress':'UNKNOWN','errors':[],'tool_entries':[], 'guardrail_events':[], 'receipts':[],
+                       'receiver_shutdown':False,'sdk_resume_status':'NOT_STARTED',
+                       'pending_after_resume':None,'pending_tasks_after_resume':None}
+              digest_holder=['NOT_FROZEN']
+              snapshot=None
+              try:
+                  proc, ref, db = start_receiver(folder,run_id,case)
+                  summary['receiver_instance_id']=ref['receiver_instance_id']
+          
+                  # Preserve F1F's A input/output guardrail path for a comparable SDK probe.
+                  @tool_input_guardrail
+                  async def input_guardrail(_):
+                      summary['guardrail_events'].append('input_A')
+                      return ToolGuardrailFunctionOutput.allow()
+          
+                  @tool_output_guardrail
+                  async def output_guardrail(_):
+                      summary['guardrail_events'].append('output_A')
+                      return ToolGuardrailFunctionOutput.allow()
+          
+                  @tool(needs_approval=True, tool_input_guardrails=[input_guardrail],
+                        tool_output_guardrails=[output_guardrail])
+                  async def action_a() -> str:
+                      """Synthetic action A (no real-world effect)."""
+                      summary['tool_entries'].append('A')
+                      receipt=effect(ref['port'],run_id,case,'A',digest_holder[0])
+                      summary['receipts'].append({'action':'A','receipt':receipt})
+                      return 'receipt-A'
+          
+                  @tool(needs_approval=True)
+                  async def action_b() -> str:
+                      """Synthetic action B (no real-world effect)."""
+                      summary['tool_entries'].append('B')
+                      receipt=effect(ref['port'],run_id,case,'B',digest_holder[0])
+                      summary['receipts'].append({'action':'B','receipt':receipt})
+                      return 'receipt-B'
+          
+                  scripted = ([function_call('action_b',{},call_id='inner-B')]
+                              if case=='B_POSITIVE' else
+                              [function_call('action_a',{},call_id='inner-A'),
+                               function_call('action_b',{},call_id='inner-B')])
+                  child_model=ScriptedModel([scripted,[assistant_message('done')]])
+                  child=Agent(name='child',model=child_model,tools=[action_a,action_b])
+                  if case=='NESTED':
+                      parent=Agent(name='parent',model=ScriptedModel([
+                          [function_call('delegate',{'input':'run'},call_id='outer-1')],
+                          [assistant_message('parent done')]]),tools=[
+                          child.as_tool(tool_name='delegate',tool_description='Nested synthetic task',
+                                        session=None,failure_error_function=None)])
+                  else:
+                      parent=child
+                  config=RunConfig(tracing_disabled=True)
+                  first=await asyncio.wait_for(Runner.run(parent,'start',run_config=config),timeout=12)
+                  state=first.to_state()
+                  items={getattr(x.raw_item,'call_id',None):x for x in state.get_interruptions()}
+                  expected={'inner-B'} if case=='B_POSITIVE' else {'inner-A','inner-B'}
+                  if set(items)!=expected:
+                      raise AssertionError('Unexpected interrupt IDs: '+str(set(items)))
+                  if case=='B_POSITIVE':
+                      state.approve(items['inner-B'])
+                      decisions={'inner-B':'APPROVED'}
+                  else:
+                      state.approve(items['inner-A'])
+                      decisions={'inner-A':'APPROVED','inner-B':'PENDING'}
+          
+                  # Read-only confirmation that approve() affected the owning (possibly nested) state.
+                  from agents.run_context import RunContextWrapper
+                  verified_decisions={}
+                  for key,item in items.items():
+                      owner=state._find_nested_approval_state(item)
+                      target, owned = owner if owner is not None else (state,item)
+                      namespace=RunContextWrapper._resolve_tool_namespace(owned)
+                      value=target._context.get_approval_status(
+                          owned.tool_name or '',key,tool_namespace=namespace,existing_pending=owned)
+                      verified_decisions[key]={'value':value,'owner':'nested' if owner else 'root',
+                                                'namespace':namespace}
+                      expected_value=(decisions[key]=='APPROVED')
+                      if value is not (True if expected_value else None):
+                          raise AssertionError('Wrong approval binding for '+key+': '+repr(value))
+                  summary['verified_decisions']=verified_decisions
+                  state_json=state.to_json()
+                  snapshot={'run_id':run_id,'case_id':case,'decisions':decisions,
+                            'verified_decisions':verified_decisions,
+                            'calls': {key:{'tool_name':item.tool_name,
+                              'arguments':getattr(item.raw_item,'arguments',None)} for key,item in items.items()},
+                            'sdk_commit':SDK_PIN,'sdk_runstate':state_json}
+                  digest_holder[0]=sha(snapshot)
+                  (folder/'approval_snapshot.json').write_text(canonical(snapshot)+'\n')
+                  summary['approval_snapshot_digest']=digest_holder[0]
+                  summary['sdk_resume_status']='STARTED'
+                  result=await asyncio.wait_for(Runner.run(parent,state,run_config=config),timeout=12)
+                  summary['sdk_resume_status']='RETURNED'
+                  summary['pending_after_resume']=[getattr(x.raw_item,'call_id',None)
+                                                    for x in result.interruptions]
+                  # The SDK can pause on B; a paused run is not an unfinished measurement.
+                  active=[t for t in asyncio.all_tasks() if t is not asyncio.current_task() and not t.done()]
+                  summary['pending_tasks_after_resume']=len(active)
+                  if active:
+                      for task in active:
+                          task.cancel()
+                      await asyncio.gather(*active,return_exceptions=True)
+                      summary['errors'].append('SDK_BACKGROUND_TASKS_REQUIRED_CANCELLATION')
+                  if case=='UNSAFE_LOCAL':
+                      summary['deliberate_negative_control']=True
+                      summary['receipts'].append({'action':'B','source':'LOCAL_NEGATIVE_CONTROL',
+                          'receipt':effect(ref['port'],run_id,case,'B',digest_holder[0],
+                                           'LOCAL_NEGATIVE_CONTROL')})
+              except Exception as e:
+                  summary['errors'].append(type(e).__name__+': '+str(e))
+              finally:
+                  if proc is not None:
+                      # If the SDK was cancelled or left tasks running, seal is forensic only:
+                      # no negative (absence) claim is ever allowed.
+                      try:
+                          summary['seal_receipt']=post(ref['port'],'/seal',{})
+                          post(ref['port'],'/shutdown',{})
+                          proc.wait(timeout=6)
+                          summary['receiver_shutdown']=(proc.returncode==0)
+                      except Exception as e:
+                          summary['errors'].append('SHUTDOWN:'+type(e).__name__+': '+str(e))
+                          if proc.poll() is None:
+                              proc.kill(); proc.wait(timeout=3)
+                      try:
+                          observations=final_read(db)
+                          (folder/'independent_final_read.json').write_text(canonical(observations)+'\n')
+                          effects=observations['effects']
+                          control_events=[x['event'] for x in observations['controls']]
+                          id_ok=all(x['receiver_instance_id']==ref['receiver_instance_id']
+                                    and x['run_id']==run_id and x['case_id']==case for x in effects)
+                          expected_seq=list(range(1,len(effects)+1))
+                          def call_matches(effect_row):
+                              if snapshot is None:
+                                  return False
+                              item=snapshot['calls'].get(effect_row['sdk_call_id_claim'])
+                              if item is None or item['tool_name']!='action_'+effect_row['action'].lower():
+                                  return False
+                              args=item['arguments']
+                              if isinstance(args,str):
+                                  try:
+                                      args=json.loads(args)
+                                  except (ValueError,TypeError):
+                                      return False
+                              return args==effect_row['arguments']
+                          identity_ok=(id_ok and [x['effect_seq'] for x in effects]==expected_seq
+                                       and all(x['approval_snapshot_digest']==digest_holder[0]
+                                               and call_matches(x) for x in effects))
+                          summary['effect_counts']={a:sum(x['action']==a for x in effects) for a in ('A','B')}
+                          summary['effect_sources']=[{'action':x['action'],'source':x['emission_origin']}
+                                                     for x in effects]
+                          summary['final_read_integrity']=observations['db_integrity']
+                          # F1F has A input and output guardrails. An effect must not be
+                          # mistaken for equivalent F1F execution if they were skipped.
+                          n_a=sum(x['action']=='A' and x['emission_origin']=='SDK_TOOL' for x in effects)
+                          guardrails_ok=(summary['guardrail_events']==['input_A','output_A']
+                                         if n_a == 1 else summary['guardrail_events']==[] if n_a == 0 else False)
+                          summary['guardrails_match_F1F']=guardrails_ok
+                          complete=bool(not summary['errors'] and summary['receiver_shutdown'] and
+                              summary['sdk_resume_status']=='RETURNED' and
+                              summary['pending_tasks_after_resume']==0 and guardrails_ok and
+                              control_events==['READY','SEALED','SHUTDOWN'] and
+                              observations['db_integrity']=='ok' and identity_ok and
+                              summary['seal_receipt']['effect_count']==len(effects) and
+                              observations['controls'][0]['details']['receiver_instance_id']==ref['receiver_instance_id'])
+                          summary['measurement_validity']='COMPLETE' if complete else 'INCOMPLETE'
+                          # Positive violations remain visible even when the final seal is incomplete.
+                          b_bad=bool(snapshot and snapshot['decisions'].get('inner-B')=='PENDING' and
+                              any(x['action']=='B' and x['sdk_call_id_claim']=='inner-B' and
+                                  x['approval_snapshot_digest']==digest_holder[0] and
+                                  x['arguments']=={} and x['run_id']==run_id and
+                                  x['case_id']==case for x in effects))
+                          if b_bad:
+                              summary['authorization']='VIOLATION'
+                          elif complete:
+                              summary['authorization']='NO_VIOLATION_OBSERVED'
+                          if complete and snapshot and snapshot['decisions'].get('inner-A')=='APPROVED':
+                              summary['progress']='OBSERVED' if summary['effect_counts']['A']==1 else 'DEVIATION'
+                          elif case=='B_POSITIVE' and complete:
+                              summary['progress']='NOT_APPLICABLE'
+                          summary['sdk_unauthorized_effect_candidate']=bool(b_bad and any(
+                              x['action']=='B' and x['emission_origin']=='SDK_TOOL' for x in effects))
+                          summary['negative_control_origin_confirmed']=bool(
+                              case=='UNSAFE_LOCAL' and b_bad and any(
+                                  x['action']=='B' and x['emission_origin']=='LOCAL_NEGATIVE_CONTROL'
+                                  for x in effects))
+                      except Exception as e:
+                          summary['errors'].append('READ:'+type(e).__name__+': '+str(e))
+                  (folder/'result.json').write_text(json.dumps(summary,indent=2,sort_keys=True,default=str)+'\n')
+              return summary
+          
+          
+          async def main(root):
+              root.mkdir(parents=True, exist_ok=True)
+              results=[]
+              for case in CASES:
+                  results.append(await run_case(case,root))
+              (root/'summary.json').write_text(json.dumps(results,indent=2,sort_keys=True)+'\n')
+              for r in results:
+                  print('ATLAS_F1G',canonical({k:r.get(k) for k in (
+                      'case_id','measurement_validity','authorization','progress',
+                      'effect_counts','pending_after_resume','errors')}),flush=True)
+              # A deliberately unsafe control MUST be reported as a violation to calibrate.
+              cal=next(x for x in results if x['case_id']=='UNSAFE_LOCAL')
+              if cal['authorization']!='VIOLATION' or not cal.get('negative_control_origin_confirmed'):
+                  raise SystemExit('F1G negative control did not calibrate')
+              if any(x['measurement_validity']!='COMPLETE' for x in results):
+                  raise SystemExit('F1G measurement incomplete')
+              direct=next(x for x in results if x['case_id']=='DIRECT')
+              b_control=next(x for x in results if x['case_id']=='B_POSITIVE')
+              if (direct.get('effect_counts')!={'A':1,'B':0}
+                  or direct.get('pending_after_resume')!=['inner-B']
+                  or b_control.get('effect_counts')!={'A':0,'B':1}
+                  or cal.get('effect_counts')!={'A':1,'B':1}):
+                  raise SystemExit('F1G positive/negative control mismatch')
+              nested=next(x for x in results if x['case_id']=='NESTED')
+              if (nested.get('effect_counts')=={'A':0,'B':0}
+                  and nested.get('pending_after_resume')==['inner-B']):
+                  finding='NESTED_PARTIAL_PROGRESS_DEVIATION_OBSERVED'
+              elif (nested.get('effect_counts')=={'A':1,'B':0}
+                    and nested.get('pending_after_resume')==['inner-B']):
+                  finding='NESTED_PARTIAL_PROGRESS_OBSERVED'
+              elif nested.get('effect_counts',{}).get('B',0)>0:
+                  finding='NESTED_UNAPPROVED_B_EFFECT_CANDIDATE'
+              else:
+                  finding='NESTED_UNCLASSIFIED_EFFECT_PATTERN'
+              (root/'classification.json').write_text(json.dumps({'finding':finding,
+                  'sdk_bug_confirmed':False,'reason':'one synthetic local run; sender call ID is a claim'},
+                  indent=2)+'\n')
+              print('ATLAS_F1G_CLASSIFICATION',finding)
+          
+          
+          if __name__=='__main__':
+              p=argparse.ArgumentParser()
+              p.add_argument('--output',default='proof/f1g')
+              a=p.parse_args()
+              asyncio.run(main(Path(a.output)))
+          ATLAS_F1G_DRIVER_PY_END
+          python -m py_compile atlas/f1g/*.py
+      - name: Four fixed synthetic SDK cases (single run)
+        run: python -m atlas.f1g.driver --output proof/f1g
+      - name: Evidence integrity hashes
+        if: always()
+        shell: bash
+        run: |
+          find proof atlas -type f ! -path '*/__pycache__/*' -print0 | sort -z | xargs -0 -r sha256sum > SHA256SUMS
+          for f in sdk.txt dependencies.txt; do if test -f "$f"; then sha256sum "$f" >> SHA256SUMS; fi; done
+      - name: Upload evidence even when test fails
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: atlas-f1g-one-run-evidence
+          path: |
+            atlas/f1g/*.py
+            proof/f1g/
+            sdk.txt
+            dependencies.txt
+            SHA256SUMS
+          if-no-files-found: warn
