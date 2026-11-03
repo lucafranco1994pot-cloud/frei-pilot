@@ -1,0 +1,374 @@
+name: ATLAS F1F resume gate V2
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - '.github/workflows/ATLAS_F1F_RESUME_GATE.yml'
+permissions:
+  contents: read
+jobs:
+  diagnose:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065
+        with:
+          python-version: '3.12'
+      - name: Install pinned OpenAI Agents SDK
+        run: |
+          python -m pip install 'git+https://github.com/openai/openai-agents-python.git@e355d69152d4f4730dfb03b63dbce53e8d9f5d8c'
+          python -m pip show openai-agents > sdk.txt
+          python -m pip freeze > dependencies.txt
+      - name: Run discriminating partial-approval countercheck
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p proof
+          cat > probe.py <<'ATLAS_F1F_V2_SCRIPT'
+          """ATLAS F1F v2 — diagnostic-only, no OpenAI API calls.
+          Pinned OpenAI Agents SDK Python commit e355d69152d4f4730dfb03b63dbce53e8d9f5d8c.
+          Controls: direct approval, nested approval with B rejected, nested approval
+          with a second resume and NO new decision. Uses ScriptedModel only.
+          """
+          import asyncio
+          import hashlib
+          import json
+          import sys
+          import traceback
+          from pathlib import Path
+
+          from agents import Agent, Runner, RunConfig
+          from agents.decorators import tool
+          from agents.testing import ScriptedModel, function_call, assistant_message
+          from agents.tool_guardrails import (
+              tool_input_guardrail,
+              tool_output_guardrail,
+              ToolGuardrailFunctionOutput,
+          )
+
+          BASELINE = "e355d69152d4f4730dfb03b63dbce53e8d9f5d8c"
+          ROOT = Path("proof")
+          ROOT.mkdir(exist_ok=True)
+          CASES = ("DIRECT_REJECT", "NESTED_REJECT", "NESTED_NO_DECISION")
+          WATCHED = {
+              "_run_agent_impl", "_nested_approvals_status", "resolve_interrupted_turn",
+              "_select_function_tool_runs_for_resume", "execute_approved_tools",
+              "execute_function_tool_calls",
+          }
+
+
+          def dump_json(path, value):
+              path.write_text(json.dumps(value, indent=2, sort_keys=True, default=str) + "\n", encoding="utf-8")
+
+
+          def interruptions(result):
+              return [getattr(x.raw_item, "call_id", None) for x in result.interruptions]
+
+
+          def read_decisions(state):
+              """Read-only internal diagnostic; does not change an approval."""
+              from agents.run_context import RunContextWrapper
+              values = {}
+              for item in state.get_interruptions():
+                  call_id = getattr(item.raw_item, "call_id", None)
+                  owner = state._find_nested_approval_state(item)
+                  target, item_for_owner = owner if owner is not None else (state, item)
+                  context = target._context
+                  namespace = RunContextWrapper._resolve_tool_namespace(item_for_owner)
+                  decision = context.get_approval_status(
+                      item_for_owner.tool_name or "", call_id,
+                      tool_namespace=namespace, existing_pending=item_for_owner,
+                  ) if context is not None and call_id else None
+                  values[call_id] = {
+                      "decision": decision, "owner": "nested" if owner else "root",
+                      "tool": item_for_owner.tool_name, "namespace": namespace,
+                      "agent": getattr(item_for_owner.agent, "name", None),
+                  }
+              return values
+
+
+          async def run_case(case):
+              is_nested = case != "DIRECT_REJECT"
+              mode = "NESTED" if is_nested else "DIRECT"
+              counts = {"executor_A": 0, "effect_A": 0, "executor_B": 0, "effect_B": 0,
+                        "guardrail_input_A": 0, "guardrail_output_A": 0}
+              events = []
+              current_phase = ["initial"]
+              record = {"case": case, "mode": mode, "sdk_commit": BASELINE,
+                        "status": "NOT_EVALUABLE", "exception": None,
+                        "events": events, "decisions": {}}
+
+              def mark(name):
+                  counts[name] += 1
+                  events.append({"phase": current_phase[0], "event": "SIDE_EFFECT", "name": name})
+
+              def profile(frame, event, value):
+                  path = frame.f_code.co_filename.replace("\\", "/")
+                  if "/agents/" not in path:
+                      return
+                  name = frame.f_code.co_name
+                  if name not in WATCHED and name not in ("get_approval_status", "run"):
+                      return
+                  loc = frame.f_locals
+                  if event == "call":
+                      if name in WATCHED:
+                          events.append({"phase": current_phase[0], "event": "ENTER",
+                                         "function": name, "module": path.rsplit("/", 1)[-1]})
+                      if name == "run" and path.endswith("/agents/run.py"):
+                          starting_agent = loc.get("starting_agent")
+                          events.append({"phase": current_phase[0], "event": "RUNNER_ENTER",
+                                         "agent": getattr(starting_agent, "name", None),
+                                         "input_is_state": getattr(type(loc.get("input")), "__name__", "") == "RunState"})
+                  elif event == "return":
+                      if name == "get_approval_status" and loc.get("call_id") in ("inner-A", "inner-B"):
+                          pending = loc.get("existing_pending") or loc.get("current_invocation")
+                          events.append({
+                              "phase": current_phase[0], "event": "APPROVAL_READ",
+                              "call_id": loc.get("call_id"), "tool": loc.get("tool_name"),
+                              "namespace": loc.get("tool_namespace"),
+                              "owning_agent": getattr(getattr(pending, "agent", None), "name", None),
+                              "decision": value,
+                          })
+                      if name == "_nested_approvals_status":
+                          events.append({
+                              "phase": current_phase[0], "event": "NESTED_GATE_RETURN",
+                              "result": value,
+                              "has_decision": loc.get("has_decision"),
+                              "has_pending": loc.get("has_pending"),
+                          })
+
+              @tool_input_guardrail
+              async def input_guardrail(_):
+                  mark("guardrail_input_A")
+                  return ToolGuardrailFunctionOutput.allow()
+
+              @tool_output_guardrail
+              async def output_guardrail(_):
+                  mark("guardrail_output_A")
+                  return ToolGuardrailFunctionOutput.allow()
+
+              @tool(needs_approval=True, tool_input_guardrails=[input_guardrail],
+                    tool_output_guardrails=[output_guardrail])
+              async def action_a() -> str:
+                  """Harmless synthetic A action."""
+                  mark("executor_A")
+                  mark("effect_A")
+                  return "receipt-A"
+
+              @tool(needs_approval=True)
+              async def action_b() -> str:
+                  """Harmless synthetic B action."""
+                  mark("executor_B")
+                  mark("effect_B")
+                  return "receipt-B"
+
+              child_model = ScriptedModel([
+                  [function_call("action_a", {}, call_id="inner-A"),
+                   function_call("action_b", {}, call_id="inner-B")],
+                  [assistant_message("child done")],
+              ])
+              child = Agent(name="child", model=child_model, tools=[action_a, action_b])
+              parent_model = None
+              if is_nested:
+                  parent_model = ScriptedModel([
+                      [function_call("delegate", {"input": "run"}, call_id="outer-1")],
+                      [assistant_message("parent done")],
+                  ])
+                  parent = Agent(name="parent", model=parent_model, tools=[
+                      child.as_tool(tool_name="delegate", tool_description="Nested synthetic task",
+                                    session=None, failure_error_function=None),
+                  ])
+              else:
+                  parent = child
+              config = RunConfig(tracing_disabled=True)
+
+              async def resume(state, phase):
+                  current_phase[0] = phase
+                  events.append({"phase": phase, "event": "ROOT_RESUME_REQUESTED", "agent": parent.name})
+                  sys.setprofile(profile)
+                  try:
+                      return await Runner.run(parent, state, run_config=config)
+                  finally:
+                      sys.setprofile(None)
+
+              try:
+                  first = await Runner.run(parent, "start", run_config=config)
+                  record["first_interruptions"] = interruptions(first)
+                  if sorted(record["first_interruptions"]) != ["inner-A", "inner-B"]:
+                      raise AssertionError("Missing distinct initial A/B approval interruptions")
+                  first_state = first.to_state()
+                  a_item = next(i for i in first_state.get_interruptions()
+                                if getattr(i.raw_item, "call_id", None) == "inner-A")
+                  first_state.approve(a_item)
+                  record["decision_snapshot_sha256"] = hashlib.sha256(
+                      json.dumps(first_state.to_json(), sort_keys=True, default=str).encode()
+                  ).hexdigest()
+                  record["decisions"]["before_first_resume"] = read_decisions(first_state)
+                  if (record["decisions"]["before_first_resume"].get("inner-A", {}).get("decision") is not True or
+                          record["decisions"]["before_first_resume"].get("inner-B", {}).get("decision") is not None):
+                      raise AssertionError("Pre-resume approval identity is invalid: expected A=true/B=unknown")
+                  second = await resume(first_state, "RESUME_A")
+                  record["after_A"] = {
+                      "pending": interruptions(second), "counts": dict(counts),
+                      "child_model_calls": len(child_model.calls),
+                      "parent_model_calls": len(parent_model.calls) if parent_model else None,
+                  }
+                  if interruptions(second) != ["inner-B"]:
+                      raise AssertionError("First resume must leave B pending for discriminating test")
+                  second_state = second.to_state()
+                  record["decisions"]["before_second_resume"] = read_decisions(second_state)
+                  if case.endswith("NO_DECISION"):
+                      # KEY COUNTERCHECK: no approve()/reject() call here.
+                      record["no_new_decision_snapshot_sha256"] = hashlib.sha256(
+                          json.dumps(second_state.to_json(), sort_keys=True, default=str).encode()
+                      ).hexdigest()
+                      third = await resume(second_state, "RESUME_NO_NEW_DECISION")
+                  else:
+                      b_item = next(i for i in second_state.get_interruptions()
+                                    if getattr(i.raw_item, "call_id", None) == "inner-B")
+                      second_state.reject(b_item, rejection_message="Reviewer explicitly rejected B")
+                      record["decisions"]["before_second_resume"] = read_decisions(second_state)
+                      third = await resume(second_state, "RESUME_REJECT_B")
+                  record["after_second_resume"] = {
+                      "pending": interruptions(third), "counts": dict(counts),
+                      "final_output": third.final_output,
+                      "child_model_calls": len(child_model.calls),
+                      "parent_model_calls": len(parent_model.calls) if parent_model else None,
+                  }
+                  record["status"] = "OBSERVED"
+              except Exception as exc:
+                  sys.setprofile(None)
+                  record["exception"] = {"type": type(exc).__name__, "message": str(exc),
+                                         "phase": current_phase[0], "traceback": traceback.format_exc()[-2500:]}
+                  record["status"] = "NO_DECISION_RESUME_ERROR" if (
+                      case.endswith("NO_DECISION") and current_phase[0] == "RESUME_NO_NEW_DECISION"
+                  ) else "NOT_EVALUABLE"
+
+              record["trace_counts"] = {
+                  ph: {
+                      "root_resume_requested": sum(e.get("phase") == ph and e.get("event") == "ROOT_RESUME_REQUESTED" for e in events),
+                      "runner_enter_parent": sum(e.get("phase") == ph and e.get("event") == "RUNNER_ENTER" and e.get("agent") == parent.name for e in events),
+                      "runner_enter_child": sum(e.get("phase") == ph and e.get("event") == "RUNNER_ENTER" and e.get("agent") == "child" for e in events),
+                      **{name: sum(e.get("phase") == ph and e.get("event") == "ENTER" and e.get("function") == name for e in events) for name in sorted(WATCHED)},
+                      "read_A_true": sum(e.get("phase") == ph and e.get("event") == "APPROVAL_READ" and e.get("call_id") == "inner-A" and e.get("decision") is True for e in events),
+                      "read_B_none": sum(e.get("phase") == ph and e.get("event") == "APPROVAL_READ" and e.get("call_id") == "inner-B" and e.get("decision") is None for e in events),
+                  } for ph in ("RESUME_A", "RESUME_REJECT_B", "RESUME_NO_NEW_DECISION")
+              }
+              dump_json(ROOT / f"{case}.json", record)
+              print("ATLAS_CASE", json.dumps({
+                  "case": case, "status": record["status"], "after_A": record.get("after_A"),
+                  "after_second_resume": record.get("after_second_resume"),
+                  "exception": record["exception"]["type"] if record["exception"] else None,
+                  "trace_counts": record["trace_counts"],
+              }, sort_keys=True))
+              return record
+
+
+          async def main():
+              records = {case: await run_case(case) for case in CASES}
+              direct, nested, noop = (records[name] for name in CASES)
+              d = direct.get("after_A", {}).get("counts", {})
+              n = nested.get("after_A", {}).get("counts", {})
+              nf = nested.get("after_second_resume", {}).get("counts", {})
+              qf = noop.get("after_second_resume", {}).get("counts", {})
+              calibrated = bool(
+                  direct["status"] == "OBSERVED" and
+                  d.get("executor_A") == d.get("effect_A") == 1 and
+                  d.get("executor_B") == 0 and
+                  direct["trace_counts"]["RESUME_A"]["read_A_true"] > 0 and
+                  direct["trace_counts"]["RESUME_A"]["resolve_interrupted_turn"] > 0
+              )
+              reject_control = bool(
+                  nested["status"] == "OBSERVED" and
+                  n.get("effect_A") == 0 and n.get("effect_B") == 0 and
+                  nf.get("effect_A") == 1 and nf.get("effect_B") == 0 and
+                  nf.get("guardrail_input_A") == nf.get("guardrail_output_A") == 1 and
+                  nested.get("after_second_resume", {}).get("pending") == []
+              )
+              approval_isolated = all(
+                  r.get("after_A", {}).get("counts", {}).get("effect_B", 0) == 0 and
+                  r.get("after_second_resume", {}).get("counts", {}).get("effect_B", 0) == 0
+                  for r in records.values()
+              )
+              if not calibrated:
+                  classification = "BLOCKED_INSTRUMENTATION_OR_DIRECT_CONTROL"
+              elif not approval_isolated:
+                  classification = "SEPARATE_UNAPPROVED_B_EXECUTION"
+              elif not reject_control:
+                  classification = "NESTED_BASELINE_CHANGED_OR_NOT_EVALUABLE"
+              elif noop["status"] == "NO_DECISION_RESUME_ERROR":
+                  classification = "NO_DECISION_RESUME_UNSUPPORTED_OR_FAILED"
+              elif noop["status"] != "OBSERVED":
+                  classification = "NO_DECISION_RESUME_NOT_EVALUABLE"
+              elif qf.get("effect_A", 0) > 1:
+                  classification = "DUPLICATE_A_AFTER_NO_DECISION_RESUME"
+              elif (qf.get("effect_A") == 1 and qf.get("effect_B") == 0
+                    and noop.get("after_second_resume", {}).get("pending") == ["inner-B"]):
+                  classification = "EXTRA_RESUME_SUFFICIENT_B_STILL_PENDING"
+              elif qf.get("effect_A") == 0 and noop.get("after_second_resume", {}).get("pending") == ["inner-B"]:
+                  classification = "STILL_DEFERRED_WITHOUT_B_DECISION"
+              else:
+                  classification = "UNCLASSIFIED_NO_DECISION_OUTCOME"
+
+              before_gate = nested["trace_counts"]["RESUME_A"]
+              after_gate = nested["trace_counts"]["RESUME_REJECT_B"]
+              if not reject_control:
+                  gate_hint = "NOT_EVALUABLE_UNTIL_REJECTION_CONTROL_PASSES"
+              elif after_gate["_run_agent_impl"] == 0:
+                  gate_hint = "AGENT_TOOL_ENTRY_OBSERVER_NOT_CALIBRATED"
+              elif before_gate["_run_agent_impl"] == 0:
+                  gate_hint = "NESTED_DELEGATE_NOT_REENTERED_AFTER_A_ONLY"
+              elif before_gate["runner_enter_child"] == 0:
+                  gate_hint = "DELEGATE_ENTERED_BUT_CHILD_RUN_NOT_OBSERVED"
+              elif before_gate["read_A_true"] == 0:
+                  gate_hint = "CHILD_ENTERED_BUT_A_APPROVAL_READ_NOT_OBSERVED"
+              else:
+                  gate_hint = "CHILD_AND_A_DECISION_OBSERVED_BUT_A_DEFERRED"
+
+              summary = {
+                  "schema": "atlas-f1f-v2", "sdk_commit": BASELINE,
+                  "first_execution_boundary_hint": gate_hint,
+                  "classification": classification,
+                  "calibrated": calibrated, "rejection_control": reject_control,
+                  "B_never_executed": approval_isolated,
+                  "A_after_first_partial_nested": n.get("effect_A"),
+                  "A_after_second_no_decision": qf.get("effect_A"),
+                  "A_after_B_rejection_control": nf.get("effect_A"),
+                  "B_still_pending_after_no_decision": noop.get("after_second_resume", {}).get("pending") == ["inner-B"],
+                  "no_decision_second_resume_status": noop["status"],
+                  "trace": {name: records[name]["trace_counts"] for name in CASES},
+                  "interpretation": "Instrumented entry and approval reads; a live root cause or security impact is not automatically proven.",
+                  "new_security_bug_confirmed": False,
+              }
+              dump_json(ROOT / "summary.json", summary)
+              print("ATLAS_F1F_V2", json.dumps(summary, sort_keys=True))
+              # Distinguish a complete diagnostic with a negative result from failed measurement.
+              if classification == "BLOCKED_INSTRUMENTATION_OR_DIRECT_CONTROL":
+                  raise SystemExit(2)
+              if classification in ("NESTED_BASELINE_CHANGED_OR_NOT_EVALUABLE", "NO_DECISION_RESUME_NOT_EVALUABLE"):
+                  raise SystemExit(3)
+
+
+          if __name__ == "__main__":
+              asyncio.run(main())
+          ATLAS_F1F_V2_SCRIPT
+          python -m py_compile probe.py
+          python probe.py
+      - name: SHA-256 evidence manifest
+        if: always()
+        shell: bash
+        run: |
+          find proof -type f ! -name SHA256SUMS -print0 | sort -z | xargs -0 -r sha256sum > SHA256SUMS
+          sha256sum probe.py sdk.txt dependencies.txt >> SHA256SUMS
+      - name: Upload complete evidence on success or failure
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: atlas-f1f-v2-no-decision-countercheck
+          path: |
+            probe.py
+            proof/
+            sdk.txt
+            dependencies.txt
+            SHA256SUMS
+          if-no-files-found: warn
