@@ -1,0 +1,95 @@
+diff --git a/crates/adapters/interactive_brokers/src/execution/updates.rs b/crates/adapters/interactive_brokers/src/execution/updates.rs
+index 69eb87c..65bee36 100644
+--- a/crates/adapters/interactive_brokers/src/execution/updates.rs
++++ b/crates/adapters/interactive_brokers/src/execution/updates.rs
+@@ -901,7 +901,12 @@ impl InteractiveBrokersExecutionClient {
+     ) {
+         // Only a complete answer proves absence: ibapi ends a stream after an error, and a
+         // stream cut short must leave the order working rather than reject it
+-        match Self::find_open_order(client, ib_order_id, timeout_dur).await {
++        let Ok(local_client_id) = orders.lock().map(|state| state.client_id) else {
++            tracing::warn!("Skipping IB order presence check: order tracking unavailable");
++            return;
++        };
++
++        match Self::find_open_order(client, ib_order_id, local_client_id, timeout_dur).await {
+             Ok(true) => {
+                 tracing::debug!("Order {client_order_id} remains open at the venue after notice");
+                 return;
+@@ -949,9 +954,15 @@ impl InteractiveBrokersExecutionClient {
+                 .map(|order| order.perm_id)
+         });
+ 
++        let Ok(local_client_id) = orders.lock().map(|state| state.client_id) else {
++            tracing::warn!("Skipping IB completed-order check: order tracking unavailable");
++            return;
++        };
++
+         let completed = match Self::find_completed_order(
+             client,
+             ib_order_id,
++            local_client_id,
+             tracked_perm_id,
+             timeout_dur,
+         )
+@@ -1022,6 +1033,7 @@ impl InteractiveBrokersExecutionClient {
+     async fn find_open_order(
+         client: &Arc<Client>,
+         ib_order_id: i32,
++        local_client_id: i32,
+         timeout_dur: Duration,
+     ) -> anyhow::Result<bool> {
+         tokio::time::timeout(timeout_dur, async {
+@@ -1029,7 +1041,8 @@ impl InteractiveBrokersExecutionClient {
+             while let Some(item) = subscription.next().await {
+                 match item? {
+                     SubscriptionItem::Data(Orders::OrderData(data))
+-                        if data.order_id == ib_order_id =>
++                        if data.order_id == ib_order_id
++                            && data.order.client_id == local_client_id =>
+                     {
+                         return Ok(true);
+                     }
+@@ -1047,6 +1060,7 @@ impl InteractiveBrokersExecutionClient {
+     async fn find_completed_order(
+         client: &Arc<Client>,
+         ib_order_id: i32,
++        local_client_id: i32,
+         tracked_perm_id: Option<i64>,
+         timeout_dur: Duration,
+     ) -> anyhow::Result<Option<(OrderStatusKind, i64, f64)>> {
+@@ -1055,7 +1069,8 @@ impl InteractiveBrokersExecutionClient {
+             while let Some(item) = subscription.next().await {
+                 match item? {
+                     SubscriptionItem::Data(Orders::OrderData(data))
+-                        if data.order_id == ib_order_id
++                        if (data.order_id == ib_order_id
++                            && data.order.client_id == local_client_id)
+                             || (data.order.perm_id != 0
+                                 && Some(data.order.perm_id) == tracked_perm_id) =>
+                     {
+@@ -1410,6 +1425,16 @@ impl InteractiveBrokersExecutionClient {
+                         return Ok(());
+                     }
+ 
++                    // A foreign client's order may reuse our numeric order ID; only a tracked
++                    // correlation or an order from our own client may accept or update ours
++                    let may_update_own_order = match &correlation {
++                        OrderCorrelation::Tracked { .. } => true,
++                        OrderCorrelation::Untracked { .. } => {
++                            order_data.order.client_id == orders.lock()?.client_id
++                        }
++                        OrderCorrelation::Duplicate { .. } => true,
++                    };
++
+                     if let OrderCorrelation::Tracked { order_id, .. } = correlation {
+                         normalized_order.order_id = order_id;
+                     }
+@@ -1436,6 +1461,7 @@ impl InteractiveBrokersExecutionClient {
+                     };
+ 
+                     if let Some(client_order_id) = client_order_id
++                        && may_update_own_order
+                         && IbOrderStatus::from_str(status_str).is_ok_and(IbOrderStatus::is_accepted)
+                     {
+                         let instrument_id = {
