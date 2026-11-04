@@ -1,0 +1,202 @@
+name: ATLAS 4152 - original code proof (no fix)
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  original-code-proof:
+    name: Pending cancel/update - expected red
+    runs-on: ubuntu-latest
+    timeout-minutes: 50
+    steps:
+      - name: Checkout pinned NautilusTrader original
+        uses: actions/checkout@v4
+        with:
+          repository: nautechsystems/nautilus_trader
+          ref: 6c843bc7f9f72941eeddb22df502b520c97a8987
+          path: original
+          persist-credentials: false
+
+      - name: Verify exact upstream commit
+        shell: bash
+        run: |
+          set -euo pipefail
+          actual="$(git -C original rev-parse HEAD)"
+          expected="6c843bc7f9f72941eeddb22df502b520c97a8987"
+          echo "Pinned commit: $actual"
+          test "$actual" = "$expected"
+
+      - name: Install pinned Rust toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.99.1
+
+      - name: Install native build prerequisites
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y pkg-config libssl-dev libclang-dev
+
+      - name: Existing original manager baseline must pass
+        shell: bash
+        working-directory: original
+        run: |
+          set -euo pipefail
+          cargo test -p nautilus-live --lib test_accepted_report_during_pending_command_preserves_inflight_tracking -- --nocapture > "$RUNNER_TEMP/atlas4152-baseline.log" 2>&1
+          cat "$RUNNER_TEMP/atlas4152-baseline.log"
+          if ! grep -q 'test result: ok.*2 passed' "$RUNNER_TEMP/atlas4152-baseline.log"; then
+            echo "BLOCKED: Original baseline did not execute and pass both parameterized cases."
+            exit 1
+          fi
+          echo "BASELINE_PASS: Original manager's pending-command tracking tests passed."
+
+      - name: Inject only two negative-control tests into original manager
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          path = Path("original/crates/live/src/execution/manager.rs")
+          src = path.read_text()
+          original_branch = "OrderStatus::PendingUpdate | OrderStatus::PendingCancel => {"
+          terminal_call = "create_reconciliation_canceled(&order, ts_now)"
+          assert original_branch in src and terminal_call in src, "Original manager branch not found: stop"
+          assert "#[cfg(test)]\nmod tests {" in src, "Test module missing: stop"
+          assert "test_atlas_4152_pending_cancel" not in src, "Already injected: stop"
+          src = src.rstrip()
+          assert src.endswith('}'), "Unexpected manager file ending: stop"
+          tests = r'''
+
+              // ATLAS #4152: two *negative controls*, not a proposed production fix.
+              // Expected outcome on pinned original: both fail with ATLAS_4152_FALSE_CANCEL.
+              async fn atlas_4152_pending_check(pending_status: OrderStatus) {
+                  let client_order_id = ClientOrderId::from("ATLAS-4152-ORDER");
+                  let venue_order_id = VenueOrderId::from("ATLAS-4152-VENUE");
+                  let account_id = AccountId::from("TEST-001");
+                  let client_id = ClientId::from("TEST");
+                  let instrument_id = crypto_perpetual_ethusdt().id();
+                  let clock = Rc::new(RefCell::new(VirtualClock::new()));
+                  let cache = Rc::new(RefCell::new(Cache::default()));
+                  insert_accepted_limit_order(
+                      &cache,
+                      client_order_id,
+                      venue_order_id,
+                      instrument_id,
+                      client_id,
+                  );
+                  let order = cache.borrow().order_owned(&client_order_id).unwrap();
+                  let event = match pending_status {
+                      OrderStatus::PendingCancel => OrderEventAny::PendingCancel(
+                          OrderPendingCancelSpec::builder()
+                              .trader_id(order.trader_id())
+                              .strategy_id(order.strategy_id())
+                              .instrument_id(instrument_id)
+                              .client_order_id(client_order_id)
+                              .account_id(account_id)
+                              .venue_order_id(venue_order_id)
+                              .build(),
+                      ),
+                      OrderStatus::PendingUpdate => OrderEventAny::PendingUpdate(
+                          OrderPendingUpdateSpec::builder()
+                              .trader_id(order.trader_id())
+                              .strategy_id(order.strategy_id())
+                              .instrument_id(instrument_id)
+                              .client_order_id(client_order_id)
+                              .account_id(account_id)
+                              .venue_order_id(venue_order_id)
+                              .build(),
+                      ),
+                      _ => unreachable!(),
+                  };
+                  cache.borrow_mut().update_order(&event).unwrap();
+                  let mut manager = ExecutionManager::new(
+                      clock,
+                      cache.clone(),
+                      ExecutionManagerConfig {
+                          inflight_threshold_ms: 1,
+                          inflight_max_retries: 1,
+                          ..Default::default()
+                      },
+                  )
+                  .unwrap();
+                  manager.register_inflight(client_order_id, UUID4::new());
+                  dst::time::sleep(Duration::from_millis(30)).await;
+                  let result = manager.check_inflight_orders();
+                  assert!(
+                      result.events.is_empty(),
+                      "ATLAS_4152_FALSE_CANCEL: retry exhaustion created a terminal event for {pending_status:?}: {:?}",
+                      result.events,
+                  );
+                  assert!(
+                      manager.order_inflight_checks.contains_key(&client_order_id),
+                      "ATLAS_4152_TRACKING_LOST: pending order no longer eligible for future checks"
+                  );
+              }
+
+              #[tokio::test]
+              async fn test_atlas_4152_pending_cancel() {
+                  atlas_4152_pending_check(OrderStatus::PendingCancel).await;
+              }
+
+              #[tokio::test]
+              async fn test_atlas_4152_pending_update() {
+                  atlas_4152_pending_check(OrderStatus::PendingUpdate).await;
+              }
+          '''
+          path.write_text(src[:-1] + tests + '\n}\n')
+          print('Injected two tests without touching production code.')
+          PY
+
+      - name: Verify test-only diff after injection
+        shell: bash
+        working-directory: original
+        run: |
+          set -euo pipefail
+          changed="$(git diff --name-only)"
+          if [[ "$changed" != "crates/live/src/execution/manager.rs" ]]; then
+            echo "BLOCKED: Unexpected changed files: $changed"
+            exit 1
+          fi
+          if [[ "$(git diff --numstat | wc -l)" -ne 1 ]]; then
+            echo "BLOCKED: Expected exactly one diff file."
+            exit 1
+          fi
+          echo "TEST_ONLY_DIFF_CHECK_PASS: Only manager.rs modified for injected tests."
+
+      - name: Run native Rust tests - require two specific assertion failures
+        shell: bash
+        working-directory: original
+        run: |
+          set +e
+          cargo test -p nautilus-live --lib test_atlas_4152_pending_ -- --nocapture --test-threads=1 > "$RUNNER_TEMP/atlas4152.log" 2>&1
+          rc=$?
+          set -e
+          cat "$RUNNER_TEMP/atlas4152.log"
+          if [[ "$rc" -eq 0 ]]; then
+            echo "FAIL: Original unexpectedly passed; no defect demonstrated."
+            exit 1
+          fi
+          if ! grep -q 'test result: FAILED.*2 failed' "$RUNNER_TEMP/atlas4152.log"; then
+            echo "BLOCKED: Not two failing Rust tests (maybe compilation/setup error)."
+            exit 1
+          fi
+          count="$(grep -c 'ATLAS_4152_FALSE_CANCEL' "$RUNNER_TEMP/atlas4152.log" || true)"
+          if [[ "$count" -lt 2 ]]; then
+            echo "BLOCKED: Missing two precise false-cancel assertions."
+            exit 1
+          fi
+          echo "PROVEN_ORIGINAL_RED: Both pending states produced synthetic terminal events on pinned original."
+
+      - name: Upload full proof log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: atlas-4152-original-proof-log
+          path: |
+            ${{ runner.temp }}/atlas4152-baseline.log
+            ${{ runner.temp }}/atlas4152.log
+          if-no-files-found: ignore
