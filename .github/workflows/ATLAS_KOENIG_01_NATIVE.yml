@@ -1,0 +1,117 @@
+name: ATLAS 01 - Native identity differential
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  diagnostic:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 100
+    steps:
+      - name: Checkout ATLAS test assets
+        uses: actions/checkout@v4
+        with:
+          path: atlas-assets
+      - name: Checkout exact upstream version
+        uses: actions/checkout@v4
+        with:
+          repository: nautechsystems/nautilus_trader
+          ref: 6c843bc7f9f72941eeddb22df502b520c97a8987
+          path: nautilus
+          persist-credentials: false
+      - name: Python 3.13 and uv
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - name: Install uv
+        uses: astral-sh/setup-uv@v6
+      - name: Prepare and fingerprint inputs
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p evidence
+          git -C nautilus rev-parse HEAD | tee evidence/upstream_commit.txt
+          sha256sum atlas-assets/atlas/koenig01/fix.patch | tee evidence/patch_sha256.txt
+          cp atlas-assets/atlas/koenig01/{prepare_fixture.py,run_fixture.py} nautilus/
+          cd nautilus
+          python prepare_fixture.py
+          sha256sum ib_equal_id_repro.py | tee ../evidence/fixture_sha256.txt
+          git apply --check ../atlas-assets/atlas/koenig01/fix.patch
+      - name: ORIGINAL build and three separate protocol cases
+        id: original
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd nautilus
+          make sync 2>&1 | tee ../evidence/original_sync.log
+          make build-debug 2>&1 | tee ../evidence/original_build.log
+          for case in duplicate_absent duplicate baseline; do
+            python/.venv/bin/python run_fixture.py "$case" "../evidence/original_${case}.json" 2>&1 | tee "../evidence/original_${case}.log"
+          done
+      - name: Require original evidence before modifying code
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "${{ steps.original.outcome }}" = success || { echo 'BASELINE_BUILD_OR_FIXTURE_FAILED'; exit 1; }
+          python - <<'PY'
+          import json, pathlib
+          base=pathlib.Path('evidence')
+          for case in ('duplicate_absent','duplicate','baseline'):
+              p=base/f'original_{case}.json'
+              if not p.is_file(): raise SystemExit('BASELINE_MISSING '+str(p))
+              j=json.loads(p.read_text())
+              if j['result'].get('fixture_errors') or j['result'].get('run_error'):
+                  raise SystemExit('BASELINE_INVALID '+case)
+          # This is a diagnostic snapshot guard, not a full asynchronous drain proof.
+          rejected=json.dumps(json.loads((base/'original_duplicate_absent.json').read_text())['result'].get('events', []))
+          collision=json.dumps(json.loads((base/'original_duplicate.json').read_text())['result'].get('events', []))
+          if 'OrderRejected' not in rejected or 'OrderAccepted' not in collision:
+              raise SystemExit('BASELINE_NOT_REPRODUCED: inspect artifacts before patch')
+          print('BASELINE_REPRODUCED_SNAPSHOT_ONLY')
+          PY
+      - name: Apply minimal patch and rebuild
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd nautilus
+          git apply ../atlas-assets/atlas/koenig01/fix.patch
+          git diff --check
+          git diff > ../evidence/applied.diff
+          make build-debug 2>&1 | tee ../evidence/fix_build.log
+          for case in duplicate_absent duplicate baseline; do
+            python/.venv/bin/python run_fixture.py "$case" "../evidence/fix_${case}.json" 2>&1 | tee "../evidence/fix_${case}.log"
+          done
+      - name: Basic evidence comparison (not full certification)
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import json,pathlib
+          root=pathlib.Path('evidence')
+          data={k:json.loads((root/f'{k}.json').read_text()) for k in [
+            'original_duplicate_absent','original_duplicate','original_baseline',
+            'fix_duplicate_absent','fix_duplicate','fix_baseline']}
+          hashes={v['fixture_sha256'] for v in data.values()}
+          if len(hashes)!=1: raise SystemExit('FIXTURE_MISMATCH')
+          def has(k,event): return event in json.dumps(data[k]['result'].get('events', []))
+          checks={
+            'original_control_rejected':has('original_duplicate_absent','OrderRejected'),
+            'original_collision_accepted':has('original_duplicate','OrderAccepted'),
+            'fixed_control_rejected':has('fix_duplicate_absent','OrderRejected'),
+            'fixed_collision_rejected':has('fix_duplicate','OrderRejected'),
+            'fixed_collision_not_accepted':not has('fix_duplicate','OrderAccepted'),
+            'fixed_genuine_accepted':has('fix_baseline','OrderAccepted'),
+          }
+          (root/'comparison.json').write_text(json.dumps(checks,indent=2)+'\n')
+          print(json.dumps(checks,indent=2))
+          if not all(checks.values()): raise SystemExit('DIFFERENTIAL_SNAPSHOT_FAIL')
+          print('NATIVE_SNAPSHOT_DIFFERENTIAL_PASS; async-drain/external-order preservation still unverified')
+          PY
+      - name: Always upload evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: atlas-01-native-evidence
+          path: evidence/
+          if-no-files-found: warn
