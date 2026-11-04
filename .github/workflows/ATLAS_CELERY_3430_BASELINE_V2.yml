@@ -1,0 +1,438 @@
+name: ATLAS Celery 3430 - RabbitMQ solo baseline V2
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  rabbitmq-solo-baseline:
+    name: celery-${{ matrix.celery }} / ${{ matrix.ack_mode }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 9
+    strategy:
+      fail-fast: false
+      matrix:
+        celery: ['5.6.3', '5.7.0rc1']
+        ack_mode: ['early', 'late']
+    services:
+      rabbitmq:
+        image: rabbitmq:4.1-management
+        env:
+          RABBITMQ_DEFAULT_USER: atlas
+          RABBITMQ_DEFAULT_PASS: atlaspass
+        ports:
+          - 5672:5672
+          - 15672:15672
+        # Deliberately no `options`: V1's quoted --health-cmd caused
+        # docker create "invalid reference format" before any test ran.
+        # Python below independently waits for RabbitMQ and its consumer.
+    steps:
+      - name: Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install exact Celery version
+        run: |
+          set -euo pipefail
+          mkdir -p evidence
+          python -m pip install 'celery==${{ matrix.celery }}'
+          python -m pip freeze > packages.txt
+          docker image inspect rabbitmq:4.1-management --format '{{json .RepoDigests}}' > evidence/rabbitmq_image_digests.json || true
+      - name: Original-code RabbitMQ solo probe (no Celery patch)
+        env:
+          ATLAS_ACK_MODE: ${{ matrix.ack_mode }}
+          ATLAS_CELERY_VERSION: ${{ matrix.celery }}
+          ATLAS_BROKER_URL: amqp://atlas:atlaspass@127.0.0.1:5672//
+        run: |
+          cat > atlas_celery_3430.py <<'PY'
+          import base64
+          import hashlib
+          import json
+          import os
+          from pathlib import Path
+          import subprocess
+          import sys
+          import time
+          from urllib import request, parse, error
+          import uuid
+
+          from celery import Celery
+          import celery
+
+          MODE = os.environ.get('ATLAS_ACK_MODE', 'early')
+          BROKER = os.environ.get('ATLAS_BROKER_URL', 'amqp://atlas:atlaspass@127.0.0.1:5672//')
+          QUEUE = os.environ.get('ATLAS_QUEUE', 'atlas3430_default')
+          LONG_SECONDS = 32
+          SHORT_SECONDS = 1
+          HEARTBEAT_REQUESTED = 10
+          app = Celery('atlas3430', broker=BROKER)
+          app.conf.update(
+              task_acks_late=(MODE == 'late'),
+              broker_heartbeat=HEARTBEAT_REQUESTED,
+              broker_heartbeat_checkrate=2,
+              worker_prefetch_multiplier=1,
+              worker_enable_remote_control=False,
+              task_ignore_result=True,
+              task_serializer='json',
+              accept_content=['json'],
+              task_default_queue=QUEUE,
+          )
+
+          def journal_path():
+              # Read on each use. The parent and child use the same env path.
+              return Path(os.environ.get('ATLAS_JOURNAL', 'task_events.jsonl')).resolve()
+
+          def write_event(kind, task_id, redelivered):
+              event = {
+                  'type': kind, 'task_id': task_id,
+                  'redelivered': bool(redelivered), 'pid': os.getpid(),
+                  'at_utc_unix': time.time(), 'at_monotonic': time.monotonic(),
+                  'attempt_id': getattr(write_event, 'attempt_id', None),
+              }
+              with journal_path().open('a', encoding='utf-8') as stream:
+                  stream.write(json.dumps(event, sort_keys=True) + '\n')
+                  stream.flush()
+                  os.fsync(stream.fileno())
+
+          @app.task(name='atlas3430.sleeper', bind=True)
+          def sleeper(self, seconds):
+              data = self.request.delivery_info or {}
+              write_event.attempt_id = uuid.uuid4().hex
+              write_event('start', self.request.id, data.get('redelivered', False))
+              time.sleep(seconds)
+              write_event('end', self.request.id, data.get('redelivered', False))
+              return 'done'
+
+          OUT = Path('evidence').resolve()
+          OUT.mkdir(exist_ok=True)
+          API_ERRORS = []
+          AUTH = base64.b64encode(b'atlas:atlaspass').decode('ascii')
+          API_ROOT = 'http://127.0.0.1:15672'
+
+          def api(method, endpoint, *, allow_missing=False):
+              url = API_ROOT + endpoint
+              req = request.Request(url, method=method,
+                                    headers={'Authorization': 'Basic ' + AUTH})
+              try:
+                  with request.urlopen(req, timeout=3) as response:
+                      if method == 'DELETE':
+                          return {'ok': True, 'data': {}}
+                      return {'ok': True, 'data': json.load(response)}
+              except error.HTTPError as exc:
+                  if allow_missing and exc.code == 404:
+                      return {'ok': True, 'missing': True, 'data': None}
+                  desc = {'at': time.time(), 'endpoint': endpoint,
+                          'status': exc.code, 'error': str(exc)}
+              except Exception as exc:
+                  desc = {'at': time.time(), 'endpoint': endpoint,
+                          'status': None, 'error': repr(exc)}
+              API_ERRORS.append(desc)
+              return {'ok': False, 'data': None, 'error': desc}
+
+          def read_events(path, task_id=None):
+              if not path.exists():
+                  return []
+              events = []
+              for index, line in enumerate(path.read_text(encoding='utf-8').splitlines(), 1):
+                  try:
+                      event = json.loads(line)
+                  except json.JSONDecodeError as exc:
+                      raise RuntimeError(f'corrupt journal line {index}: {exc}')
+                  if task_id is None or event.get('task_id') == task_id:
+                      events.append(event)
+              return events
+
+          def consumer_for(queue_name):
+              reply = api('GET', '/api/consumers/%2F')
+              if not reply['ok'] or not isinstance(reply['data'], list):
+                  return {'ok': False, 'identity': None}
+              matches = [c for c in reply['data']
+                         if c.get('queue', {}).get('name') == queue_name]
+              if not matches:
+                  return {'ok': True, 'identity': None}
+              channel = matches[0].get('channel_details', {})
+              return {'ok': True, 'identity': {
+                  'consumer_tag': matches[0].get('consumer_tag'),
+                  'connection': channel.get('connection_name'),
+                  'channel': channel.get('name'),
+              }}
+
+          def queue_state(queue_name):
+              return api('GET', '/api/queues/%2F/' + parse.quote(queue_name, safe=''),
+                         allow_missing=True)
+
+          def connection_state(connection_name):
+              if not connection_name:
+                  return {'ok': False, 'data': None}
+              return api('GET', '/api/connections/' +
+                         parse.quote(connection_name, safe=''), allow_missing=True)
+
+          def sample(queue_name, original, start_monotonic):
+              q = queue_state(queue_name)
+              c = consumer_for(queue_name)
+              con = connection_state(original)
+              qdata = q.get('data') if isinstance(q.get('data'), dict) else None
+              cdata = con.get('data') if isinstance(con.get('data'), dict) else None
+              present = (None if not con.get('ok') or not original
+                         else not con.get('missing', False))
+              return {
+                  'at_utc_unix': time.time(),
+                  'relative_to_start_s': round(time.monotonic() - start_monotonic, 2),
+                  'queue_api_ok': q['ok'],
+                  'consumers_api_ok': c['ok'],
+                  'connection_api_ok': con['ok'],
+                  'queue': ({key: qdata.get(key) for key in
+                             ('messages_ready', 'messages_unacknowledged', 'consumers')}
+                            if qdata else None),
+                  'consumer_identity': c.get('identity'),
+                  'original_connection_present': present,
+                  'connection_state': cdata.get('state') if cdata else None,
+                  'negotiated_heartbeat_s': cdata.get('timeout') if cdata else None,
+              }
+
+          def wait_for_event(path, task_id, kind, worker, timeout):
+              until = time.monotonic() + timeout
+              while time.monotonic() < until:
+                  found = [e for e in read_events(path, task_id)
+                           if e.get('type') == kind]
+                  if found:
+                      return found[0]
+                  if worker.poll() is not None:
+                      raise RuntimeError('worker exited while waiting for ' + kind)
+                  time.sleep(0.2)
+              raise RuntimeError(f'task {task_id} missing {kind} after {timeout}s')
+
+          def classify(samples, events, task_id, original):
+              starts = [e for e in events if e['type'] == 'start']
+              ends = [e for e in events if e['type'] == 'end']
+              first_end = min((e['at_monotonic'] for e in ends), default=None)
+              valid = [s for s in samples if s['queue'] is not None and
+                       all(s[key] for key in ('queue_api_ok', 'consumers_api_ok',
+                                                'connection_api_ok'))]
+              during = [s for s in valid if s['relative_to_start_s'] <= LONG_SECONDS
+                        and (first_end is None or s['relative_to_start_s'] <=
+                             first_end - starts[0]['at_monotonic'])]
+              identity_missing = not original
+              original_lost = any(s['original_connection_present'] is False
+                                  for s in during)
+              consumer_switched = any(s['consumer_identity'] is not None and
+                                      s['consumer_identity'].get('connection') != original
+                                      for s in during)
+              missing_samples = any(not (s['queue_api_ok'] and s['consumers_api_ok']
+                                         and s['connection_api_ok'])
+                                    for s in samples if s['relative_to_start_s'] <= LONG_SECONDS)
+              if original_lost or consumer_switched:
+                  # Positive evidence of loss must not be hidden by other API errors.
+                  connection_verdict = 'LOSS_OR_SWITCH_OBSERVED'
+              elif identity_missing or missing_samples or len(during) < 4:
+                  connection_verdict = 'UNKNOWN_INSUFFICIENT_OBSERVATIONS'
+              else:
+                  connection_verdict = 'NO_LOSS_IN_SAMPLES'
+
+              # Multiple RabbitMQ management statistics updates (usually 5s apart),
+              # never claiming the exact moment basic.ack hit the socket.
+              window = [s for s in during if 5.0 <= s['relative_to_start_s'] <= 18.0
+                        and s['original_connection_present'] is True and
+                        s['consumer_identity'] is not None and
+                        s['consumer_identity'].get('connection') == original and
+                        isinstance(s['queue'].get('messages_ready'), int) and
+                        isinstance(s['queue'].get('messages_unacknowledged'), int)]
+              spanning = len(window) >= 4 and (
+                  window[-1]['relative_to_start_s'] - window[0]['relative_to_start_s'] >= 6)
+              any_unacked = any(s['queue']['messages_unacknowledged'] > 0 for s in window)
+              all_clear = all(s['queue']['messages_unacknowledged'] == 0 and
+                              s['queue']['messages_ready'] == 0 for s in window)
+              if connection_verdict != 'NO_LOSS_IN_SAMPLES' or not spanning:
+                  ack_verdict = 'INCONCLUSIVE'
+              elif MODE == 'early':
+                  ack_verdict = ('UNACKED_DURING_TASK_OBSERVED' if any_unacked else
+                                 'CONSISTENT_WITH_EARLY_ACK' if all_clear else
+                                 'INCONCLUSIVE')
+              else:
+                  ack_verdict = ('LATE_UNACKED_CONTROL_OBSERVED' if any_unacked else
+                                 'LATE_UNACKED_CONTROL_NOT_OBSERVED')
+
+              if len(starts) > 1:
+                  execution_verdict = 'MULTIPLE_STARTS_OBSERVED'
+              elif len(starts) == 1 and len(ends) == 1:
+                  execution_verdict = 'ONE_COMPLETE_START_OBSERVED'
+              elif len(starts) == 1:
+                  execution_verdict = 'ONE_START_NO_COMPLETION_OBSERVED'
+              else:
+                  execution_verdict = 'NO_START_OBSERVED'
+              return {
+                  'ack': ack_verdict,
+                  'connection': connection_verdict,
+                  'execution': execution_verdict,
+                  'recovery': 'NOT_TESTED',
+                  'business_effect': 'NOT_TESTED',
+                  'original_connection': original,
+                  'window_samples': len(window),
+                  'window_span_s': round(window[-1]['relative_to_start_s'] -
+                                         window[0]['relative_to_start_s'], 2) if len(window) > 1 else 0,
+                  'first_end_observed': first_end is not None,
+                  'task_id': task_id,
+              }
+
+          def save_and_summarize(result):
+              path = OUT / 'result.json'
+              path.write_text(json.dumps(result, indent=2, sort_keys=True), encoding='utf-8')
+              preview = {k: v for k, v in result.items()
+                         if k not in ('snapshots', 'events', 'api_errors')}
+              print(json.dumps(preview, indent=2, sort_keys=True), flush=True)
+              summary_path = os.environ.get('GITHUB_STEP_SUMMARY')
+              if summary_path:
+                  lines = [f"### Celery #3430: {result.get('celery_installed')} / {MODE}",
+                           '', f"**Infrastructure:** {result.get('infrastructure')}",
+                           '', '| Independent check | Result |', '|---|---|']
+                  for key, val in result.get('verdicts', {}).items():
+                      if isinstance(val, str):
+                          lines.append(f'| {key} | `{val}` |')
+                  lines += ['', 'GitHub job success means a completed baseline measurement, **not** a fixed bug.',
+                            'RabbitMQ API samples do not prove socket flush timing or exactly-once effects.']
+                  with open(summary_path, 'a', encoding='utf-8') as stream:
+                      stream.write('\n'.join(lines) + '\n')
+
+          def run_probe():
+              unique = uuid.uuid4().hex[:12]
+              queue = 'atlas3430_' + unique
+              task_id = 'atlas3430-long-' + unique
+              control_id = 'atlas3430-short-' + unique
+              journal = OUT / 'task_events.jsonl'
+              journal.unlink(missing_ok=True)
+              os.environ['ATLAS_QUEUE'] = queue
+              os.environ['ATLAS_JOURNAL'] = str(journal)
+              # The parent imported the module before selecting the queue.
+              app.conf.task_default_queue = queue
+              worker_log = (OUT / 'worker.log').open('w', encoding='utf-8')
+              worker = None
+              results = {
+                  'infrastructure': 'BLOCKED', 'celery_requested': os.environ.get('ATLAS_CELERY_VERSION'),
+                  'celery_installed': celery.__version__, 'ack_mode': MODE,
+                  'heartbeat_requested_s': HEARTBEAT_REQUESTED,
+                  'heartbeat_negotiated_s': None, 'task_duration_s': LONG_SECONDS,
+                  'queue': queue, 'task_id': task_id, 'control_id': control_id,
+                  'script_sha256': hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
+                  'verdicts': {}, 'snapshots': [], 'events': [],
+                  'limits': ['No crash/network fault injection',
+                             'Management API aggregates statistics; exact ACK timing not proved',
+                             'Consumer ACK has no independent positive confirmation',
+                             'No guarantee of exactly-once execution or business effects'],
+              }
+              try:
+                  if celery.__version__ != os.environ.get('ATLAS_CELERY_VERSION'):
+                      raise RuntimeError('Installed Celery version does not match requested version')
+                  # RabbitMQ service may not have an actions service-level health check.
+                  ready_by = time.monotonic() + 75
+                  while time.monotonic() < ready_by:
+                      if api('GET', '/api/overview')['ok']:
+                          break
+                      time.sleep(1)
+                  else:
+                      raise RuntimeError('RabbitMQ management API not ready within 75s')
+                  overview = api('GET', '/api/overview')
+                  if overview['ok']:
+                      results['rabbitmq_version'] = overview['data'].get('rabbitmq_version')
+
+                  worker = subprocess.Popen(
+                      [sys.executable, '-m', 'celery', '-A', 'atlas_celery_3430:app',
+                       'worker', '--pool=solo', '--concurrency=1', '--loglevel=INFO',
+                       '--without-gossip', '--without-mingle', '-Q', queue,
+                       '--hostname=atlas3430@%h'],
+                      env=os.environ.copy(), stdout=worker_log, stderr=subprocess.STDOUT)
+                  read_by = time.monotonic() + 55
+                  original_connection = None
+                  original_channel = None
+                  while time.monotonic() < read_by:
+                      if worker.poll() is not None:
+                          raise RuntimeError('Worker exited before consumer ready')
+                      c = consumer_for(queue)
+                      ident = c.get('identity')
+                      if c['ok'] and ident and ident.get('connection'):
+                          original_connection = ident['connection']
+                          original_channel = ident.get('channel')
+                          break
+                      time.sleep(.5)
+                  if not original_connection:
+                      raise RuntimeError('Could not identify original consumer connection')
+                  results['consumer_initial_connection'] = original_connection
+                  results['consumer_initial_channel'] = original_channel
+                  connection = connection_state(original_connection)
+                  if connection['ok'] and isinstance(connection.get('data'), dict):
+                      results['heartbeat_negotiated_s'] = connection['data'].get('timeout')
+
+                  # Short task verifies the instrumentation and completion journal first.
+                  app.send_task('atlas3430.sleeper', args=[SHORT_SECONDS],
+                                task_id=control_id, queue=queue)
+                  wait_for_event(journal, control_id, 'start', worker, 20)
+                  wait_for_event(journal, control_id, 'end', worker, 20)
+                  results['short_control'] = 'COMPLETE'
+                  results['pre_long_queue'] = queue_state(queue).get('data')
+
+                  app.send_task('atlas3430.sleeper', args=[LONG_SECONDS],
+                                task_id=task_id, queue=queue)
+                  began = wait_for_event(journal, task_id, 'start', worker, 25)
+                  began_mono = began['at_monotonic']
+                  results['long_started'] = True
+                  deadline = time.monotonic() + (2 * LONG_SECONDS + 12)
+                  while time.monotonic() < deadline:
+                      s = sample(queue, original_connection, began_mono)
+                      s['worker_running'] = worker.poll() is None
+                      results['snapshots'].append(s)
+                      time.sleep(.7)
+                  results['events'] = read_events(journal)
+                  matching = [e for e in results['events'] if e.get('task_id') == task_id]
+                  results['verdicts'] = classify(results['snapshots'], matching,
+                                                  task_id, original_connection)
+                  results['task_starts'] = sum(e['type'] == 'start' for e in matching)
+                  results['task_ends'] = sum(e['type'] == 'end' for e in matching)
+                  results['redelivered_starts'] = sum(e['type'] == 'start' and
+                                                     e.get('redelivered', False)
+                                                     for e in matching)
+                  results['worker_exit_before_cleanup'] = worker.poll()
+                  results['infrastructure'] = ('MEASUREMENT_COMPLETE' if
+                                               len(results['snapshots']) >= 12
+                                               and results['task_starts'] >= 1 else
+                                               'INCONCLUSIVE')
+              except Exception as exc:
+                  results['error'] = repr(exc)
+                  results['infrastructure'] = 'BLOCKED'
+              finally:
+                  results['api_errors'] = API_ERRORS
+                  results['cleanup_terminated_worker'] = bool(worker and worker.poll() is None)
+                  # Save evidence before changing the worker or queue state.
+                  save_and_summarize(results)
+                  if worker and worker.poll() is None:
+                      worker.terminate()
+                      try:
+                          worker.wait(timeout=5)
+                      except subprocess.TimeoutExpired:
+                          worker.kill()
+                          worker.wait(timeout=5)
+                  worker_log.close()
+                  api('DELETE', '/api/queues/%2F/' + parse.quote(queue, safe=''),
+                      allow_missing=True)
+              # A substantive baseline failure still counts as measured evidence.
+              return 0 if results['infrastructure'] == 'MEASUREMENT_COMPLETE' else 2
+
+          if __name__ == '__main__':
+              sys.exit(run_probe())
+          PY
+          python atlas_celery_3430.py
+      - name: Capture RabbitMQ container logs
+        if: always()
+        run: |
+          mkdir -p evidence
+          docker logs '${{ job.services.rabbitmq.id }}' > evidence/rabbitmq.log 2>&1 || true
+      - name: Upload complete evidence, even on failure
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: celery3430-v2-${{ matrix.celery }}-${{ matrix.ack_mode }}
+          path: |
+            evidence/
+            packages.txt
+            atlas_celery_3430.py
+          if-no-files-found: warn
