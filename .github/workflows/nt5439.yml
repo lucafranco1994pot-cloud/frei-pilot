@@ -1,0 +1,104 @@
+name: NT5439 ALT versus FIX
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  regression:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    env:
+      BASE_COMMIT: 6c843bc7f9f72941eeddb22df502b520c97a8987
+      CRATE: nautilus-interactive-brokers
+      TEST_FILTER: nt5439
+      TESTS_FILE: crates/adapters/interactive_brokers/src/execution/core/tests.rs
+
+    steps:
+      - name: Checkout frei-pilot
+        uses: actions/checkout@v4
+        with:
+          path: pilot
+
+      - name: Checkout pinned NautilusTrader
+        uses: actions/checkout@v4
+        with:
+          repository: nautechsystems/nautilus_trader
+          ref: 6c843bc7f9f72941eeddb22df502b520c97a8987
+          path: nt
+          persist-credentials: false
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: nt
+          key: nt5439
+
+      - name: ALT (original code + regression tests)
+        id: alt
+        shell: bash
+        working-directory: nt
+        run: |
+          set +e
+          mkdir -p ../logs
+          test "$(git rev-parse HEAD)" = "$BASE_COMMIT" || { echo "setup=fail" >> "$GITHUB_OUTPUT"; exit 0; }
+          cat ../pilot/.github/nt5439/regression.rs >> "$TESTS_FILE"
+          cargo test --locked -p "$CRATE" "$TEST_FILTER" --no-run > ../logs/alt-compile.log 2>&1
+          echo "compile=$?" >> "$GITHUB_OUTPUT"
+          cargo test --locked -p "$CRATE" "$TEST_FILTER" -- --nocapture > ../logs/alt-test.log 2>&1
+          echo "test=$?" >> "$GITHUB_OUTPUT"
+          echo "setup=ok" >> "$GITHUB_OUTPUT"
+          tail -n 60 ../logs/alt-compile.log; tail -n 80 ../logs/alt-test.log
+          exit 0
+
+      - name: FIX (same commit + patch + same tests)
+        id: fix
+        shell: bash
+        working-directory: nt
+        run: |
+          set +e
+          git apply --check ../pilot/.github/nt5439/fix.patch && git apply ../pilot/.github/nt5439/fix.patch
+          echo "patch=$?" >> "$GITHUB_OUTPUT"
+          cargo test --locked -p "$CRATE" "$TEST_FILTER" --no-run > ../logs/fix-compile.log 2>&1
+          echo "compile=$?" >> "$GITHUB_OUTPUT"
+          cargo test --locked -p "$CRATE" "$TEST_FILTER" -- --nocapture > ../logs/fix-test.log 2>&1
+          echo "test=$?" >> "$GITHUB_OUTPUT"
+          tail -n 60 ../logs/fix-compile.log; tail -n 80 ../logs/fix-test.log
+          exit 0
+
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: nt5439-logs
+          path: logs/
+          if-no-files-found: warn
+
+      - name: Final VERDICT and REASON
+        if: always()
+        shell: bash
+        env:
+          SETUP: ${{ steps.alt.outputs.setup }}
+          ALT_COMPILE: ${{ steps.alt.outputs.compile }}
+          ALT_TEST: ${{ steps.alt.outputs.test }}
+          PATCH: ${{ steps.fix.outputs.patch }}
+          FIX_COMPILE: ${{ steps.fix.outputs.compile }}
+          FIX_TEST: ${{ steps.fix.outputs.test }}
+        run: |
+          set +e
+          verdict=BLOCKED
+          if [[ "$SETUP" != "ok" ]]; then reason="Setup failed (wrong commit?)"
+          elif [[ "$ALT_COMPILE" != "0" ]]; then reason="ALT does not compile (see alt-compile.log) - not a test result"
+          elif [[ "$PATCH" != "0" ]]; then reason="Patch does not apply"
+          elif [[ "$FIX_COMPILE" != "0" ]]; then reason="FIX does not compile (see fix-compile.log)"
+          elif ! grep -Eq 'running [1-9][0-9]* tests?' logs/alt-test.log; then reason="No tests ran"
+          elif grep -q 'NT5439 control:' logs/alt-test.log; then reason="Control failed already on ALT - test setup wrong"
+          elif [[ "$ALT_TEST" == "0" ]]; then verdict=FAIL; reason="ALT passed - bug not reproduced"
+          elif ! grep -q 'NT5439: foreign OpenOrder emitted OrderAccepted' logs/alt-test.log; then reason="ALT failed, but not at the NT5439 assertion"
+          elif [[ "$FIX_TEST" != "0" ]]; then verdict=FAIL; reason="ALT reproduced the bug, but FIX still fails (see fix-test.log)"
+          else verdict=PASS; reason="ALT: foreign OpenOrder accepted own order. FIX: rejected, own-order controls still accepted"
+          fi
+          { echo "VERDICT=$verdict"; echo "REASON=$reason"; echo "SCOPE=OpenOrder path only; rejection/presence path patched but not tested"; } | tee -a "$GITHUB_STEP_SUMMARY"
+          [[ "$verdict" == "PASS" ]]
