@@ -1,0 +1,136 @@
+name: ATLAS Gainium 221 – native ALT/FIX Red-Green
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  gainium-221:
+    name: Unmodified product code – same harness
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      ALT: 20f604b43a61de5e74d4cea6fe4964efa6775edf
+      FIX: 35173c4bb92c3a217e132ae3071e0ea62d9797fb
+      TEST_PATH: src/bot/dca/writtenOffLevelId.harness.spec.ts
+      HUSKY: '0'
+      CI: 'true'
+    steps:
+      - name: Fetch manufacturer ALT
+        uses: actions/checkout@v4
+        with:
+          repository: Gainium/main-app-sh
+          ref: 20f604b43a61de5e74d4cea6fe4964efa6775edf
+          path: gainium/ALT
+          persist-credentials: false
+
+      - name: Fetch manufacturer FIX
+        uses: actions/checkout@v4
+        with:
+          repository: Gainium/main-app-sh
+          ref: 35173c4bb92c3a217e132ae3071e0ea62d9797fb
+          path: gainium/FIX
+          persist-credentials: false
+
+      - name: Use the manufacturer's Node version
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Record identity and port ONLY the original FIX harness to ALT
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p evidence
+          echo "ALT expected=$ALT actual=$(git -C gainium/ALT rev-parse HEAD)" | tee evidence/versions.txt
+          echo "FIX expected=$FIX actual=$(git -C gainium/FIX rev-parse HEAD)" | tee -a evidence/versions.txt
+          test "$(git -C gainium/ALT rev-parse HEAD)" = "$ALT"
+          test "$(git -C gainium/FIX rev-parse HEAD)" = "$FIX"
+          node --version | tee -a evidence/versions.txt
+          npm --version | tee -a evidence/versions.txt
+          test ! -e "gainium/ALT/$TEST_PATH" || { echo 'ALT unexpectedly already contains harness'; exit 1; }
+          cp "gainium/FIX/$TEST_PATH" "gainium/ALT/$TEST_PATH"
+          sha256sum "gainium/ALT/$TEST_PATH" "gainium/FIX/$TEST_PATH" | tee evidence/harness.sha256
+          cmp "gainium/ALT/$TEST_PATH" "gainium/FIX/$TEST_PATH"
+          git -C gainium/ALT status --porcelain | tee evidence/alt_worktree.txt
+          git -C gainium/FIX status --porcelain | tee evidence/fix_worktree.txt
+          test "$(git -C gainium/ALT status --porcelain | wc -l)" -eq 1
+          test -z "$(git -C gainium/FIX status --porcelain)"
+
+      - name: Install and run same focused original Mocha harness on both versions
+        shell: bash
+        run: |
+          set -uo pipefail
+          mkdir -p evidence
+          # The manufacturer's PR workflow documents git+ssh deps that are public.
+          git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
+          for label in ALT FIX; do
+            printf '%s\n' 'npm install --legacy-peer-deps --no-audit --no-fund' > "evidence/${label}.install.command"
+            (cd "gainium/$label" && timeout 12m npm install --legacy-peer-deps --no-audit --no-fund) \
+              > "evidence/${label}.install.stdout" 2> "evidence/${label}.install.stderr"
+            install_rc=$?
+            echo "$install_rc" > "evidence/${label}.install.exitcode"
+            echo "INSTALL $label exit=$install_rc"
+            cmd='env NODE_NO_WARNINGS=1 NODE_ENV=testing ./node_modules/.bin/mocha --timeout 20000 --exit -r ts-node/register --extension ts src/bot/dca/writtenOffLevelId.harness.spec.ts'
+            echo "$cmd" > "evidence/${label}.test.command"
+            if [ "$install_rc" -eq 0 ]; then
+              (cd "gainium/$label" && timeout 3m env NODE_NO_WARNINGS=1 NODE_ENV=testing ./node_modules/.bin/mocha --timeout 20000 --exit -r ts-node/register --extension ts "$TEST_PATH") \
+                > "evidence/${label}.test.stdout" 2> "evidence/${label}.test.stderr"
+              test_rc=$?
+            else
+              echo 'NOT_EXECUTED – dependency installation failed' > "evidence/${label}.test.stdout"
+              : > "evidence/${label}.test.stderr"
+              test_rc=125
+            fi
+            echo "$test_rc" > "evidence/${label}.test.exitcode"
+            echo "TEST $label exit=$test_rc"
+            tail -n 35 "evidence/${label}.test.stdout" || true
+            tail -n 25 "evidence/${label}.test.stderr" || true
+          done
+
+      - name: Classify evidence – semantic RED, real GREEN, not infrastructure failures
+        shell: bash
+        run: |
+          set -euo pipefail
+          alt_install=$(cat evidence/ALT.install.exitcode)
+          fix_install=$(cat evidence/FIX.install.exitcode)
+          alt_test=$(cat evidence/ALT.test.exitcode)
+          fix_test=$(cat evidence/FIX.test.exitcode)
+          cat evidence/ALT.test.stdout evidence/ALT.test.stderr > evidence/ALT.test.combined
+          cat evidence/FIX.test.stdout evidence/FIX.test.stderr > evidence/FIX.test.combined
+          verdict=BLOCKED
+          reason='Installation or import failure: see logs'
+          if [ "$alt_install" = 0 ] && [ "$fix_install" = 0 ]; then
+            if [ "$alt_test" != 0 ] && [ "$fix_test" = 0 ] && \
+               grep -Eq 'AssertionError|AssertionError:' evidence/ALT.test.combined && \
+               grep -Eq '§4\.2|a level carrying a written-off id' evidence/ALT.test.combined && \
+               grep -Eq '4 passing' evidence/FIX.test.combined; then
+              verdict=PASS
+              reason='ALT failed expected behavioral §4.2 assertion; FIX passed all four original tests'
+            elif [ "$alt_test" = 0 ]; then
+              verdict=FAIL
+              reason='ALT unexpectedly passed identical harness'
+            elif [ "$fix_test" != 0 ] && grep -q 'AssertionError' evidence/FIX.test.combined; then
+              verdict=FAIL
+              reason='FIX did not meet original harness assertions'
+            elif [ "$alt_test" != 0 ] && grep -q 'AssertionError' evidence/ALT.test.combined; then
+              verdict=UNKNOWN
+              reason='ALT assertion observed but full red/green conditions unmet; inspect logs'
+            fi
+          fi
+          printf 'VERDICT=%s\nREASON=%s\nALT_INSTALL=%s\nFIX_INSTALL=%s\nALT_TEST=%s\nFIX_TEST=%s\n' \
+            "$verdict" "$reason" "$alt_install" "$fix_install" "$alt_test" "$fix_test" | tee evidence/VERDICT.txt
+          printf '### ATLAS Gainium 221\n\nVerdict: **%s**\n\n%s\n\n' "$verdict" "$reason" >> "$GITHUB_STEP_SUMMARY"
+          echo 'All stdout, stderr, exit codes, commit identities and test hashes are in the attached artifact.' >> "$GITHUB_STEP_SUMMARY"
+          test "$verdict" = PASS
+
+      - name: Upload complete evidence, even on failure
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: atlas-gainium-221-alt-fix-evidence
+          path: evidence/
+          if-no-files-found: warn
+          retention-days: 30
