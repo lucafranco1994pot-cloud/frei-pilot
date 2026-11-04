@@ -1,0 +1,194 @@
+name: ATLAS KOENIG 5416 native one shot
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/ATLAS_KOENIG_5416_ONESHOT.yml
+
+permissions:
+  contents: read
+
+jobs:
+  native:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install reported SDK version
+        run: |
+          python -m pip install --disable-pip-version-check 'openai-agents==0.24.0'
+          python -m pip show openai-agents > sdk_identity.txt
+      - name: Native deterministic test ALT then FIX, exactly once
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > atlas_koenig_5416_probe.py <<'PYTHON'
+          """ATLAS #5416 single-shot no-network/no-payment native SDK probe.
+
+          Under openai-agents==0.24.0 the SDK scripted transport is real, while the
+          reconciliation gateway is an application-level SQLite simulation.
+          """
+          import asyncio
+          import json
+          import sqlite3
+          import tempfile
+          from pathlib import Path
+
+          from agents.decorators import tool
+          from agents.realtime import (
+              RealtimeAgent, RealtimeRunner, RealtimeModelToolCallEvent,
+              RealtimeModelSendInterrupt, RealtimeModelSendUserInput,
+              RealtimeModelSendToolOutput,
+          )
+          from agents.realtime.testing import RealtimeStep, ScriptedRealtimeModel
+
+
+          class Treasury:
+              def __init__(self, path):
+                  self.db = sqlite3.connect(str(path), isolation_level=None)
+                  self.db.execute("CREATE TABLE fund (available INTEGER NOT NULL)")
+                  self.db.execute("INSERT INTO fund VALUES (1000)")
+                  self.db.execute("CREATE TABLE op(id TEXT PRIMARY KEY, state TEXT NOT NULL, courier INTEGER DEFAULT 0, bank INTEGER DEFAULT 0)")
+                  self.db.execute("INSERT INTO op(id,state) VALUES ('refund-5416','IN_FLIGHT')")
+                  self.db.execute("UPDATE fund SET available=0")
+
+              def state(self):
+                  return self.db.execute("SELECT state FROM op WHERE id='refund-5416'").fetchone()[0]
+
+              def available(self):
+                  return self.db.execute("SELECT available FROM fund").fetchone()[0]
+
+              def revoke(self):
+                  assert self.db.execute("UPDATE op SET state='UNKNOWN' WHERE id='refund-5416' AND state='IN_FLIGHT'").rowcount == 1
+
+              def payment_boundary(self):
+                  """One atomic local authorization+effect; production bank must enforce this."""
+                  self.db.execute("BEGIN IMMEDIATE")
+                  try:
+                      result = self.db.execute("UPDATE op SET state='PAID' WHERE id='refund-5416' AND state='IN_FLIGHT'").rowcount == 1
+                      self.db.execute("COMMIT")
+                      return result
+                  except BaseException:
+                      self.db.execute("ROLLBACK")
+                      raise
+
+              def witness(self, party):
+                  if party not in ('courier','bank'):
+                      raise ValueError(party)
+                  self.db.execute(f"UPDATE op SET {party}=1 WHERE id='refund-5416' AND state='UNKNOWN'")
+
+              def release_if_returned(self):
+                  self.db.execute("BEGIN IMMEDIATE")
+                  try:
+                      updated = self.db.execute("UPDATE op SET state='RETURNED' WHERE id='refund-5416' AND state='UNKNOWN' AND courier=1 AND bank=1").rowcount
+                      if updated:
+                          self.db.execute("UPDATE fund SET available=available+1000")
+                      self.db.execute("COMMIT")
+                      return updated == 1
+                  except BaseException:
+                      self.db.execute("ROLLBACK")
+                      raise
+
+
+          async def native_case(path, *, guarded):
+              t = Treasury(path)
+              started, proceed, output_seen = asyncio.Event(), asyncio.Event(), asyncio.Event()
+              effects, outputs = [], []
+
+              @tool
+              async def refund_once(order_id: str) -> str:
+                  """Synthetic refund invocation; no external money or API requests."""
+                  started.set()
+                  await proceed.wait()
+                  # The safe version checks at the actual synthetic effect boundary.
+                  if guarded and not t.payment_boundary():
+                      return 'BLOCKED_REVOKED'
+                  effects.append(order_id)
+                  return 'FAKE_PAYMENT_CREATED'
+
+              def match_output(event):
+                  if not isinstance(event, RealtimeModelSendToolOutput):
+                      return False
+                  if event.tool_call.call_id != 'call-5416':
+                      return False
+                  outputs.append(event.output)
+                  output_seen.set()
+                  return True
+
+              model = ScriptedRealtimeModel(
+                  [RealtimeStep(expect=RealtimeModelSendInterrupt),
+                   RealtimeStep(expect=lambda e: isinstance(e, RealtimeModelSendUserInput) and e.user_input == 'STOPP'),
+                   RealtimeStep(expect=match_output)],
+                  connect_events=[RealtimeModelToolCallEvent(name='refund_once',call_id='call-5416',arguments='{"order_id":"refund-5416"}')],
+              )
+              runner = RealtimeRunner(RealtimeAgent(name='König',tools=[refund_once]), model=model,
+                                      config={'async_tool_calls':True,'tracing_disabled':True})
+              async with await runner.run() as session:
+                  await asyncio.wait_for(started.wait(), timeout=8)
+                  assert effects == []
+                  if guarded:
+                      t.revoke()
+                      assert t.state() == 'UNKNOWN' and t.available() == 0
+                  await session.interrupt()
+                  await session.send_message('STOPP')
+                  assert effects == []
+                  proceed.set()
+                  await asyncio.wait_for(output_seen.wait(), timeout=8)
+
+              model.assert_complete()
+              if guarded:
+                  assert effects == [] and outputs == ['BLOCKED_REVOKED']
+                  assert t.state() == 'UNKNOWN' and t.available() == 0
+                  assert not t.release_if_returned(), 'never release on zero witnesses'
+                  t.witness('courier')
+                  assert not t.release_if_returned(), 'one witness never releases'
+                  t.witness('bank')
+                  assert t.release_if_returned(), 'both witnesses permit an authoritative return'
+                  assert not t.release_if_returned(), 'must not release twice'
+                  assert t.state() == 'RETURNED' and t.available() == 1000
+                  assert not t.payment_boundary(), 'old order must remain irrevocably invalid'
+              else:
+                  assert effects == ['refund-5416'] and outputs == ['FAKE_PAYMENT_CREATED']
+                  assert t.available() == 0
+              result={'branch':'FIX_APP_GATE' if guarded else 'ALT_NATIVE',
+                      'effect_count':len(effects),'outputs':outputs,
+                      'final_state':t.state(),'available':t.available(),
+                      'verdict':'PASS'}
+              t.db.close()
+              return result
+
+
+          async def main():
+              with tempfile.TemporaryDirectory(prefix='atlas5416-') as root:
+                  root=Path(root)
+                  alt=await native_case(root/'alt.db',guarded=False)
+                  fix=await native_case(root/'fix.db',guarded=True)
+                  report={'target':'openai-agents==0.24.0','scope':'native SDK scripted transport; application SQLite gate; no LLM text claim exercised',
+                          'cases':[alt,fix],'verdict':'PASS'}
+                  Path('native_report.json').write_text(json.dumps(report,indent=2)+'\n')
+                  print(json.dumps(report,ensure_ascii=False))
+
+
+          if __name__ == '__main__':
+              asyncio.run(main())
+          PYTHON
+          python -m py_compile atlas_koenig_5416_probe.py
+          python atlas_koenig_5416_probe.py 2>&1 | tee native_run.log
+          sha256sum atlas_koenig_5416_probe.py native_report.json native_run.log sdk_identity.txt > SHA256SUMS.txt
+      - name: Preserve evidence even on failure
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: ATLAS-KOENIG-5416-native-proof
+          path: |
+            atlas_koenig_5416_probe.py
+            native_report.json
+            native_run.log
+            sdk_identity.txt
+            SHA256SUMS.txt
+          if-no-files-found: warn
