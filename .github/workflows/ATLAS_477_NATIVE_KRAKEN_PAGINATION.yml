@@ -1,0 +1,226 @@
+name: ATLAS 477 - Kraken native pagination contract
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  connector-original:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout pinned original Gainium connector
+        uses: actions/checkout@v4
+        with:
+          repository: Gainium/exchange-connector-sh
+          ref: 880cfa9ee3ad560cf9e44948d04cc592a2ef7c2e
+          path: connector
+          persist-credentials: false
+
+      - name: Setup Node 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Inject ATLAS contract spec (no original source edits)
+        shell: bash
+        working-directory: connector
+        run: |
+          cat > src/exchange/exchanges/kraken/atlas-order-477-pagination.spec.ts <<'ATLAS_SPEC'
+          process.env.NODE_ENV = 'testing'
+          
+          /**
+           * ATLAS-ORDER-477 / H477-PAGE
+           * Target: Gainium/exchange-connector-sh pinned to 880cfa9ee3ad560cf9e44948d04cc592a2ef7c2e
+           * Native original KrakenExchange.getOrder call; offline only; no credentials.
+           *
+           * CONTRACT: A page with continuationToken is not a complete negative proof.
+           * A later matched fill should be resolved OR the connector must preserve UNKNOWN.
+           * One contradictory definitive 'Order not found in history' fails the test.
+           */
+          import { describe, it } from 'mocha'
+          import { Futures } from '../../types'
+          import KrakenExchange from './index'
+          
+          const CLIENT_ID = 'ATLAS-477-ORDER-A'
+          const VENUE_ID = 'f697b805-dc4d-44b3-944e-1e2311df69cd'
+          const TOKEN = 'ATLAS_NEXT_PAGE'
+          const T0 = Date.now() - 60 * 60 * 1000
+          
+          type Mode = 'page2' | 'page1' | 'exhausted'
+          
+          function historyEvent(id: string, idx = 0) {
+            return {
+              uid: `event-${id}-${idx}`,
+              timestamp: T0 - idx,
+              event: {
+                OrderUpdated: {
+                  oldOrder: {
+                    uid: id === CLIENT_ID ? VENUE_ID : `noise-${idx}`,
+                    clientId: id,
+                    tradeable: 'PF_XBTUSD',
+                    quantity: '1',
+                    filled: '0',
+                    limitPrice: '100',
+                    orderType: 'lmt',
+                    direction: 'Buy',
+                  },
+                  newOrder: {
+                    uid: id === CLIENT_ID ? VENUE_ID : `noise-${idx}`,
+                    clientId: id,
+                    tradeable: 'PF_XBTUSD',
+                    quantity: '1',
+                    filled: '1',
+                    limitPrice: '100',
+                    orderType: 'lmt',
+                    direction: 'Buy',
+                  },
+                  reason: 'full_fill',
+                },
+              },
+            }
+          }
+          
+          function makeExchange(mode: Mode) {
+            // Original class and original getOrder implementation are exercised.
+            const ex: any = new KrakenExchange(Futures.usdm, '', '')
+            const calls: Array<{ args: any; page: number }> = []
+            ex.checkLimits = async () => undefined
+            ex.normalizeSymbol = async (s: string) => s
+            ex.toKrakenSymbol = async () => 'PF_XBTUSD'
+          
+            const otherOrders = Array.from({ length: 1000 }, (_, i) =>
+              historyEvent(`OTHER-${i}`, i + 1),
+            )
+            ex.derivativesClient = {
+              getOrderStatus: async () => ({ result: 'success', orders: [] }),
+              getOrderEvents: async (args: any = {}) => {
+                const token = args?.continuation_token ?? args?.continuationToken
+                const page = token ? 2 : 1
+                calls.push({ args, page })
+                if (mode === 'page1') return { elements: [historyEvent(CLIENT_ID)] }
+                if (mode === 'exhausted') return { elements: otherOrders }
+                if (page === 1) {
+                  return { elements: otherOrders, continuationToken: TOKEN }
+                }
+                return { elements: [historyEvent(CLIENT_ID)] }
+              },
+              getFills: async () => ({ result: 'success', fills: [] }),
+            }
+            return { ex, calls }
+          }
+          
+          const read = (ex: any) =>
+            ex.getOrder({ symbol: 'BTC-USD', newClientOrderId: CLIENT_ID })
+          
+          function isDefinitiveNegative(result: any): boolean {
+            // Approximate the main-app classifier's significant negative forms.
+            // 'Order not found in open orders' is deliberately a nonterminal exception.
+            if (result?.status === 'OK') return false
+            const reason = `${result?.reason ?? ''}`.toLowerCase()
+            return (
+              (reason.includes('order not found') &&
+                !reason.includes('order not found in open orders')) ||
+              reason.includes('order does not exist') ||
+              reason.includes('unknownoid')
+            )
+          }
+          
+          describe('ATLAS-ORDER-477 — original Kraken getOrder / incomplete history', () => {
+            it('positive control: completed fill on first history page resolves', async () => {
+              const m = makeExchange('page1')
+              const res = await read(m.ex)
+              if (res.status !== 'OK' || res.data?.status !== 'FILLED') {
+                throw new Error(`A visible full fill was not resolved: ${JSON.stringify(res)}`)
+              }
+              if (m.calls.length !== 1) {
+                throw new Error(`Unexpected history reads: ${m.calls.length}`)
+              }
+            })
+          
+            it('negative control: exhausted history without target is not a phantom fill', async () => {
+              const m = makeExchange('exhausted')
+              const res = await read(m.ex)
+              if (res.status === 'OK' && res.data?.status === 'FILLED') {
+                throw new Error('An absent order was falsely reported as FILLED')
+              }
+            })
+          
+            it('H477-PAGE: continuation token forbids premature definitive absence', async () => {
+              const m = makeExchange('page2')
+              const res = await read(m.ex)
+              // Accept either a genuine page-two FULL FILL or an explicitly unresolved
+              // result that will not be classified as an authoritative absence.
+              const resolved = res.status === 'OK' && res.data?.status === 'FILLED'
+              const safelyUnknown = res.status !== 'OK' && !isDefinitiveNegative(res)
+              if (!resolved && !safelyUnknown) {
+                throw new Error(
+                  'PREMATURE_NEGATIVE: an unvisited continuationToken was ignored; ' +
+                    `historyCalls=${JSON.stringify(m.calls)} ` +
+                    `response=${JSON.stringify({ status: res.status, reason: res.reason, data: res.data })}`,
+                )
+              }
+              if (resolved && m.calls.length < 2) {
+                throw new Error('FILLED was asserted without consulting the only page containing A')
+              }
+            })
+          })
+          ATLAS_SPEC
+          mkdir -p atlas-evidence
+          git rev-parse HEAD > atlas-evidence/commit-sha.txt
+          git status --porcelain=v1 > atlas-evidence/local-changes.txt
+          sha256sum src/exchange/exchanges/kraken/index.ts src/exchange/exchanges/kraken/atlas-order-477-pagination.spec.ts > atlas-evidence/source-sha256.txt
+
+      - name: Install dependencies and retain install logs
+        shell: bash
+        working-directory: connector
+        run: |
+          set +e
+          set -uo pipefail
+          npm ci --ignore-scripts --no-audit --no-fund > atlas-evidence/npm-ci.log 2>&1
+          rc=$?
+          echo "$rc" > atlas-evidence/npm-ci.exitcode
+          tail -35 atlas-evidence/npm-ci.log || true
+          exit 0
+
+      - name: Run native original connector contract + controls
+        shell: bash
+        working-directory: connector
+        run: |
+          set +e
+          set -uo pipefail
+          if [ "$(cat atlas-evidence/npm-ci.exitcode)" != '0' ]; then
+            echo BLOCKED_DEPENDENCY_INSTALL > atlas-evidence/classification.txt
+            echo 127 > atlas-evidence/mocha.exitcode
+            echo 'Skipped: npm ci failed; inspect npm-ci.log' > atlas-evidence/mocha.log
+          elif [ ! -x ./node_modules/.bin/mocha ]; then
+            echo BLOCKED_MOCHA_MISSING > atlas-evidence/classification.txt
+            echo 127 > atlas-evidence/mocha.exitcode
+          else
+            env NODE_ENV=testing NODE_NO_WARNINGS=1 TS_NODE_TRANSPILE_ONLY=1 \
+              ./node_modules/.bin/mocha --timeout 20000 --exit \
+              -r ts-node/register --extension ts \
+              src/exchange/exchanges/kraken/atlas-order-477-pagination.spec.ts \
+              > atlas-evidence/mocha.log 2>&1
+            rc=$?
+            echo "$rc" > atlas-evidence/mocha.exitcode
+            echo INSPECT_LOG_FOR_CONTRACT_RED_OR_PASS > atlas-evidence/classification.txt
+          fi
+          cat atlas-evidence/mocha.log 2>/dev/null || true
+          cat atlas-evidence/classification.txt
+          exit 0
+
+      - name: Generate independent SHA-256 manifest
+        if: always()
+        shell: bash
+        working-directory: connector
+        run: |
+          mkdir -p atlas-evidence
+          (cd atlas-evidence && find . -type f ! -name SHA256SUMS.txt -print0 | sort -z | xargs -0 -r sha256sum > SHA256SUMS.txt)
+
+      - name: Upload evidence (even on failures)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: atlas-order-477-native-connector
+          path: connector/atlas-evidence/
+          if-no-files-found: error
