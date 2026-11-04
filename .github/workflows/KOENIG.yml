@@ -1,0 +1,217 @@
+name: ATLAS KOENIG 5416 receiver boundary one shot
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/ATLAS_KOENIG_5416_RECEIVER_ONESHOT.yml
+
+permissions:
+  contents: read
+
+jobs:
+  receiver-boundary:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: One independent receiver test, five fixed scenarios
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > atlas_koenig_5416_receiver_probe.py <<'PYTHON'
+          """ATLAS 5416 V2: independent synthetic receiver boundary, stdlib only.
+          
+          A separate short-lived bank subprocess owns bank.db and writes the effect ledger.
+          The sender never edits bank.db directly. All operations are synthetic; no SDK,
+          LLM, network, real money, or bank integration is exercised. No live issue fix claim.
+          """
+          import argparse
+          import json
+          import os
+          from pathlib import Path
+          import sqlite3
+          import subprocess
+          import sys
+          import tempfile
+          
+          OP_ID = "refund-5416"
+          RECIPIENT = "synthetic:account-B"
+          AMOUNT_CENTS = 100000
+          
+          
+          def bank(db_path, command, op_id, amount, recipient, crash=False):
+              # A dedicated subprocess is the sole authority for this SQLite database.
+              con = sqlite3.connect(f"file:{db_path}?mode={'rwc' if command == 'init' else 'rw'}", uri=True, isolation_level=None, timeout=5)
+              try:
+                  if command == 'init':
+                      con.execute("CREATE TABLE IF NOT EXISTS operations (op_id TEXT PRIMARY KEY, recipient TEXT NOT NULL, amount INTEGER NOT NULL, state TEXT NOT NULL)")
+                      con.execute("CREATE TABLE IF NOT EXISTS ledger (op_id TEXT PRIMARY KEY, recipient TEXT NOT NULL, amount INTEGER NOT NULL)")
+                      con.execute("INSERT INTO operations (op_id,recipient,amount,state) VALUES (?,?,?,'PENDING')", (op_id,recipient,amount))
+                      return {'decision': 'PENDING'}
+                  if command == 'status':
+                      state = con.execute('SELECT state FROM operations WHERE op_id=?',(op_id,)).fetchone()
+                      total = con.execute('SELECT COUNT(*) FROM ledger WHERE op_id=?',(op_id,)).fetchone()[0]
+                      return {'state': state[0] if state else 'ABSENT', 'effect_count': total}
+                  con.execute('BEGIN IMMEDIATE')
+                  try:
+                      row = con.execute('SELECT recipient,amount,state FROM operations WHERE op_id=?',(op_id,)).fetchone()
+                      if row is None or row[0] != recipient or row[1] != amount:
+                          result = {'decision':'PAYLOAD_CONFLICT'}
+                      elif command == 'stop':
+                          if row[2] == 'PENDING':
+                              con.execute("UPDATE operations SET state='CANCELLED' WHERE op_id=?",(op_id,))
+                              result = {'decision':'STOP_CONFIRMED'}
+                          elif row[2] == 'PAID':
+                              result = {'decision':'ALREADY_PAID'}
+                          else:
+                              result = {'decision':'ALREADY_STOPPED'}
+                      elif command == 'pay':
+                          if row[2] == 'PENDING':
+                              con.execute('INSERT INTO ledger(op_id,recipient,amount) VALUES (?,?,?)',(op_id,recipient,amount))
+                              con.execute("UPDATE operations SET state='PAID' WHERE op_id=?",(op_id,))
+                              result = {'decision':'PAID'}
+                          elif row[2] == 'PAID':
+                              result = {'decision':'ALREADY_PAID'}
+                          else:
+                              result = {'decision':'BLOCKED_CANCELLED'}
+                      else:
+                          raise ValueError(command)
+                      con.execute('COMMIT')
+                  except BaseException:
+                      con.execute('ROLLBACK')
+                      raise
+                  if crash and command == 'pay' and result['decision'] == 'PAID':
+                      os._exit(93)  # committed but reply lost; next call is a new process
+                  return result
+              finally:
+                  con.close()
+          
+          
+          def rpc(db_path, command, *, amount=AMOUNT_CENTS, recipient=RECIPIENT, crash=False):
+              argv = [sys.executable, str(Path(__file__).resolve()), '--bank', command,
+                      '--db', str(db_path), '--op', OP_ID, '--amount', str(amount), '--recipient', recipient]
+              if crash:
+                  argv.append('--crash-after-commit')
+              return subprocess.run(argv, capture_output=True, text=True, timeout=8)
+          
+          
+          def request(db_path, command, **kw):
+              p=rpc(db_path, command, **kw)
+              if p.returncode:
+                  raise RuntimeError(f'bank process failed rc={p.returncode} stderr={p.stderr[-800:]}')
+              return json.loads(p.stdout)
+          
+          
+          def snapshot(db_path):
+              return request(db_path,'status')
+          
+          
+          def main():
+              cases=[]
+              with tempfile.TemporaryDirectory(prefix='atlas5416-receiver-') as tmp:
+                  root=Path(tmp)
+                  # Negative control: saying STOP locally does NOT cancel an instruction
+                  # already en route to an independent receiver.
+                  a=root/'alt-bank.db'
+                  request(a,'init')
+                  sender_local_claim='CANCELLED'  # no receiver ACK: invalid claim
+                  pay=request(a,'pay')
+                  st=snapshot(a)
+                  assert sender_local_claim=='CANCELLED' and pay['decision']=='PAID' and st=={'state':'PAID','effect_count':1}
+                  cases.append({'name':'ALT_LOCAL_STOP_ONLY','expected':'UNSAFE_DEMONSTRATED','bank_effects':1,'receiver_state':st['state']})
+          
+                  # Positive gate: receiver ACK persisted before old pay instruction arrives.
+                  b=root/'stop-first.db'
+                  request(b,'init')
+                  stop=request(b,'stop')
+                  old=request(b,'pay')
+                  again=request(b,'pay')
+                  repeated_stop=request(b,'stop')
+                  st=snapshot(b)
+                  assert stop['decision']=='STOP_CONFIRMED'
+                  assert old['decision']==again['decision']=='BLOCKED_CANCELLED'
+                  assert repeated_stop['decision']=='ALREADY_STOPPED'
+                  assert st=={'state':'CANCELLED','effect_count':0}
+                  cases.append({'name':'FIX_RECEIVER_STOP_ACK_FIRST','expected':'SAFE_IN_TEST','bank_effects':0,'receiver_state':st['state']})
+          
+                  # Irreversible effect precedes stop: never claim successful cancellation.
+                  c=root/'pay-first.db'
+                  request(c,'init')
+                  first=request(c,'pay')
+                  stop=request(c,'stop')
+                  replay=request(c,'pay')
+                  changed=request(c,'pay',amount=AMOUNT_CENTS+1)
+                  st=snapshot(c)
+                  assert first['decision']=='PAID' and stop['decision']=='ALREADY_PAID'
+                  assert replay['decision']=='ALREADY_PAID' and changed['decision']=='PAYLOAD_CONFLICT'
+                  assert st=={'state':'PAID','effect_count':1}
+                  cases.append({'name':'FIX_PAY_BEFORE_STOP','expected':'TRUTHFUL_PAID_NO_DUPLICATE','bank_effects':1,'receiver_state':st['state']})
+          
+                  # Abrupt bank death after durable commit but before confirmation: new
+                  # process retry must not create a second effect.
+                  d=root/'lost-reply.db'
+                  request(d,'init')
+                  crash=rpc(d,'pay',crash=True)
+                  assert crash.returncode == 93 and crash.stdout == ''
+                  status_after_restart=snapshot(d)
+                  retry=request(d,'pay')
+                  st=snapshot(d)
+                  assert status_after_restart=={'state':'PAID','effect_count':1}
+                  assert retry['decision']=='ALREADY_PAID' and st['effect_count']==1
+                  cases.append({'name':'FIX_CRASH_AFTER_COMMIT','expected':'ONE_EFFECT_AFTER_RESTART','bank_effects':1,'receiver_state':st['state']})
+          
+                  # Unavailable bank: there is no cancellation ACK. Do NOT tell user
+                  # "cancelled" or release held funds on an unconfirmed assumption.
+                  missing=root/'does-not-exist'/'bank.db'
+                  unavailable=rpc(missing,'stop')
+                  assert unavailable.returncode != 0
+                  sender_reply='UNKNOWN_PENDING_RECONCILIATION'
+                  available_cents=0
+                  assert sender_reply=='UNKNOWN_PENDING_RECONCILIATION' and available_cents==0
+                  cases.append({'name':'NO_ACK_FAIL_CLOSED','expected':'UNKNOWN_NO_FALSE_STOP','bank_effects':None,'receiver_state':'UNKNOWN'})
+          
+              report={'scope':'synthetic recipient subprocess + private SQLite effect ledger; NOT a real bank, SDK or LLM test',
+                      'issue':'openai/openai-agents-python#5416; checks truthful status contract, not model behavior',
+                      'cases':cases,
+                      'pass_count':len(cases),
+                      'verdict':'PASS',
+                      'limitations':['Receiver and ledger are simulated, not a real payment processor',
+                                     'A sender cannot declare cancellation before a receiver acknowledgement',
+                                     'No LLM prompt/context claims or pending-marker behavior were exercised']}
+              Path('receiver_report.json').write_text(json.dumps(report,indent=2,ensure_ascii=False)+'\n', encoding='utf-8')
+              print(json.dumps(report,ensure_ascii=False))
+          
+          
+          if __name__=='__main__':
+              p=argparse.ArgumentParser()
+              p.add_argument('--bank', choices=['init','status','pay','stop'])
+              p.add_argument('--db')
+              p.add_argument('--op',default=OP_ID)
+              p.add_argument('--amount',type=int,default=AMOUNT_CENTS)
+              p.add_argument('--recipient',default=RECIPIENT)
+              p.add_argument('--crash-after-commit',action='store_true')
+              args=p.parse_args()
+              if args.bank:
+                  print(json.dumps(bank(Path(args.db),args.bank,args.op,args.amount,args.recipient,args.crash_after_commit)))
+              else:
+                  main()
+          PYTHON
+          python -m py_compile atlas_koenig_5416_receiver_probe.py
+          python atlas_koenig_5416_receiver_probe.py 2>&1 | tee receiver_run.log
+          sha256sum atlas_koenig_5416_receiver_probe.py receiver_report.json receiver_run.log > SHA256SUMS.txt
+      - name: Preserve evidence even if a case fails
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: ATLAS-KOENIG-5416-receiver-proof
+          path: |
+            atlas_koenig_5416_receiver_probe.py
+            receiver_report.json
+            receiver_run.log
+            SHA256SUMS.txt
+          if-no-files-found: warn
