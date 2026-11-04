@@ -1,0 +1,192 @@
+name: ATLAS Gainium 221 V2 – native ALT/FIX Red-Green
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/ATLAS_GAINIUM_221_V2.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  gainium-221:
+    name: Unmodified product code – same harness
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      ALT: 20f604b43a61de5e74d4cea6fe4964efa6775edf
+      FIX: 35173c4bb92c3a217e132ae3071e0ea62d9797fb
+      TEST_PATH: src/bot/dca/writtenOffLevelId.harness.spec.ts
+      HUSKY: '0'
+      CI: 'true'
+    steps:
+      - name: Fetch manufacturer ALT
+        uses: actions/checkout@v4
+        with:
+          repository: Gainium/main-app-sh
+          ref: 20f604b43a61de5e74d4cea6fe4964efa6775edf
+          path: gainium/ALT
+          persist-credentials: false
+
+      - name: Fetch manufacturer FIX
+        uses: actions/checkout@v4
+        with:
+          repository: Gainium/main-app-sh
+          ref: 35173c4bb92c3a217e132ae3071e0ea62d9797fb
+          path: gainium/FIX
+          persist-credentials: false
+
+      - name: Use the manufacturer's Node version
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Record identity and port ONLY the original FIX harness to ALT
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p evidence
+          echo "ALT expected=$ALT actual=$(git -C gainium/ALT rev-parse HEAD)" | tee evidence/versions.txt
+          echo "FIX expected=$FIX actual=$(git -C gainium/FIX rev-parse HEAD)" | tee -a evidence/versions.txt
+          test "$(git -C gainium/ALT rev-parse HEAD)" = "$ALT"
+          test "$(git -C gainium/FIX rev-parse HEAD)" = "$FIX"
+          node --version | tee -a evidence/versions.txt
+          npm --version | tee -a evidence/versions.txt
+          test ! -e "gainium/ALT/$TEST_PATH" || { echo 'ALT unexpectedly already contains harness'; exit 1; }
+          cp "gainium/FIX/$TEST_PATH" "gainium/ALT/$TEST_PATH"
+          sha256sum "gainium/ALT/$TEST_PATH" "gainium/FIX/$TEST_PATH" | tee evidence/harness.sha256
+          cmp "gainium/ALT/$TEST_PATH" "gainium/FIX/$TEST_PATH"
+          git -C gainium/ALT status --porcelain | tee evidence/alt_worktree.txt
+          git -C gainium/FIX status --porcelain | tee evidence/fix_worktree.txt
+          test "$(git -C gainium/ALT status --porcelain | wc -l)" -eq 1
+          test -z "$(git -C gainium/FIX status --porcelain)"
+
+      - name: Install and run same focused original Mocha harness on both versions
+        shell: bash
+        run: |
+          # GitHub bash starts with -e: expected ALT red must not stop FIX.
+          set +e
+          set -uo pipefail
+          mkdir -p evidence
+          # The manufacturer's PR workflow documents git+ssh deps that are public.
+          git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
+          for label in ALT FIX; do
+            printf '%s\n' 'npm install --legacy-peer-deps --no-audit --no-fund' > "evidence/${label}.install.command"
+            (cd "gainium/$label" && timeout 12m npm install --legacy-peer-deps --no-audit --no-fund) \
+              > "evidence/${label}.install.stdout" 2> "evidence/${label}.install.stderr"
+            install_rc=$?
+            echo "$install_rc" > "evidence/${label}.install.exitcode"
+            echo "INSTALL $label exit=$install_rc"
+            git -C "gainium/$label" status --porcelain > "evidence/${label}.after-install.status"
+            git -C "gainium/$label" diff -- package.json package-lock.json > "evidence/${label}.dependencies.diff"
+            cmd='env NODE_NO_WARNINGS=1 NODE_ENV=testing ./node_modules/.bin/mocha --timeout 20000 --exit -r ts-node/register --extension ts --reporter json src/bot/dca/writtenOffLevelId.harness.spec.ts'
+            echo "$cmd" > "evidence/${label}.test.command"
+            if [ "$install_rc" -eq 0 ]; then
+              (cd "gainium/$label" && timeout 3m env NODE_NO_WARNINGS=1 NODE_ENV=testing ./node_modules/.bin/mocha --timeout 20000 --exit -r ts-node/register --extension ts --reporter json "$TEST_PATH") \
+                > "evidence/${label}.test.stdout" 2> "evidence/${label}.test.stderr"
+              test_rc=$?
+            else
+              echo 'NOT_EXECUTED – dependency installation failed' > "evidence/${label}.test.stdout"
+              : > "evidence/${label}.test.stderr"
+              test_rc=125
+            fi
+            echo "$test_rc" > "evidence/${label}.test.exitcode"
+            echo "TEST $label exit=$test_rc"
+            tail -n 35 "evidence/${label}.test.stdout" || true
+            tail -n 25 "evidence/${label}.test.stderr" || true
+          done
+
+      - name: Classify evidence – semantic RED, real GREEN, not infrastructure failures
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+          E = Path("evidence")
+          def rc(name):
+              try:
+                  return int((E / name).read_text().strip())
+              except Exception:
+                  return None
+          def read_report(label):
+              try:
+                  j = json.loads((E / f"{label}.test.stdout").read_text())
+                  if not isinstance(j, dict) or any(k not in j for k in ("stats", "tests", "passes", "failures", "pending")):
+                      raise ValueError("Mocha JSON does not include all result fields")
+                  return j, ""
+              except Exception as exc:
+                  return None, f"{label}: No valid Mocha JSON: {type(exc).__name__}: {exc}"
+          def case_id(t):
+              title = str(t.get("fullTitle") or t.get("title") or "")
+              for key in ("§4.1", "§4.2", "§4.3", "§1.2"):
+                  if key in title:
+                      return key
+              return "OTHER"
+          ai, fi = rc("ALT.install.exitcode"), rc("FIX.install.exitcode")
+          at, ft = rc("ALT.test.exitcode"), rc("FIX.test.exitcode")
+          alt, aerr = read_report("ALT")
+          fix, ferr = read_report("FIX")
+          verdict, reason = "BLOCKED", "Missing complete structured test evidence"
+          expected = {"§4.1", "§4.2", "§4.3", "§1.2"}
+          if ai != 0 or fi != 0:
+              reason = f"Installation failure: ALT={ai}, FIX={fi}"
+          elif aerr or ferr:
+              reason = " | ".join(t for t in (aerr, ferr) if t)
+          else:
+              atests = [case_id(t) for t in alt["tests"]]
+              ftests = [case_id(t) for t in fix["tests"]]
+              fpasses = [case_id(t) for t in fix["passes"]]
+              afails = [f for f in alt["failures"] if case_id(f) == "§4.2"]
+              semantic = any(
+                  ("AssertionError" in str(f.get("err", {}).get("name", "")) or
+                   "AssertionError" in str(f.get("err", {}).get("stack", ""))) and
+                  ("not the written-off id" in str(f.get("err", {}).get("message", "")) or
+                   "not equal" in str(f.get("err", {}).get("message", "")))
+                  for f in afails
+              )
+              coverage = (len(atests) == 4 and set(atests) == expected and
+                          len(ftests) == 4 and set(ftests) == expected and
+                          len(fpasses) == 4 and set(fpasses) == expected and
+                          len(alt["pending"]) == 0 and len(fix["pending"]) == 0)
+              if not coverage:
+                  verdict, reason = "UNKNOWN", "Not all four required test identities executed without skips"
+              elif at == 0:
+                  verdict, reason = "FAIL", "ALT unexpectedly passed identical harness"
+              elif ft != 0:
+                  verdict, reason = "FAIL", "FIX test process nonzero (inspect JSON failures)"
+              elif len(fix["failures"]) != 0:
+                  verdict, reason = "FAIL", "FIX reported at least one failing case"
+              elif not alt["failures"]:
+                  verdict, reason = "UNKNOWN", "ALT exited nonzero without a structured assertion failure"
+              elif not semantic:
+                  verdict, reason = "UNKNOWN", "ALT §4.2 missing expected order-ID-reuse assertion"
+              elif any(case_id(f) not in ("§4.1", "§4.2") for f in alt["failures"]):
+                  verdict, reason = "UNKNOWN", "ALT also fails an unrelated case"
+              else:
+                  verdict, reason = "PASS", "ALT §4.2 ID-reuse assertion RED; FIX four original controls GREEN"
+          (E / "VERDICT.txt").write_text(
+              f"VERDICT={verdict}\nREASON={reason}\nALT_INSTALL={ai}\nFIX_INSTALL={fi}\nALT_TEST={at}\nFIX_TEST={ft}\n"
+              f"ALT_CASES={json.dumps([case_id(t) for t in alt['tests']] if alt else [],ensure_ascii=False)}\n"
+              f"FIX_PASSES={json.dumps([case_id(t) for t in fix['passes']] if fix else [],ensure_ascii=False)}\n"
+          )
+          print((E / "VERDICT.txt").read_text())
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as out:
+              out.write(f"### ATLAS Gainium 221\n\nVerdict: **{verdict}**\n\n{reason}\n\n")
+              out.write("Evidence ZIP: same-harness hashes, Mocha JSON, stderr, dependency diffs and exit codes.\n")
+          if verdict != "PASS":
+              raise SystemExit(1)
+          PY
+
+      - name: Upload complete evidence, even on failure
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: atlas-gainium-221-alt-fix-evidence
+          path: evidence/
+          if-no-files-found: error
+          retention-days: 30
