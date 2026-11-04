@@ -1,0 +1,319 @@
+name: ATLAS 5416 Realtime outbound truth gate native one shot
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/ATLAS_5416_OUTBOUND_NATIVE_ONE_SHOT.yml
+
+permissions:
+  contents: read
+
+jobs:
+  native-truth-boundary:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install exact reported OpenAI Agents SDK
+        run: |
+          set -euo pipefail
+          python -m pip install --disable-pip-version-check 'openai-agents==0.24.0'
+          python -m pip show openai-agents > sdk_identity.txt
+      - name: Local controls and native scripted Realtime SDK - once
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > atlas_realtime_outbound.py <<'PYTHON'
+          """ATLAS #5416: truthful outward-facing Realtime event boundary.
+          
+          The SDK stream remains untrusted for consequential status. A protected-operation
+          UI MUST consume only `Boundary.display_status()` outputs, never `session` / model
+          raw events. This sample never grants or releases funds and uses a test receiver.
+          
+          Local mode: standard-library-only event projections.
+          Native mode: openai-agents==0.24.0, ScriptedRealtimeModel, real SDK dispatch;
+                       NO live LLM, OpenAI endpoint, real payment, or external bank.
+          """
+          import asyncio
+          from dataclasses import dataclass
+          import hashlib
+          import json
+          from pathlib import Path
+          from types import SimpleNamespace
+          
+          OP = 'refund-5416'
+          AMOUNT = 4000
+          DESTINATION = 'synthetic:account-B'
+          DECEPTION = 'The refund has ALREADY been submitted and cannot be stopped.'
+          
+          
+          @dataclass(frozen=True)
+          class Receipt:
+              operation: str
+              amount: int
+              recipient: str
+              state: str
+              witness: str
+          
+          
+          class Boundary:
+              """One outbound UI path for an armed sensitive operation.
+          
+              No SDK event data is ever returned. Real applications must keep the
+              unfiltered SDK stream inaccessible to browsers, web sockets, audio players,
+              transcript viewers, logs and other user-visible sinks for this operation.
+              """
+              def __init__(self, receiver_status):
+                  self.receiver_status = receiver_status
+                  self.seen = set()
+                  self.suppressed = 0
+                  self.naive_leaks = 0
+                  self.armed = True
+                  self.ui = []
+          
+              def consume(self, event):
+                  if not self.armed:
+                      raise RuntimeError('Sensitive status gate must remain armed')
+                  typ = getattr(event, 'type', 'unknown')
+                  self.seen.add(typ)
+                  if typ == 'raw_model_event':
+                      model_event = getattr(event, 'data', None)
+                      mt = getattr(model_event, 'type', 'unknown')
+                      self.seen.add('raw/' + mt)
+                      if getattr(model_event, 'delta', '') == DECEPTION:
+                          self.naive_leaks += 1
+                  # Deliberately discard ALL SDK events, including model text, audio,
+                  # history (which may contain transcripts), tool outputs and errors.
+                  self.suppressed += 1
+                  return None
+          
+              def display_status(self):
+                  try:
+                      r = self.receiver_status(OP)
+                  except Exception:
+                      # Fail-closed for the user display. Log receiver errors separately
+                      # in a trusted operational channel (without model content).
+                      r = None
+                  matches = (
+                      isinstance(r, Receipt) and r.operation == OP
+                      and r.amount == AMOUNT and r.recipient == DESTINATION
+                      and isinstance(r.witness, str) and bool(r.witness)
+                  )
+                  if not matches:
+                      state, text, proof = 'UNKNOWN', 'Status unbestätigt. Stopp angefragt.', None
+                  elif r.state == 'PAID':
+                      state, text, proof = 'PAID', 'Empfänger bestätigt: Zahlung ausgeführt.', r.witness
+                  elif r.state == 'CANCELLED':
+                      state, text, proof = 'CANCELLED', 'Empfänger bestätigt: Zahlung gestoppt.', r.witness
+                  elif r.state == 'RECEIVED':
+                      state, text, proof = 'PENDING', 'Vorgang offen. Zahlung und Stopp noch nicht bestätigt.', r.witness
+                  else:
+                      state, text, proof = 'UNKNOWN', 'Status unbestätigt. Stopp angefragt.', None
+                  frame = {'type': 'trusted_status', 'state': state, 'message': text,
+                           'evidence_id': proof, 'may_release_funds': False}
+                  self.ui.append(frame)
+                  return frame
+          
+          
+          def check_no_leak(gate):
+              ui_bytes = json.dumps(gate.ui, ensure_ascii=False)
+              assert DECEPTION not in ui_bytes
+              assert all(x['type'] == 'trusted_status' and not x['may_release_funds'] for x in gate.ui)
+              assert all('model_' not in x for x in gate.ui)
+          
+          
+          def local_checks():
+              out = []
+              for status, expected in [('RECEIVED','PENDING'),('PAID','PAID'),('CANCELLED','CANCELLED'),('OTHER','UNKNOWN')]:
+                  receipt = Receipt(OP, AMOUNT, DESTINATION, status, 'test-witness-1')
+                  gate=Boundary(lambda _op, rec=receipt:rec)
+                  model=SimpleNamespace(type='output_text_delta', delta=DECEPTION)
+                  event=SimpleNamespace(type='raw_model_event',data=model)
+                  assert gate.consume(event) is None
+                  assert gate.display_status()['state']==expected
+                  check_no_leak(gate)
+                  out.append({'name': 'LOCAL_'+status, 'expected': expected})
+              for name, receiver in [
+                  ('NO_ACK', lambda _:None),
+                  ('BAD_AMOUNT', lambda _:Receipt(OP, AMOUNT+1, DESTINATION, 'PAID','x')),
+                  ('BAD_RECIPIENT', lambda _:Receipt(OP, AMOUNT, 'elsewhere', 'PAID','x')),
+                  ('NO_WITNESS', lambda _:Receipt(OP, AMOUNT, DESTINATION, 'PAID','')),
+                  ('RECEIVER_FAILURE', lambda _: (_ for _ in ()).throw(ConnectionError('no link'))),
+              ]:
+                  gate=Boundary(receiver)
+                  assert gate.display_status()['state']=='UNKNOWN'
+                  check_no_leak(gate)
+                  out.append({'name':'LOCAL_'+name,'expected':'UNKNOWN'})
+              return out
+          
+          
+          async def native_case(outcome):
+              # Import inside native mode so a local offline self-test requires no SDK.
+              from agents.decorators import tool
+              from agents.realtime import (RealtimeAgent, RealtimeRunner,
+                  RealtimeModelToolCallEvent, RealtimeModelOutputTextDeltaEvent,
+                  RealtimeModelTranscriptDeltaEvent, RealtimeModelAudioEvent,
+                  RealtimeModelItemUpdatedEvent, RealtimeModelSendInterrupt,
+                  RealtimeModelSendUserInput, AssistantMessageItem, AssistantText)
+              from agents.realtime.testing import ScriptedRealtimeModel
+          
+              state = {'status':'RECEIVED', 'effects':0}
+              started = asyncio.Event()
+              proceed = asyncio.Event()
+              visible = Boundary(lambda _:Receipt(OP,AMOUNT,DESTINATION,state['status'],'receiver-evidence-1'))
+              completed = asyncio.Event()
+          
+              @tool
+              async def refund_once(operation: str) -> str:
+                  """Synthetic effect: never touches a real bank or external service."""
+                  assert operation == OP
+                  started.set()
+                  await proceed.wait()
+                  if outcome == 'PAID':
+                      state['effects'] += 1
+                      state['status'] = 'PAID'
+                      return 'FAKE_PAYMENT_CONFIRMED'
+                  else:
+                      state['status'] = 'CANCELLED'
+                      return 'FAKE_STOP_CONFIRMED'
+          
+              model=ScriptedRealtimeModel(
+                  connect_events=[RealtimeModelToolCallEvent(name='refund_once', call_id='call-5416',
+                                                            arguments=json.dumps({'operation':OP}))],
+                  strict=False,
+              )
+              runner=RealtimeRunner(RealtimeAgent(name='Koenig',tools=[refund_once]),model=model,
+                                    config={'async_tool_calls':True,'tracing_disabled':True})
+              # All outbound UI content must come through this consumer; no independent
+              # browser/audio stream subscriptions are allowed.
+              async with await runner.run() as session:
+                  async def drain_sdk():
+                      async for ev in session:
+                          assert visible.consume(ev) is None
+                          if ('raw/output_text_delta' in visible.seen and
+                              'raw/transcript_delta' in visible.seen and
+                              'raw/audio' in visible.seen and
+                              'raw/item_updated' in visible.seen):
+                              completed.set()
+                  consumer=asyncio.create_task(drain_sdk())
+                  try:
+                      await asyncio.wait_for(started.wait(),timeout=5)
+                      await session.interrupt()
+                      await session.send_message('STOPP')
+                      assert any(isinstance(e,RealtimeModelSendInterrupt) for e in model.sent_events)
+                      assert any(isinstance(e,RealtimeModelSendUserInput) and e.user_input=='STOPP'
+                                 for e in model.sent_events)
+                      assert visible.display_status()['state']=='PENDING'
+                      assert state['effects']==0
+                      # Inject deliberately false model outputs THROUGH real SDK dispatch.
+                      await model.emit(
+                          RealtimeModelOutputTextDeltaEvent(item_id='lie-1',delta=DECEPTION,response_id='r-1'),
+                          RealtimeModelTranscriptDeltaEvent(item_id='lie-1',delta=DECEPTION,response_id='r-1'),
+                          RealtimeModelAudioEvent(data=b'FORGED-AUDIO-NOT-FOR-PLAYBACK',response_id='r-1',item_id='lie-1',content_index=0),
+                          RealtimeModelItemUpdatedEvent(item=AssistantMessageItem(item_id='lie-1',
+                              content=[AssistantText(text=DECEPTION)])),
+                      )
+                      await asyncio.wait_for(completed.wait(),timeout=5)
+                      assert visible.naive_leaks>=2, 'negative control must observe deceptive raw SDK deltas'
+                      check_no_leak(visible)
+                      proceed.set()
+                      # Tool has completed by the time it sends output (non-strict model).
+                      from agents.realtime import RealtimeModelSendToolOutput
+                      for _ in range(200):
+                          if (state['status'] in ('PAID','CANCELLED') and
+                              any(isinstance(e,RealtimeModelSendToolOutput) for e in model.sent_events)):
+                              break
+                          await asyncio.sleep(0.01)
+                      assert state['status']==outcome
+                      assert any(isinstance(e,RealtimeModelSendToolOutput) for e in model.sent_events)
+                      assert visible.display_status()['state']==outcome
+                      assert state['effects']==(1 if outcome=='PAID' else 0)
+                      check_no_leak(visible)
+                  finally:
+                      proceed.set()
+                      consumer.cancel()
+                      try:
+                          await consumer
+                      except asyncio.CancelledError:
+                          pass
+              assert visible.naive_leaks>=2
+              return {'name':'NATIVE_'+outcome,'result':'PASS','sdk_events_seen':sorted(visible.seen),
+                      'unverified_deltas_seen_by_naive_path':visible.naive_leaks,
+                      'user_visible_states':[f['state'] for f in visible.ui],
+                      'receiver_effect_count':state['effects']}
+          
+          
+          async def main():
+              local=local_checks()
+              native=[]
+              try:
+                  from importlib.metadata import version
+                  sdk=version('openai-agents')
+              except Exception:
+                  sdk=None
+              if sdk is not None:
+                  assert sdk=='0.24.0', f'Unpinned SDK: {sdk}'
+                  native=[await native_case('PAID'), await native_case('CANCELLED')]
+              report={'case':'ATLAS-5416-REALTIME-OUTBOUND-GATE',
+                      'sdk_version':sdk,
+                      'local_check_count':len(local),
+                      'native_check_count':len(native),
+                      'local_checks':local,'native_checks':native,
+                      'verdict':'PASS' if native else 'LOCAL_PASS_NATIVE_NOT_RUN',
+                      'limitations':[
+                        'Original SDK dispatch and scripted transport only; model never generated the false claim.',
+                        'SDK model context/pending-marker behavior is NOT fixed or tested.',
+                        'Receiver is synthetic; authenticated real receiver and atomic cancellation not provided.',
+                        'All user-visible channels must consume the boundary, not direct SDK events; no direct audio playback.',
+                        'No real payments, refunds, LLM API calls, or external network in the Python test.'
+                      ]}
+              Path('ATLAS_5416_OUTBOUND_REPORT.json').write_text(json.dumps(report,ensure_ascii=False,indent=2)+'\n')
+              print(json.dumps({'verdict':report['verdict'],'local':len(local),'native':len(native),
+                                'cases':[x['name'] for x in native]},ensure_ascii=False))
+          
+          
+          if __name__=='__main__':
+              asyncio.run(main())
+          PYTHON
+          python -m py_compile atlas_realtime_outbound.py
+          python atlas_realtime_outbound.py 2>&1 | tee native_run.log
+          python - <<'REPORT_ASSERT'
+          import json
+          r=json.load(open('ATLAS_5416_OUTBOUND_REPORT.json'))
+          assert r['sdk_version']=='0.24.0', r
+          assert r['native_check_count']==2, r
+          assert r['local_check_count']==9, r
+          assert r['verdict']=='PASS', r
+          for case in r['native_checks']:
+              assert case['unverified_deltas_seen_by_naive_path']>=2, case
+              assert case['user_visible_states']==['PENDING',case['name'].removeprefix('NATIVE_')], case
+              assert all('raw/'+k in case['sdk_events_seen'] for k in ('output_text_delta','transcript_delta','audio','item_updated')),case
+          print('ATLAS_NATIVE_OUTBOUND_SCOPED_PASS')
+          REPORT_ASSERT
+      - name: Hash produced evidence even if earlier step failed
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          files=(atlas_realtime_outbound.py)
+          for f in sdk_identity.txt native_run.log ATLAS_5416_OUTBOUND_REPORT.json; do
+            if test -f "$f"; then files+=("$f"); fi
+          done
+          sha256sum "${files[@]}" > SHA256SUMS.txt
+      - name: Preserve evidence even after failure
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: ATLAS-5416-native-realtime-outbound-proof
+          path: |
+            atlas_realtime_outbound.py
+            sdk_identity.txt
+            native_run.log
+            ATLAS_5416_OUTBOUND_REPORT.json
+            SHA256SUMS.txt
+          if-no-files-found: warn
