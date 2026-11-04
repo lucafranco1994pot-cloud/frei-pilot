@@ -1,0 +1,251 @@
+name: ATLAS 01 - Native identity differential one-file
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  diagnostic:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 100
+    steps:
+      - name: Checkout exact upstream version
+        uses: actions/checkout@v4
+        with:
+          repository: nautechsystems/nautilus_trader
+          ref: 6c843bc7f9f72941eeddb22df502b520c97a8987
+          path: nautilus
+          persist-credentials: false
+      - name: Python 3.13 and uv
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - name: Install uv
+        uses: astral-sh/setup-uv@v6
+      - name: Prepare self-contained fixture, patch, and fingerprints
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p evidence
+          git -C nautilus rev-parse HEAD | tee evidence/upstream_commit.txt
+          cd nautilus
+          cat > fix.patch <<'ATLAS_EOF_FIX_PATCH'
+          diff --git a/crates/adapters/interactive_brokers/src/execution/updates.rs b/crates/adapters/interactive_brokers/src/execution/updates.rs
+          --- a/crates/adapters/interactive_brokers/src/execution/updates.rs
+          +++ b/crates/adapters/interactive_brokers/src/execution/updates.rs
+          @@ -901,4 +901,11 @@
+               ) {
+                   // Only a complete answer proves absence: ibapi ends a stream after an error, and a
+                   // stream cut short must leave the order working rather than reject it
+          -        match Self::find_open_order(client, ib_order_id, timeout_dur).await {
+          +        let expected_client_id = match orders.lock() {
+          +            Ok(state) => state.client_id,
+          +            Err(e) => {
+          +                tracing::error!("Cannot read IB client identity for order presence check: {e}");
+          +                return;
+          +            }
+          +        };
+          +        match Self::find_open_order(client, expected_client_id, ib_order_id, timeout_dur).await {
+          @@ -949,8 +956,16 @@
+                           .map(|order| order.perm_id)
+                   });
+          +        let expected_client_id = match orders.lock() {
+          +            Ok(state) => state.client_id,
+          +            Err(e) => {
+          +                tracing::error!("Cannot read IB client identity for completed order check: {e}");
+          +                return;
+          +            }
+          +        };
+           
+                   let completed = match Self::find_completed_order(
+                       client,
+          +            expected_client_id,
+                       ib_order_id,
+                       tracked_perm_id,
+                       timeout_dur,
+          @@ -1021,5 +1036,6 @@
+               // the end message and yields an error first on a reset, so `?` fails a partial list.
+               async fn find_open_order(
+                   client: &Arc<Client>,
+          +        expected_client_id: i32,
+                   ib_order_id: i32,
+                   timeout_dur: Duration,
+          @@ -1030,5 +1046,6 @@
+                       while let Some(item) = subscription.next().await {
+                           match item? {
+                               SubscriptionItem::Data(Orders::OrderData(data))
+          -                        if data.order_id == ib_order_id =>
+          +                        if data.order_id == ib_order_id
+          +                            && data.order.client_id == expected_client_id =>
+                               {
+          @@ -1046,5 +1063,6 @@
+               // Returns the completed status and filled quantity of the order, failing on a partial list.
+               async fn find_completed_order(
+                   client: &Arc<Client>,
+          +        expected_client_id: i32,
+                   ib_order_id: i32,
+                   tracked_perm_id: Option<i64>,
+          @@ -1054,7 +1072,9 @@
+                       while let Some(item) = subscription.next().await {
+                           match item? {
+                               SubscriptionItem::Data(Orders::OrderData(data))
+          -                        if data.order_id == ib_order_id
+          -                            || (data.order.perm_id != 0
+          -                                && Some(data.order.perm_id) == tracked_perm_id) =>
+          +                        if (tracked_perm_id.is_some_and(|id| id > 0)
+          +                            && Some(data.order.perm_id) == tracked_perm_id)
+          +                            || (tracked_perm_id.is_none_or(|id| id == 0)
+          +                                && data.order_id == ib_order_id
+          +                                && data.order.client_id == expected_client_id) =>
+                               {
+          @@ -1410,8 +1430,12 @@
+                                   return Ok(());
+                               }
+           
+          -                    if let OrderCorrelation::Tracked { order_id, .. } = correlation {
+          -                        normalized_order.order_id = order_id;
+          -                    }
+          +                    // Only a verified tracked correlation may mutate an existing
+          +                    // local order. Untracked and separately handled duplicate
+          +                    // broker orders must never fall back to numeric order ID.
+          +                    let OrderCorrelation::Tracked { order_id, .. } = correlation else {
+          +                        return Ok(());
+          +                    };
+          +                    normalized_order.order_id = order_id;
+           
+                               let order_data = &normalized_order;
+          ATLAS_EOF_FIX_PATCH
+          cat > prepare_fixture.py <<'ATLAS_EOF_PREPARE_FIXTURE_PY'
+          #!/usr/bin/env python3
+          """Retrieve the exact public code fence from NautilusTrader issue comment 6474060516."""
+          import json
+          import pathlib
+          import re
+          import urllib.request
+          
+          URL = 'https://api.github.com/repos/nautechsystems/nautilus_trader/issues/comments/6474060516'
+          req=urllib.request.Request(URL,headers={'Accept':'application/vnd.github+json','User-Agent':'atlas-identity-diagnostic'})
+          with urllib.request.urlopen(req,timeout=45) as response:
+              comment=json.load(response)
+          body=comment['body']
+          blocks=re.findall(r'```python\s*\n(.*?)\n```', body, flags=re.S)
+          blocks=[b for b in blocks if 'async def _native_scenario(' in b and 'class _ProtocolFixture' in b]
+          if len(blocks)!=1:
+              raise SystemExit(f'Expected exactly one fixture code fence, got {len(blocks)}')
+          path=pathlib.Path('ib_equal_id_repro.py')
+          path.write_text(blocks[0]+'\n',encoding='utf-8')
+          print(f'Fixture saved to {path}, {len(blocks[0])} chars')
+          ATLAS_EOF_PREPARE_FIXTURE_PY
+          cat > run_fixture.py <<'ATLAS_EOF_RUN_FIXTURE_PY'
+          #!/usr/bin/env python3
+          """Run one source fixture case without calling its rc7-only CLI entrypoint."""
+          import asyncio
+          import hashlib
+          import json
+          import pathlib
+          import runpy
+          import sys
+          from importlib.metadata import version
+          
+          if __name__=='__main__':
+              if len(sys.argv)!=3:
+                  raise SystemExit('usage: run_fixture.py CASE OUTPUT.json')
+              case,out=sys.argv[1:]
+              if case not in ('duplicate_absent','duplicate','baseline'):
+                  raise SystemExit('unsupported case')
+              code=pathlib.Path('ib_equal_id_repro.py')
+              ns=runpy.run_path(str(code),run_name='atlas_imported_fixture')
+              outcome=asyncio.run(ns['_native_scenario'](case))
+              result={
+                  'case':case,
+                  'package_version':version('nautilus-trader'),
+                  'fixture_sha256':hashlib.sha256(code.read_bytes()).hexdigest(),
+                  'result':outcome,
+              }
+              pathlib.Path(out).write_text(json.dumps(result,indent=2,sort_keys=True,default=str)+'\n')
+              print('RESULT_JSON='+json.dumps(result,sort_keys=True,default=str))
+              if outcome.get('fixture_errors') or outcome.get('run_error') or not outcome.get('started'):
+                  raise SystemExit('fixture failed; evidence invalid')
+          ATLAS_EOF_RUN_FIXTURE_PY
+          sha256sum fix.patch | tee ../evidence/patch_sha256.txt
+          python prepare_fixture.py
+          sha256sum ib_equal_id_repro.py | tee ../evidence/fixture_sha256.txt
+          git apply --check fix.patch
+          echo PATCH_APPLIES_TO_PINNED_SOURCE | tee ../evidence/patch_apply_check.txt
+      - name: ORIGINAL build and three separate protocol cases
+        id: original
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd nautilus
+          make sync 2>&1 | tee ../evidence/original_sync.log
+          make build-debug 2>&1 | tee ../evidence/original_build.log
+          for case in duplicate_absent duplicate baseline; do
+            python/.venv/bin/python run_fixture.py "$case" "../evidence/original_${case}.json" 2>&1 | tee "../evidence/original_${case}.log"
+          done
+      - name: Require original evidence before modifying code
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "${{ steps.original.outcome }}" = success || { echo 'BASELINE_BUILD_OR_FIXTURE_FAILED'; exit 1; }
+          python - <<'PY'
+          import json, pathlib
+          base=pathlib.Path('evidence')
+          for case in ('duplicate_absent','duplicate','baseline'):
+              p=base/f'original_{case}.json'
+              if not p.is_file(): raise SystemExit('BASELINE_MISSING '+str(p))
+              j=json.loads(p.read_text())
+              if j['result'].get('fixture_errors') or j['result'].get('run_error'):
+                  raise SystemExit('BASELINE_INVALID '+case)
+          # This is a diagnostic snapshot guard, not a full asynchronous drain proof.
+          rejected=json.dumps(json.loads((base/'original_duplicate_absent.json').read_text())['result'].get('events', []))
+          collision=json.dumps(json.loads((base/'original_duplicate.json').read_text())['result'].get('events', []))
+          if 'OrderRejected' not in rejected or 'OrderAccepted' not in collision:
+              raise SystemExit('BASELINE_NOT_REPRODUCED: inspect artifacts before patch')
+          print('BASELINE_REPRODUCED_SNAPSHOT_ONLY')
+          PY
+      - name: Apply minimal patch and rebuild
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd nautilus
+          git apply fix.patch
+          git diff --check
+          git diff > ../evidence/applied.diff
+          make build-debug 2>&1 | tee ../evidence/fix_build.log
+          for case in duplicate_absent duplicate baseline; do
+            python/.venv/bin/python run_fixture.py "$case" "../evidence/fix_${case}.json" 2>&1 | tee "../evidence/fix_${case}.log"
+          done
+      - name: Basic evidence comparison (not full certification)
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import json,pathlib
+          root=pathlib.Path('evidence')
+          data={k:json.loads((root/f'{k}.json').read_text()) for k in [
+            'original_duplicate_absent','original_duplicate','original_baseline',
+            'fix_duplicate_absent','fix_duplicate','fix_baseline']}
+          hashes={v['fixture_sha256'] for v in data.values()}
+          if len(hashes)!=1: raise SystemExit('FIXTURE_MISMATCH')
+          def has(k,event): return event in json.dumps(data[k]['result'].get('events', []))
+          checks={
+            'original_control_rejected':has('original_duplicate_absent','OrderRejected'),
+            'original_collision_accepted':has('original_duplicate','OrderAccepted'),
+            'fixed_control_rejected':has('fix_duplicate_absent','OrderRejected'),
+            'fixed_collision_rejected':has('fix_duplicate','OrderRejected'),
+            'fixed_collision_not_accepted':not has('fix_duplicate','OrderAccepted'),
+            'fixed_genuine_accepted':has('fix_baseline','OrderAccepted'),
+          }
+          (root/'comparison.json').write_text(json.dumps(checks,indent=2)+'\n')
+          print(json.dumps(checks,indent=2))
+          if not all(checks.values()): raise SystemExit('DIFFERENTIAL_SNAPSHOT_FAIL')
+          print('NATIVE_SNAPSHOT_DIFFERENTIAL_PASS; async-drain/external-order preservation still unverified')
+          PY
+      - name: Always upload evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: atlas-01-native-evidence
+          path: evidence/
+          if-no-files-found: warn
