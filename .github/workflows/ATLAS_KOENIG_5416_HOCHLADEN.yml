@@ -1,0 +1,429 @@
+name: ATLAS KOENIG 5416 original HTTP native once
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  sdk-original-http:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Fetch pinned original stopbench sources
+        shell: bash
+        run: |
+          set -euo pipefail
+          git clone --quiet https://github.com/chrislazar25/stopbench.git stopbench
+          git -C stopbench checkout --quiet --detach 2a4d471139543100c4d6ddb404b8b5763104ef89
+          test "$(git -C stopbench rev-parse HEAD)" = '2a4d471139543100c4d6ddb404b8b5763104ef89'
+          test "$(git hash-object stopbench/ledger.py)" = 'efb7fead6ba4c775d87f4e67afe50b10a567f212'
+          test "$(git hash-object stopbench/refund.py)" = '976d0c9eefe5997d499714595fd6de5568606c39'
+          git -C stopbench rev-parse HEAD > stopbench_commit.txt
+      - name: Install original pinned dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --disable-pip-version-check -r stopbench/requirements-realtime.lock.txt
+          python -m pip show openai-agents > sdk_identity.txt
+          python -c 'from agents.realtime.testing import ScriptedRealtimeModel; print("SDK_REALTIME_IMPORT_PASS")'
+      - name: Native SDK original HTTP ALT and FIX - only once
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > atlas_5416_http_native.py <<'PYTHON'
+          """ATLAS #5416: true SDK Realtime orchestration + original stopbench HTTP ledger.
+
+          No real payments, no OpenAI calls, no retries, exactly two fixed cases.
+          The original ledger handler is unchanged. Only its timing function is wrapped to
+          announce the moment *after receiving request body but before SQLite commit*.
+          The wrapper is a test seam, not a production guarantee.
+          """
+          from __future__ import annotations
+
+          import asyncio
+          import hashlib
+          import json
+          import sqlite3
+          import sys
+          import tempfile
+          import threading
+          import time
+          from dataclasses import dataclass
+          from http.server import ThreadingHTTPServer
+          from pathlib import Path
+
+          # The workflow checks out a PINNED copy of the original stopbench repository.
+          STOPBENCH = Path(__file__).resolve().parent / "stopbench"
+          sys.path.insert(0, str(STOPBENCH))
+          import ledger  # type: ignore  # original ledger.py, byte-identical
+          import refund  # type: ignore  # original refund.py, byte-identical
+          from stopbench import Marks  # type: ignore
+
+          from agents.decorators import tool
+          from agents.realtime import (
+              RealtimeAgent,
+              RealtimeModelSendInterrupt,
+              RealtimeModelSendToolOutput,
+              RealtimeModelSendUserInput,
+              RealtimeModelToolCallEvent,
+              RealtimeRunner,
+          )
+          from agents.realtime.testing import RealtimeStep, ScriptedRealtimeModel
+
+          REFUND_ID = "atlas-5416-same-economic-operation"
+          AMOUNT = 4000
+          STOP = "STOPP: keine weitere Auszahlung aus dieser Reservierung"
+          ORIGINAL_COMMIT = "2a4d471139543100c4d6ddb404b8b5763104ef89"
+          LEDGER_GIT_BLOB = "efb7fead6ba4c775d87f4e67afe50b10a567f212"
+          REFUND_GIT_BLOB = "976d0c9eefe5997d499714595fd6de5568606c39"
+
+
+          def git_blob_sha(data: bytes) -> str:
+              return hashlib.sha1(f"blob {len(data)}\0".encode() + data).hexdigest()
+
+
+          def source_check() -> dict:
+              actual = {"ledger.py": git_blob_sha((STOPBENCH / "ledger.py").read_bytes()),
+                        "refund.py": git_blob_sha((STOPBENCH / "refund.py").read_bytes())}
+              assert actual["ledger.py"] == LEDGER_GIT_BLOB, "original ledger changed"
+              assert actual["refund.py"] == REFUND_GIT_BLOB, "original refund tool changed"
+              return {"stopbench_commit": ORIGINAL_COMMIT, "original_git_blobs": actual}
+
+
+          class ReceiptClock:
+              """Deterministic visibility barrier at original handler's `time.sleep` call.
+
+              `ledger.py` itself remains byte-for-byte unchanged; do_POST has read the POST body,
+              and has set received_at before calling this hook. The first request pauses here.
+              """
+              def __init__(self, gate_seen: threading.Event, release: threading.Event):
+                  self.gate_seen = gate_seen
+                  self.release = release
+                  self.original_time = time
+                  self._lock = threading.Lock()
+                  self._first = True
+
+              def time(self):
+                  return self.original_time.time()
+
+              def sleep(self, delay: float):
+                  with self._lock:
+                      first = self._first
+                      self._first = False
+                  if first:
+                      self.gate_seen.set()
+                      if not self.release.wait(timeout=15):
+                          raise TimeoutError("receiver release barrier never opened")
+                  self.original_time.sleep(delay)
+
+
+          @dataclass
+          class OriginalReceiver:
+              folder: Path
+
+              def __post_init__(self):
+                  self.db = self.folder / "original_ledger.sqlite"
+                  with sqlite3.connect(self.db) as conn:
+                      conn.executescript(ledger.SCHEMA)
+                  self.gate_seen = threading.Event()
+                  self.release = threading.Event()
+                  self.clock = ReceiptClock(self.gate_seen, self.release)
+                  # Rebinding a module variable affects just this test process, not file bytes.
+                  ledger.time = self.clock
+                  handler = ledger.make_handler(str(self.db), 0.4, threading.Lock())
+                  self.server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
+                  self.port = self.server.server_address[1]
+                  self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+                  self.thread.start()
+
+              @property
+              def url(self):
+                  return f"http://127.0.0.1:{self.port}/refunds"
+
+              def rows(self):
+                  with sqlite3.connect(self.db) as conn:
+                      raw = conn.execute("SELECT seq,refund_id,amount_cents,received_at,committed_at FROM refunds ORDER BY seq").fetchall()
+                  return [{"seq": r[0], "refund_id": r[1], "amount_cents": r[2],
+                           "received_at": r[3], "committed_at": r[4]} for r in raw]
+
+              def close(self):
+                  self.release.set()
+                  self.server.shutdown()
+                  self.server.server_close()
+                  self.thread.join(timeout=3)
+                  ledger.time = time
+
+
+          class Kingdom:
+              """Local app reservation authority, NOT an external bank/rollback protocol."""
+              def __init__(self, path):
+                  self.db = sqlite3.connect(str(path), isolation_level=None)
+                  self.db.execute("CREATE TABLE balance(available INTEGER NOT NULL, reserved INTEGER NOT NULL)")
+                  self.db.execute("INSERT INTO balance VALUES(?,?)", (0, AMOUNT))
+                  self.db.execute("CREATE TABLE order_status(id TEXT PRIMARY KEY, state TEXT NOT NULL)")
+                  self.db.execute("INSERT INTO order_status VALUES (?,?)", (REFUND_ID, "IN_FLIGHT"))
+
+              def stop_unknown(self):
+                  assert self.db.execute("UPDATE order_status SET state='UNKNOWN' WHERE id=? AND state='IN_FLIGHT'", (REFUND_ID,)).rowcount == 1
+
+              def can_start_replacement(self):
+                  return self.db.execute("SELECT available FROM balance").fetchone()[0] >= AMOUNT
+
+              def reconcile_original_commit(self, rows):
+                  assert rows and rows[0]["refund_id"] == REFUND_ID
+                  assert self.db.execute("UPDATE order_status SET state='PAID' WHERE id=? AND state='UNKNOWN'", (REFUND_ID,)).rowcount == 1
+                  # Reserved funds have been spent; do not release on STOPP or missing witnesses.
+                  self.db.execute("UPDATE balance SET reserved=0")
+
+              def snapshot(self):
+                  state = self.db.execute("SELECT state FROM order_status").fetchone()[0]
+                  available,reserved = self.db.execute("SELECT available,reserved FROM balance").fetchone()
+                  return {"state":state,"available_cents":available,"reserved_cents":reserved}
+
+              def close(self):
+                  self.db.close()
+
+
+          async def case(folder: Path, protected: bool) -> dict:
+              folder.mkdir()
+              server = OriginalReceiver(folder)
+              gate = Kingdom(folder / "kingdom.sqlite") if protected else None
+              old_output = asyncio.Event()
+              new_output = asyncio.Event()
+              outputs: dict[str, str] = {}
+              old_marks, new_marks = Marks(), Marks()
+              observations: dict = {}
+
+              @tool
+              async def issue_refund(amount_cents: int, attempt: str) -> str:
+                  """Issue a synthetic refund through the original HTTP client and SQLite recipient."""
+                  if amount_cents != AMOUNT or attempt not in ("old", "new"):
+                      return "INVALID_ARGUMENTS"
+                  if attempt == "new" and protected:
+                      assert gate is not None
+                      if not gate.can_start_replacement():
+                          return "BLOCKED_UNKNOWN_FUNDS"
+                      raise AssertionError("reserved old funds unexpectedly available")
+                  marks = old_marks if attempt == "old" else new_marks
+                  result = await refund.issue_refund(server.url, REFUND_ID, amount_cents, marks)
+                  assert result["status"] == "committed", result
+                  return "ORIGINAL_LEDGER_COMMITTED"
+
+              def track_output(event):
+                  if not isinstance(event, RealtimeModelSendToolOutput):
+                      return False
+                  key=event.tool_call.call_id
+                  if key not in ("call-old", "call-new"):
+                      return False
+                  outputs[key]=event.output
+                  (old_output if key == "call-old" else new_output).set()
+                  return True
+
+              model = ScriptedRealtimeModel(
+                  [
+                      RealtimeStep(expect=RealtimeModelSendInterrupt),
+                      RealtimeStep(expect=lambda e:isinstance(e,RealtimeModelSendUserInput) and e.user_input==STOP),
+                      RealtimeStep(expect=track_output),  # replacement output
+                      RealtimeStep(expect=track_output),  # delayed original output
+                  ],
+                  connect_events=[RealtimeModelToolCallEvent(
+                      name="issue_refund",call_id="call-old",
+                      arguments=json.dumps({"amount_cents":AMOUNT,"attempt":"old"}),
+                  )],
+              )
+              runner = RealtimeRunner(
+                  RealtimeAgent(name="AtlasKing", tools=[issue_refund]),
+                  model=model,
+                  config={"async_tool_calls":True,"tracing_disabled":True},
+              )
+              try:
+                  async with await runner.run() as session:
+                      # The original receiver has read the old request, but its commit is gated.
+                      assert await asyncio.wait_for(asyncio.to_thread(server.gate_seen.wait, 9),timeout=10)
+                      before_stop=server.rows()
+                      assert before_stop == [], "first payment committed before STOPP"
+                      observations["old_received_before_stop"] = True  # instrumented receipt barrier
+                      observations["bank_rows_at_stop"] = len(before_stop)
+                      if gate:
+                          gate.stop_unknown()
+                          observations["gate_at_stop"] = gate.snapshot()
+                      observations["stop_at"] = time.time()
+                      await session.interrupt()
+                      await session.send_message(STOP)
+                      observations["stop_message_sent"] = True
+                      await model.emit(RealtimeModelToolCallEvent(
+                          name="issue_refund",call_id="call-new",
+                          arguments=json.dumps({"amount_cents":AMOUNT,"attempt":"new"}),
+                      ))
+                      await asyncio.wait_for(new_output.wait(),timeout=10)
+                      observations["ledger_count_before_old_release"] = len(server.rows())
+                      if protected:
+                          assert outputs.get("call-new") == "BLOCKED_UNKNOWN_FUNDS", outputs
+                          assert observations["ledger_count_before_old_release"] == 0
+                      else:
+                          assert outputs.get("call-new") == "ORIGINAL_LEDGER_COMMITTED", outputs
+                          assert observations["ledger_count_before_old_release"] == 1
+                      server.release.set()
+                      await asyncio.wait_for(old_output.wait(),timeout=10)
+                  model.assert_complete()
+                  rows=server.rows()
+                  assert outputs.get("call-old") == "ORIGINAL_LEDGER_COMMITTED", outputs
+                  original_request = min(rows, key=lambda r: r["received_at"])
+                  assert original_request["received_at"] < observations["stop_at"] < original_request["committed_at"], "STOPP not actually in-flight"
+                  observations["old_was_in_flight_at_stop"] = True
+                  if protected:
+                      assert len(rows) == 1, rows
+                      assert gate is not None
+                      gate.reconcile_original_commit(rows)
+                      assert gate.snapshot() == {"state":"PAID","available_cents":0,"reserved_cents":0}
+                  else:
+                      assert len(rows) == 2, rows
+                      later_request = max(rows, key=lambda r: r["received_at"])
+                      assert later_request["received_at"] > observations["stop_at"], "second request did not follow STOPP"
+                  observations.update({"sdk_outputs":outputs,"ledger_rows":rows,
+                                       "ledger_commits":len(rows),"replacement_reservation_safety": "PASS" if protected else "FAIL_DUPLICATE_IN_DEMO_LEDGER",
+                                       "model_first_reply":"NOT_TESTED_SCRIPTED_TRANSPORT",
+                                       "bank_reversal":"NOT_IMPLEMENTED_OR_CLAIMED",
+                                       "old_payment_stopped":"NO_ALREADY_RECEIVED_BY_LEDGER"})
+                  if gate:
+                      observations["gate_final"] = gate.snapshot()
+                  return {"branch":"FIX_APPLICATION_GATE" if protected else "ALT_ORIGINAL_SDK_AND_HTTP",
+                          "verdict":"PASS","observations":observations}
+              finally:
+                  server.release.set()
+                  server.close()
+                  if gate:
+                      gate.close()
+
+
+          async def main():
+              sources=source_check()
+              with tempfile.TemporaryDirectory(prefix="atlas-5416-http-") as d:
+                  root=Path(d)
+                  alt=await case(root / "alt", protected=False)
+                  fix=await case(root / "fix", protected=True)
+              report={"target":"openai-agents==0.24.0 + original stopbench ledger.py/refund.py",
+                      "transport":"official ScriptedRealtimeModel, no real model",
+                      "exactly_two_fixed_cases":True,"original_sources":sources,
+                      "no_real_payment":True,"cases":[alt,fix],
+                      "conclusion":"SDK_ORCHESTRATION_AND_ORIGINAL_HTTP_APPLICATION_GATE_SCOPED_PASS",
+                      "not_claimed":["actual model first reply","provider WebSocket behavior","actual bank cancellation or reversal","SDK patched"]}
+              Path("ATLAS_5416_HTTP_NATIVE_REPORT.json").write_text(json.dumps(report,indent=2,ensure_ascii=False)+"\n",encoding="utf-8")
+              print(json.dumps({"verdict":report["conclusion"],
+                                "alt_http_commits":alt["observations"]["ledger_commits"],
+                                "fix_http_commits":fix["observations"]["ledger_commits"],
+                                "model_first_reply":"NOT_TESTED"}))
+
+          if __name__ == "__main__":
+              asyncio.run(main())
+          PYTHON
+          python -m py_compile atlas_5416_http_native.py
+          python atlas_5416_http_native.py 2>&1 | tee atlas_5416_http_native.log
+      - name: Independently check raw evidence consistency
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > atlas_5416_evidence_checker.py <<'PYTHON'
+          """Independent invariant checker for recorded SDK+original HTTP evidence.
+
+          Reads raw run report; makes no network calls and does not infer model output.
+          This is a separately implemented consistency checker, not independent collection.
+          """
+          from __future__ import annotations
+          import json
+          import sys
+          from pathlib import Path
+
+          EXPECTED={
+              'ledger.py':'efb7fead6ba4c775d87f4e67afe50b10a567f212',
+              'refund.py':'976d0c9eefe5997d499714595fd6de5568606c39',
+          }
+
+          def examine(case, guarded, problems):
+              o=case['observations']
+              label='FIX' if guarded else 'ALT'
+              def require(condition, text):
+                  if not condition: problems.append(label+': '+text)
+              rows=o['ledger_rows']
+              t=o['stop_at']
+              require(o['old_received_before_stop'] is True, 'no reception witness')
+              require(o['bank_rows_at_stop']==0, 'ledger committed before STOPP')
+              require(o['old_was_in_flight_at_stop'] is True, 'in-flight witness missing')
+              require(o['stop_message_sent'] is True, 'STOPP message not sent')
+              require(len(rows)==(1 if guarded else 2), 'wrong ledger commit count')
+              require(o['ledger_commits']==len(rows), 'report/count disagreement')
+              require(all(row['refund_id']=='atlas-5416-same-economic-operation' and row['amount_cents']==4000 for row in rows), 'different economic identity')
+              require(all(row['received_at']<row['committed_at'] for row in rows), 'time inverted')
+              require(any(row['received_at']<t<row['committed_at'] for row in rows), 'original request not in-flight during STOPP')
+              require(o['sdk_outputs'].get('call-old')=='ORIGINAL_LEDGER_COMMITTED', 'original SDK output mismatch')
+              require(o['model_first_reply']=='NOT_TESTED_SCRIPTED_TRANSPORT', 'unsupported model-reply claim')
+              require(o['bank_reversal']=='NOT_IMPLEMENTED_OR_CLAIMED', 'unsupported reversal claim')
+              if guarded:
+                  require(o['sdk_outputs'].get('call-new')=='BLOCKED_UNKNOWN_FUNDS', 'late replacement was not blocked')
+                  require(o['ledger_count_before_old_release']==0, 'money committed before original release')
+                  require(o.get('gate_at_stop')=={'state':'UNKNOWN','available_cents':0,'reserved_cents':4000}, 'money not locked at STOPP')
+                  require(o.get('gate_final')=={'state':'PAID','available_cents':0,'reserved_cents':0}, 'after-commit reconciliation wrong')
+              else:
+                  require(o['sdk_outputs'].get('call-new')=='ORIGINAL_LEDGER_COMMITTED', 'ALT negative control was blocked')
+                  require(o['ledger_count_before_old_release']==1, 'ALT second payment not committed first')
+                  require(any(row['received_at']>t for row in rows), 'ALT second request did not follow STOPP')
+
+
+          def main():
+              data=json.loads(Path(sys.argv[1] if len(sys.argv)>1 else 'ATLAS_5416_HTTP_NATIVE_REPORT.json').read_text())
+              problems=[]
+              if data['original_sources']['original_git_blobs']!=EXPECTED:
+                  problems.append('original source identity mismatch')
+              cases=data.get('cases',[])
+              if len(cases)!=2:
+                  problems.append('expected exactly two cases')
+              else:
+                  if cases[0]['branch']!='ALT_ORIGINAL_SDK_AND_HTTP' or cases[1]['branch']!='FIX_APPLICATION_GATE':
+                      problems.append('unexpected case sequence')
+                  examine(cases[0],False,problems)
+                  examine(cases[1],True,problems)
+              verdict={'verdict':'PASS_SCOPED_CONSISTENCY' if not problems else 'FAIL',
+                       'checks':'source hashes, time ordering, original ledger effects, SDK tool outputs, reservation evidence',
+                       'first_model_reply':'NOT_TESTED',
+                       'independence_limit':'separate checker over same report, not independent bank witness',
+                       'problems':problems}
+              Path('ATLAS_5416_INDEPENDENT_VERDICT.json').write_text(json.dumps(verdict,indent=2)+'\n')
+              print(json.dumps(verdict))
+              if problems: sys.exit(1)
+
+          if __name__=='__main__':
+              main()
+          PYTHON
+          python -m py_compile atlas_5416_evidence_checker.py
+          python atlas_5416_evidence_checker.py ATLAS_5416_HTTP_NATIVE_REPORT.json 2>&1 | tee atlas_5416_checker.log
+      - name: Hash evidence even if previous step fails
+        if: always()
+        shell: bash
+        run: |
+          set -u
+          for f in atlas_5416_http_native.py ATLAS_5416_HTTP_NATIVE_REPORT.json atlas_5416_http_native.log atlas_5416_evidence_checker.py atlas_5416_checker.log ATLAS_5416_INDEPENDENT_VERDICT.json sdk_identity.txt stopbench_commit.txt; do
+            if test -f "$f"; then sha256sum "$f" >> SHA256SUMS.txt; fi
+          done
+          if test -f stopbench/ledger.py; then sha256sum stopbench/ledger.py stopbench/refund.py stopbench/requirements-realtime.lock.txt >> SHA256SUMS.txt; fi
+      - name: Upload evidence even after failed test
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: ATLAS-KOENIG-5416-ORIGINAL-HTTP
+          path: |
+            atlas_5416_http_native.py
+            ATLAS_5416_HTTP_NATIVE_REPORT.json
+            atlas_5416_http_native.log
+            atlas_5416_evidence_checker.py
+            atlas_5416_checker.log
+            ATLAS_5416_INDEPENDENT_VERDICT.json
+            sdk_identity.txt
+            stopbench_commit.txt
+            SHA256SUMS.txt
+          if-no-files-found: warn
