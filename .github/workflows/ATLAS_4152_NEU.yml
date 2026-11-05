@@ -1,0 +1,337 @@
+name: "ATLAS 4152 Phase C - default native late fills (one-shot)"
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  native-phase-c:
+    runs-on: ubuntu-latest
+    timeout-minutes: 55
+    steps:
+      - name: Checkout pinned unmodified NautilusTrader
+        uses: actions/checkout@v4
+        with:
+          repository: nautechsystems/nautilus_trader
+          ref: 6c843bc7f9f72941eeddb22df502b520c97a8987
+          path: original
+          persist-credentials: false
+
+      - name: Verify the original revision
+        shell: bash
+        run: |
+          set -euo pipefail
+          actual="$(git -C original rev-parse HEAD)"
+          expected="6c843bc7f9f72941eeddb22df502b520c97a8987"
+          test "$actual" = "$expected"
+          echo "ORIGINAL_COMMIT=$actual"
+
+      - name: Install pinned Rust and native dependencies
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.99.1
+
+      - name: Install native libraries
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y pkg-config libssl-dev libclang-dev
+
+      - name: Add only test cases - production source remains intact
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PYINJECT'
+          from pathlib import Path
+          import hashlib
+          path = Path('original/crates/live/src/execution/manager.rs')
+          src = path.read_text()
+          assert '#[cfg(test)]\nmod tests {' in src, 'Native test module absent'
+          assert 'test_atlas_4152_phase_c_original_default' not in src, 'Tests already added'
+          assert src.rstrip().endswith('}'), 'Unexpected end of Rust file'
+          tests = r'''    // ATLAS Phase C: test-only probes of the unchanged production manager.
+              // Uses original default values; no venue access, no trading credentials.
+              fn atlas_4152_two_fills_with_duplicates(
+                  manager: &mut ExecutionManager,
+                  order: &OrderAny,
+                  report: &OrderStatusReport,
+                  instrument: &InstrumentAny,
+              ) -> (OrderAny, usize, usize) {
+                  let fill_a = FillReport::new(
+                      report.account_id,
+                      report.instrument_id,
+                      report.venue_order_id,
+                      TradeId::from("ATLAS-C-A"),
+                      OrderSide::Buy,
+                      Quantity::from("4.0"),
+                      Price::from("100.0"),
+                      Money::from("0.25 USDT"),
+                      LiquiditySide::Taker,
+                      report.client_order_id,
+                      None,
+                      UnixNanos::from(10),
+                      UnixNanos::from(10),
+                      None,
+                  );
+                  let mut fill_b = fill_a.clone();
+                  fill_b.trade_id = TradeId::from("ATLAS-C-B");
+                  fill_b.last_qty = Quantity::from("3.0");
+                  fill_b.commission = Money::from("0.50 USDT");
+                  fill_b.ts_event = UnixNanos::from(20);
+                  fill_b.ts_init = UnixNanos::from(20);
+          
+                  let mut working = order.clone();
+                  let mut fill_queue = ReconciliationFillQueue::default();
+                  // Deliver A, duplicate A, B, duplicate B as separate reconciliation calls.
+                  // This tests the original fill-processing path, not a custom state machine.
+                  let delivery = [&fill_a, &fill_a, &fill_b, &fill_b];
+                  let mut emitted = 0usize;
+                  let mut unique_fills = 0usize;
+                  for (index, fill) in delivery.into_iter().enumerate() {
+                      let mut step_report = report.clone();
+                      step_report.filled_qty = if index < 2 {
+                          Quantity::from("4.0")
+                      } else {
+                          Quantity::from("7.0")
+                      };
+                      let events = manager.reconcile_order_with_fills(
+                          false, &working, &step_report, &[fill], Some(instrument),
+                          &mut fill_queue, None,
+                      );
+                      let fills_now = events.iter().filter(|event| matches!(event, OrderEventAny::Filled(_))).count();
+                      emitted += events.len();
+                      unique_fills += fills_now;
+                      println!(
+                          "ATLAS_C_DELIVERY index={} trade={} events={} fills={} before_qty={}",
+                          index, fill.trade_id, events.len(), fills_now, working.filled_qty(),
+                      );
+                      for event in events {
+                          if let Err(err) = working.apply(event.clone()) {
+                              panic!("ATLAS_4152_APPLY_FAILURE: {err}; event={event:?}");
+                          }
+                      }
+                      println!(
+                          "ATLAS_C_AFTER index={} status={:?} qty={} commission={:?}",
+                          index, working.status(), working.filled_qty(),
+                          working.commissions().get(&Currency::USDT()),
+                      );
+                  }
+                  let final_events = manager.reconcile_order_with_fills(
+                      true, &working, report, &[], Some(instrument),
+                      &mut fill_queue, None,
+                  );
+                  assert!(final_events.is_empty(),
+                          "ATLAS_4152_FINAL_RECONCILIATION_NONEMPTY: {final_events:?}");
+                  println!("ATLAS_C_FINAL_RECONCILIATION events=0");
+                  (working, emitted, unique_fills)
+              }
+          
+              #[tokio::test]
+              async fn test_atlas_4152_phase_c_original_default_pending_cancel() {
+                  atlas_4152_phase_c_pending(OrderStatus::PendingCancel).await;
+              }
+          
+              #[tokio::test]
+              async fn test_atlas_4152_phase_c_original_default_pending_update() {
+                  atlas_4152_phase_c_pending(OrderStatus::PendingUpdate).await;
+              }
+          
+              async fn atlas_4152_phase_c_pending(pending_status: OrderStatus) {
+                  let (mut manager, cache, order, mut report, instrument) = cached_commission_fixtures();
+                  assert_eq!(manager.config.inflight_threshold_ms, 5_000);
+                  assert_eq!(manager.config.inflight_max_retries, 5);
+                  let client_order_id = order.client_order_id();
+                  let venue_order_id = order.venue_order_id().expect("accepted order has venue id");
+                  let account_id = AccountId::from("TEST-001");
+                  let event = match pending_status {
+                      OrderStatus::PendingCancel => OrderEventAny::PendingCancel(
+                          OrderPendingCancelSpec::builder()
+                              .trader_id(order.trader_id())
+                              .strategy_id(order.strategy_id())
+                              .instrument_id(order.instrument_id())
+                              .client_order_id(client_order_id)
+                              .account_id(account_id)
+                              .venue_order_id(venue_order_id)
+                              .build(),
+                      ),
+                      OrderStatus::PendingUpdate => OrderEventAny::PendingUpdate(
+                          OrderPendingUpdateSpec::builder()
+                              .trader_id(order.trader_id())
+                              .strategy_id(order.strategy_id())
+                              .instrument_id(order.instrument_id())
+                              .client_order_id(client_order_id)
+                              .account_id(account_id)
+                              .venue_order_id(venue_order_id)
+                              .build(),
+                      ),
+                      _ => unreachable!(),
+                  };
+                  cache.borrow_mut().update_order(&event).expect("pending status applied");
+                  manager.register_inflight(client_order_id, UUID4::new());
+                  let mut synthetic_cancel = None;
+                  // Do not lower retry count or threshold. Sleep beyond the real threshold.
+                  for attempt in 1..=5 {
+                      dst::time::sleep(Duration::from_millis(5_150)).await;
+                      let result = manager.check_inflight_orders();
+                      println!(
+                          "ATLAS_C_DEFAULT attempt={} queries={} events={} tracked={}",
+                          attempt, result.queries.len(), result.events.len(),
+                          manager.order_inflight_checks.contains_key(&client_order_id),
+                      );
+                      if attempt < 5 {
+                          assert_eq!(result.events.len(), 0, "early terminal event");
+                      } else {
+                          assert_eq!(result.events.len(), 1, "expected original terminal event");
+                          let only = result.events.into_iter().next().unwrap();
+                          assert!(matches!(only, OrderEventAny::Canceled(_)), "original did not cancel");
+                          synthetic_cancel = Some(only);
+                      }
+                  }
+                  let canceled = synthetic_cancel.expect("original synthetic cancel observed");
+                  cache.borrow_mut().update_order(&canceled).expect("local synthetic cancel applied");
+                  let locally_canceled = cache.borrow().order_owned(&client_order_id).unwrap();
+                  assert_eq!(locally_canceled.status(), OrderStatus::Canceled);
+                  println!("ATLAS_C_LOCAL_CANCEL status={:?} qty={}", locally_canceled.status(), locally_canceled.filled_qty());
+          
+                  // Independent venue truth: two unique fills A and B, 7 units, 0.75 USDT fees.
+                  // The report represents actual venue truth, not the manager's synthetic terminal event.
+                  report.order_status = OrderStatus::PartiallyFilled;
+                  report.filled_qty = Quantity::from("7.0");
+                  report.avg_px = Some(dec!(100.0));
+                  println!("ATLAS_C_VENUE_TRUTH status={:?} qty=7.0 fees=0.75 USDT trades=A,B", report.order_status);
+          
+                  let (working, emitted, unique_fills) =
+                      atlas_4152_two_fills_with_duplicates(&mut manager, &locally_canceled, &report, &instrument);
+                  println!(
+                      "ATLAS_C_FINAL state={:?} qty={} events={} unique_fill_events={} fee={:?}",
+                      working.status(), working.filled_qty(), emitted, unique_fills,
+                      working.commissions().get(&Currency::USDT()),
+                  );
+                  assert_eq!(unique_fills, 2, "ATLAS_4152_MISSING_OR_DUPLICATE_FILL: expected exactly A and B once");
+                  assert_eq!(working.filled_qty(), Quantity::from("7.0"), "ATLAS_4152_LATE_FILL_LOST: venue 7.0 != local");
+                  assert_eq!(working.commissions().get(&Currency::USDT()), Some(&Money::from("0.75 USDT")),
+                             "ATLAS_4152_FEE_MISMATCH");
+                  assert_ne!(working.status(), OrderStatus::Canceled, "ATLAS_4152_FALSE_TERMINAL_PERSISTS");
+              }
+          
+              #[test]
+              fn test_atlas_4152_phase_c_positive_control_accepted_order() {
+                  let (mut manager, _cache, order, mut report, instrument) = cached_commission_fixtures();
+                  report.order_status = OrderStatus::PartiallyFilled;
+                  report.filled_qty = Quantity::from("7.0");
+                  report.avg_px = Some(dec!(100.0));
+                  let (working, _emitted, unique_fills) =
+                      atlas_4152_two_fills_with_duplicates(&mut manager, &order, &report, &instrument);
+                  println!("ATLAS_C_POSITIVE_CONTROL status={:?} qty={}", working.status(), working.filled_qty());
+                  assert_eq!(unique_fills, 2, "ATLAS_4152_POSITIVE_CONTROL_FAIL: wrong count");
+                  assert_eq!(working.filled_qty(), Quantity::from("7.0"), "ATLAS_4152_POSITIVE_CONTROL_FAIL: wrong qty");
+                  assert_eq!(working.commissions().get(&Currency::USDT()), Some(&Money::from("0.75 USDT")));
+              }
+          '''
+          src = src.rstrip()
+          path.write_text(src[:-1] + tests + '\n}\n')
+          print('ATLAS_TEST_ONLY_INJECTION_SHA256', hashlib.sha256(tests.encode()).hexdigest())
+          PYINJECT
+
+      - name: Verify test-only diff and exact default configuration
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd original
+          test "$(git diff --name-only)" = "crates/live/src/execution/manager.rs"
+          git diff --check
+          python3 - <<'PYVERIFY'
+          from pathlib import Path
+          src = Path('crates/live/src/execution/config.rs').read_text()
+          node = Path('crates/live/src/node/config.rs').read_text()
+          assert 'inflight_threshold_ms: 5_000' in src
+          assert 'inflight_max_retries: 5' in src
+          assert '#[builder(default = 2_000)]\n    pub inflight_check_interval_ms' in node
+          assert '#[builder(default = 5_000)]\n    pub inflight_check_threshold_ms' in node
+          assert '#[builder(default = 5)]\n    pub inflight_check_retries' in node
+          print('ORIGINAL_DEFAULT_CONFIG_PASS interval=2000 threshold=5000 retries=5')
+          PYVERIFY
+          sha256sum crates/live/src/execution/manager.rs > "$RUNNER_TEMP/atlas-4152-source.sha256"
+          git diff -- crates/live/src/execution/manager.rs > "$RUNNER_TEMP/atlas-4152-test-only.diff"
+
+      - name: Confirm baseline native tests on original code
+        shell: bash
+        working-directory: original
+        run: |
+          set -euo pipefail
+          cargo test -p nautilus-live --lib test_accepted_report_during_pending_command_preserves_inflight_tracking -- --nocapture > "$RUNNER_TEMP/baseline.log" 2>&1
+          cat "$RUNNER_TEMP/baseline.log"
+          grep -q 'test result: ok.*2 passed' "$RUNNER_TEMP/baseline.log"
+          echo 'BASELINE_PASS' 
+
+      - name: Mandatory positive control - A and B exactly once
+        shell: bash
+        working-directory: original
+        run: |
+          set -euo pipefail
+          cargo test -p nautilus-live --lib test_atlas_4152_phase_c_positive_control_accepted_order -- --nocapture --test-threads=1 > "$RUNNER_TEMP/positive.log" 2>&1 || {
+            cat "$RUNNER_TEMP/positive.log"
+            echo 'BLOCKED: positive control failed - do not classify any negative outcome'
+            exit 1
+          }
+          cat "$RUNNER_TEMP/positive.log"
+          grep -q 'test result: ok.*1 passed' "$RUNNER_TEMP/positive.log"
+          echo 'POSITIVE_CONTROL_PASS' 
+
+      - name: Original default pending cancel and update + late fill sequence
+        shell: bash
+        working-directory: original
+        run: |
+          set +e
+          cargo test -p nautilus-live --lib test_atlas_4152_phase_c_original_default -- --nocapture --test-threads=1 > "$RUNNER_TEMP/phase-c.log" 2>&1
+          rc=$?
+          set -e
+          cat "$RUNNER_TEMP/phase-c.log"
+          echo "NATIVE_TEST_EXIT=$rc"
+          if ! grep -q 'ATLAS_C_DEFAULT attempt=5' "$RUNNER_TEMP/phase-c.log"; then
+            echo 'BLOCKED: native default retry-exhaustion checkpoint not observed'
+            exit 1
+          fi
+          if ! grep -q 'ATLAS_C_VENUE_TRUTH' "$RUNNER_TEMP/phase-c.log"; then
+            echo 'BLOCKED: native venue-truth feed not reached'
+            exit 1
+          fi
+          if [[ "$rc" -eq 0 ]]; then
+            if grep -q 'test result: ok.*2 passed' "$RUNNER_TEMP/phase-c.log"; then
+              echo 'NO_VIOLATION_OBSERVED_IN_THIS_NATIVE_SCENARIO'
+            else
+              echo 'BLOCKED: successful process without two native test passes'
+              exit 1
+            fi
+          elif grep -Eq 'ATLAS_4152_LATE_FILL_LOST|ATLAS_4152_MISSING_OR_DUPLICATE_FILL|ATLAS_4152_FEE_MISMATCH|ATLAS_4152_FALSE_TERMINAL_PERSISTS' "$RUNNER_TEMP/phase-c.log"; then
+            echo 'CANDIDATE_NATIVE_CONTRACT_FAILURE: inspect the entire raw log, not a completed workflow status'
+          else
+            echo 'BLOCKED: unexpected assertion failure, runtime failure or compilation failure'
+            exit 1
+          fi
+
+      - name: Hash and upload raw evidence
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          for f in "$RUNNER_TEMP"/baseline.log "$RUNNER_TEMP"/positive.log "$RUNNER_TEMP"/phase-c.log "$RUNNER_TEMP"/atlas-4152-test-only.diff; do
+            if [[ -f "$f" ]]; then sha256sum "$f"; fi
+          done > "$RUNNER_TEMP/SHA256SUMS.txt"
+          cat "$RUNNER_TEMP/SHA256SUMS.txt"
+
+      - name: Upload evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ATLAS-4152-Phase-C-default-native-evidence
+          if-no-files-found: warn
+          path: |
+            ${{ runner.temp }}/baseline.log
+            ${{ runner.temp }}/positive.log
+            ${{ runner.temp }}/phase-c.log
+            ${{ runner.temp }}/SHA256SUMS.txt
+            ${{ runner.temp }}/atlas-4152-test-only.diff
+            ${{ runner.temp }}/atlas-4152-source.sha256
