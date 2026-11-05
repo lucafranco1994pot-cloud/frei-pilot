@@ -1,0 +1,312 @@
+name: ATLAS Gainium 221 V3 - Original ALT FIX plus two FIX neighbors
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/ATLAS_GAINIUM_221_V3_VERIFIZIERT.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  gainium-221:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      ALT: 20f604b43a61de5e74d4cea6fe4964efa6775edf
+      FIX: 35173c4bb92c3a217e132ae3071e0ea62d9797fb
+      HARNESS: src/bot/dca/writtenOffLevelId.harness.spec.ts
+      CI: 'true'
+      HUSKY: '0'
+      NODE_ENV: testing
+      TS_NODE_TRANSPILE_ONLY: 'true'
+    steps:
+      - name: Checkout manufacturer ALT
+        uses: actions/checkout@v4
+        with:
+          repository: Gainium/main-app-sh
+          ref: 20f604b43a61de5e74d4cea6fe4964efa6775edf
+          path: gainium/ALT
+          persist-credentials: false
+
+      - name: Checkout manufacturer FIX
+        uses: actions/checkout@v4
+        with:
+          repository: Gainium/main-app-sh
+          ref: 35173c4bb92c3a217e132ae3071e0ea62d9797fb
+          path: gainium/FIX
+          persist-credentials: false
+
+      - name: Node 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Freeze manufacturer identity and test hashes
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p evidence
+          test "$(git -C gainium/ALT rev-parse HEAD)" = "$ALT"
+          test "$(git -C gainium/FIX rev-parse HEAD)" = "$FIX"
+          test ! -e "gainium/ALT/$HARNESS"
+          cp "gainium/FIX/$HARNESS" "gainium/ALT/$HARNESS"
+          cmp "gainium/ALT/$HARNESS" "gainium/FIX/$HARNESS"
+          sha256sum "gainium/ALT/$HARNESS" "gainium/FIX/$HARNESS" > evidence/original-harness.sha256
+          printf 'ALT=%s\nFIX=%s\n' "$ALT" "$FIX" > evidence/versions.txt
+          node --version >> evidence/versions.txt
+          npm --version >> evidence/versions.txt
+          test "$(git -C gainium/ALT status --porcelain | wc -l)" -eq 1
+          test -z "$(git -C gainium/FIX status --porcelain)"
+
+      - name: Install both original products and run exact manufacturer harness on ALT and FIX
+        shell: bash
+        run: |
+          # Preserve ALT's expected red rather than stopping the next version.
+          set +e
+          set -uo pipefail
+          mkdir -p evidence
+          git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
+          for label in ALT FIX; do
+            (cd "gainium/$label" && timeout 12m npm install --legacy-peer-deps --no-audit --no-fund) \
+              > "evidence/${label}.install.stdout" 2> "evidence/${label}.install.stderr"
+            irc=$?
+            echo "$irc" > "evidence/${label}.install.rc"
+            if [ "$irc" -eq 0 ]; then
+              (cd "gainium/$label" && timeout 5m env TS_NODE_TRANSPILE_ONLY=true NODE_ENV=testing NODE_NO_WARNINGS=1 \
+                ./node_modules/.bin/mocha --timeout 20000 --exit -r ts-node/register/transpile-only \
+                --extension ts --reporter json "$HARNESS") \
+                > "evidence/${label}.native.json" 2> "evidence/${label}.native.stderr"
+              trc=$?
+            else
+              printf 'NOT EXECUTED: dependency installation failed\n' > "evidence/${label}.native.json"
+              trc=125
+            fi
+            echo "$trc" > "evidence/${label}.native.rc"
+            git -C "gainium/$label" diff -- package.json package-lock.json > "evidence/${label}.dependencies.diff"
+            echo "NATIVE $label install=$irc test=$trc"
+          done
+
+      - name: Inject two separately labeled ATLAS probes into FIX-only harness
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path('gainium/FIX/src/bot/dca/writtenOffLevelId.harness.spec.ts')
+          s = p.read_text()
+          assert s.rstrip().endswith('})'), 'Original describe block shape changed'
+          assert 'ATLAS-N1' not in s and 'ATLAS-N2' not in s
+          extra = r'''
+
+            it('ATLAS-N1 diagnostic: lost venue acknowledgement followed by memory-only reload', async () => {
+              // Deliberately excludes startup venue reconciliation. The result
+              // is a bounded diagnostic, NOT proof of real restart behavior.
+              store.clear()
+              const refusedBot = makeMainBot(refused)
+              await refusedBot.sendOrderToExchange(makeOrder(REFUSED_ID))
+              expect(refusedBot.isWrittenOffClientOrderId?.(REFUSED_ID)).to.equal(true)
+
+              const venue = new Map<string, any>()
+              const worker = buildDcaBot([REFUSED_ID])
+              const submitted: string[] = []
+              worker.sendGridToExchange = async (grid: any) => {
+                const id = grid.newClientOrderId
+                submitted.push(id)
+                venue.set(id, row(id, 'NEW'))   // venue accepted
+                return null                       // acknowledgement was lost
+              }
+              const firstGrid = level()
+              let firstError = ''
+              try {
+                await worker.placeOrdersHoldingDealLock(BOT_ID, SYMBOL, DEAL_ID,
+                  { new: [firstGrid], cancel: [] })
+              } catch (e: any) {
+                firstError = String(e?.message ?? e)
+              }
+              expect(submitted).to.have.length(1)
+              expect(submitted[0]).to.not.equal(REFUSED_ID)
+              expect(venue.size).to.equal(1)
+
+              // Reload a NEW helper from the DB's active rows only. There are
+              // none after the lost reply; a full app boot/reconciliation is
+              // purposefully NOT included in this harness.
+              const reloaded = buildDcaBot([])
+              const reloadedId = 'D-RO-after-reload0000000000000001'
+              reloaded.sendGridToExchange = async (grid: any) => {
+                venue.set(grid.newClientOrderId, row(grid.newClientOrderId, 'NEW'))
+                return row(grid.newClientOrderId, 'NEW')
+              }
+              await reloaded.placeOrdersHoldingDealLock(BOT_ID, SYMBOL, DEAL_ID,
+                { new: [level(reloadedId)], cancel: [] })
+              const samePrice = [...venue.values()].filter(
+                (o: any) => o.price === '0.017608' && o.status === 'NEW')
+              console.log('ATLAS_N1_OBSERVATION=' + JSON.stringify({
+                fixture: 'NO_STARTUP_RECONCILIATION',
+                priorAckLost: true,
+                firstCallError: firstError,
+                venueOrderIds: [...venue.keys()],
+                samePriceCount: samePrice.length,
+                productionVerdict: 'UNKNOWN',
+              }))
+              // Validate ONLY the deliberately limited fixture, not product
+              // protection. A full startup order-recovery path must be run
+              // before any security or production finding is made.
+              expect(samePrice.length).to.equal(2)
+            })
+
+            it('ATLAS-N2: two real venue write-offs then acceptance, with reloaded active row', async () => {
+              store.clear()
+              const venue = new Map<string, any>()
+              const bot = buildDcaBot([REFUSED_ID])
+              const ids: string[] = []
+              let refusals = 0
+              bot.sendGridToExchange = async (grid: any) => {
+                const id = grid.newClientOrderId
+                ids.push(id)
+                if (refusals < 2) {
+                  // Real MainBot write-off exercised for BOTH refused ids.
+                  const mainBot = makeMainBot(refused)
+                  await mainBot.sendOrderToExchange(makeOrder(id))
+                  expect(mainBot.venueCalls).to.have.length(1)
+                  expect(mainBot.isWrittenOffClientOrderId?.(id)).to.equal(true)
+                  bot.noteWrittenOffClientOrderId(id)
+                  refusals++
+                  return null
+                }
+                const accepted = row(id, 'NEW')
+                venue.set(id, accepted)
+                bot.orders.set(id, accepted)
+                return accepted
+              }
+              const grid = level()
+              for (let i = 0; i < 3; i++) {
+                await bot.placeOrdersHoldingDealLock(BOT_ID, SYMBOL, DEAL_ID,
+                  { new: [grid], cancel: [] })
+              }
+              expect(ids, 'three venue requests').to.have.length(3)
+              expect(new Set(ids).size, 'fresh id after each refusal').to.equal(3)
+              expect(venue.size, 'one accepted venue order').to.equal(1)
+              const acceptedId = ids[2]
+              expect(grid.newClientOrderId).to.equal(acceptedId)
+
+              // Simulate reload of the successfully persisted active NEW row;
+              // order-reconciliation and process boot are not instrumented.
+              const reloaded = buildDcaBot([])
+              reloaded.orders.set(acceptedId, row(acceptedId, 'NEW'))
+              reloaded.sendGridToExchange = async (next: any) => {
+                venue.set(next.newClientOrderId, row(next.newClientOrderId, 'NEW'))
+                return row(next.newClientOrderId, 'NEW')
+              }
+              await reloaded.placeOrdersHoldingDealLock(BOT_ID, SYMBOL, DEAL_ID,
+                { new: [level(acceptedId)], cancel: [] })
+              console.log('ATLAS_N2_OBSERVATION=' + JSON.stringify({
+                refused: refusals, venueOrderIds: [...venue.keys()],
+                submittedIds: ids, finalSamePriceCount: venue.size,
+                reloadedActiveRow: true, productionRestartTested: false,
+              }))
+              expect(venue.size, 'no duplicate after represented reload').to.equal(1)
+            })
+          '''
+          s = s.rstrip()[:-2] + extra + '\n})\n'
+          p.write_text(s)
+          PY
+          git -C gainium/FIX diff -- "$HARNESS" > evidence/ATLAS-only-injection.diff
+          sha256sum "gainium/FIX/$HARNESS" > evidence/extended-harness.sha256
+
+      - name: Run both FIX-only probes independently and retain raw observations
+        shell: bash
+        run: |
+          set +e
+          set -uo pipefail
+          for pair in 'N1 ATLAS-N1' 'N2 ATLAS-N2'; do
+            set -- $pair
+            key="$1"
+            pat="$2"
+            (cd gainium/FIX && timeout 5m env TS_NODE_TRANSPILE_ONLY=true NODE_ENV=testing NODE_NO_WARNINGS=1 \
+              ./node_modules/.bin/mocha --timeout 20000 --exit -r ts-node/register/transpile-only \
+              --extension ts --reporter json --grep "$pat" "$HARNESS") \
+              > "evidence/${key}.probe.json" 2> "evidence/${key}.probe.stderr"
+            echo "$?" > "evidence/${key}.probe.rc"
+            echo "ATLAS PROBE $key exit=$(cat evidence/${key}.probe.rc)"
+            tail -n 12 "evidence/${key}.probe.stderr" || true
+          done
+
+      - name: Conservative semantic verdict (native proof vs bounded probes)
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p evidence
+          python3 - <<'PY'
+          import json, os
+          from pathlib import Path
+          E=Path('evidence')
+          def rc(name):
+            try: return int((E/name).read_text().strip())
+            except Exception: return None
+          def report(name):
+            try: src=(E/name).read_text()
+            except Exception: return None
+            dec=json.JSONDecoder()
+            for i,ch in enumerate(src):
+              if ch!='{': continue
+              try: v,_=dec.raw_decode(src[i:])
+              except Exception: continue
+              if isinstance(v,dict) and all(k in v for k in ('tests','passes','failures','pending','stats')): return v
+            return None
+          a,f=report('ALT.native.json'),report('FIX.native.json')
+          def case(t):
+            title=t.get('fullTitle') or t.get('title') or ''
+            return next((q for q in ('§4.1','§4.2','§4.3','§1.2') if q in title),'OTHER')
+          valid=set(('§4.1','§4.2','§4.3','§1.2'))
+          native='BLOCKED'
+          if a and f:
+            ok=(rc('ALT.install.rc')==0 and rc('FIX.install.rc')==0 and
+                rc('ALT.native.rc') not in (None,0) and rc('FIX.native.rc')==0 and
+                len(a['tests'])==len(f['tests'])==4 and
+                set(map(case,a['tests']))==set(map(case,f['tests']))==valid and
+                not a['pending'] and not f['pending'] and
+                len(f['passes'])==4 and not f['failures'] and
+                len(a['failures'])>=1 and
+                all(case(t) in ('§4.1','§4.2') and 'AssertionError' in
+                    (str(t.get('err',{}).get('name',''))+str(t.get('err',{}).get('stack','')))
+                    for t in a['failures']))
+            native='PASS' if ok else 'UNKNOWN'
+          def probe(label):
+            p=report(f'{label}.probe.json')
+            if p is None: return 'BLOCKED',[]
+            passed=(rc(f'{label}.probe.rc')==0 and len(p['tests'])==1 and
+                    len(p['passes'])==1 and not p['failures'] and not p['pending'])
+            return ('PASS' if passed else 'FAIL'), [x.get('fullTitle') for x in p['tests']]
+          n1,t1=probe('N1')
+          n2,t2=probe('N2')
+          outcome={
+            'native_manufacturer_alt_fix':native,
+            'n1_lost_response_no_startup_reconciliation':n1,
+            'n1_production_verdict':'UNKNOWN - fixture deliberately excludes the real startup/reconciliation path',
+            'n2_two_refusals_then_acceptance_reload':n2,
+            'n2_limit':'Real MainBot write-offs + real DCA placement loop; mocked venue, DB and reload, not actual process restart',
+            'n1_titles':t1,'n2_titles':t2,
+            'typecheck':'ts-node transpile-only; does NOT repair missing @gainium/indicators type exports',
+          }
+          (E/'VERDICT.json').write_text(json.dumps(outcome,ensure_ascii=False,indent=2))
+          print(json.dumps(outcome,ensure_ascii=False,indent=2))
+          with open(os.environ['GITHUB_STEP_SUMMARY'],'a') as f:
+            f.write(f"## ATLAS Gainium 221\n\nManufacturer ALT/FIX: **{native}**\n\n")
+            f.write(f"N1 narrow lost-ACK fixture: **{n1}**, real startup verdict **UNKNOWN**.\n\n")
+            f.write(f"N2 two refusals then accepted/reloaded row: **{n2}**.\n\n")
+            f.write('No real process restart, actual Coinbase venue or production MongoDB.\n')
+          if native != 'PASS' or n1!='PASS' or n2!='PASS': raise SystemExit(1)
+          PY
+
+      - name: Upload complete evidence even if blocked or red
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: atlas-gainium-221-v3-native-and-neighbors
+          path: evidence/
+          if-no-files-found: warn
+          retention-days: 30
