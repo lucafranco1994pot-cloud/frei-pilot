@@ -1,0 +1,223 @@
+name: ATLAS LANGGRAPH 5062 PARENT REDUCER PROBE
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - ".github/workflows/ATLAS_LANGGRAPH_5062_PARENT_REDUCER.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  parent-reducer:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - label: confirmed-2026-september
+            lg: "1.2.9"
+            prebuilt: "1.1.0"
+            core: "1.4.9"
+          - label: current-release-2026-11-05
+            lg: "1.2.20"
+            prebuilt: "1.1.1"
+            core: "1.7.3"
+    steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install pinned LangGraph packages
+        run: |
+          python -m pip install --disable-pip-version-check "langgraph==${{ matrix.lg }}" "langgraph-prebuilt==${{ matrix.prebuilt }}" "langchain-core==${{ matrix.core }}"
+      - name: Run original vs scoped candidate on compiled parent graph
+        shell: bash
+        run: |
+          cat > /tmp/atlas_5062_probe.py <<'ATLAS_PY'
+          """ATLAS #5062: independent, no-LLM compiled parent-graph acceptance probe.
+          
+          Source of problem and expected boundary: langgraph #5062 and duplicate #9072.
+          The candidate is a deliberately scoped experiment, not a production patch.
+          No external state-changing operations or network calls.
+          """
+          from __future__ import annotations
+          
+          import asyncio
+          import hashlib
+          import inspect
+          import json
+          import operator
+          import os
+          import sys
+          from collections import Counter
+          from dataclasses import replace
+          from pathlib import Path
+          from typing import Annotated
+          from typing_extensions import TypedDict
+          
+          os.environ["LANGSMITH_TRACING"] = "false"
+          os.environ["LANGCHAIN_TRACING_V2"] = "false"
+          
+          from langchain_core.messages import AIMessage, ToolMessage
+          from langchain_core.tools import InjectedToolCallId, tool
+          from langgraph.graph import END, START, StateGraph
+          from langgraph.graph.message import add_messages
+          from langgraph.prebuilt import ToolNode
+          from langgraph.types import Command, Send
+          
+          REDUCER_INPUTS: list[tuple[str, ...]] = []
+          
+          
+          def choose_longest(left: list[str], right: list[str]) -> list[str]:
+              """Intentionally NOT list concatenation; retain longest arriving batch."""
+              if right:
+                  REDUCER_INPUTS.append(tuple(right))
+              return right if len(right) > len(left) else left
+          
+          
+          class State(TypedDict):
+              messages: Annotated[list, add_messages]
+              total: Annotated[int, operator.add]
+              best: Annotated[list[str], choose_longest]
+              visited: Annotated[list[str], operator.add]
+          
+          
+          VALUES = {"alpha": (2, ["A"]), "beta": (3, ["B", "C"])}
+          
+          
+          def make_tool(name: str):
+              @tool(name, description=f"Offline transfer {name} to worker")
+              def handoff(tool_call_id: Annotated[str, InjectedToolCallId]) -> Command:
+                  amount, best = VALUES[name]
+                  return Command(
+                      graph=Command.PARENT,
+                      goto=[Send("worker", {"job": name})],
+                      update={
+                          "messages": [ToolMessage(content="transferred", name=name,
+                                                   tool_call_id=tool_call_id)],
+                          "total": amount,
+                          "best": list(best),
+                      },
+                  )
+              return handoff
+          
+          
+          class CandidateToolNode(ToolNode):
+              """Experimental two-write preservation, not asserted to be a complete fix."""
+              def _combine_tool_outputs(self, outputs, input_type):
+                  flat = []
+                  for item in outputs:
+                      flat.extend(item if isinstance(item, list) else [item])
+                  if not any(isinstance(x, Command) for x in flat):
+                      return flat if input_type == "list" else {self._messages_key: flat}
+                  combined = []
+                  parent = None
+                  for output in flat:
+                      if (isinstance(output, Command)
+                          and output.graph is Command.PARENT
+                          and isinstance(output.goto, list)
+                          and all(isinstance(s, Send) for s in output.goto)):
+                          if parent is None:
+                              parent = output  # do not discard first update
+                          else:
+                              # Keep the two values of a duplicate key as separate graph writes.
+                              if parent.update is None:
+                                  updates = output.update
+                              elif output.update is None:
+                                  updates = parent.update
+                              else:
+                                  updates = list(parent._update_as_tuples()) + list(output._update_as_tuples())
+                              parent = replace(parent, goto=parent.goto + output.goto, update=updates)
+                      elif isinstance(output, Command):
+                          combined.append(output)
+                      else:
+                          combined.append([output] if input_type == "list"
+                                          else {self._messages_key: [output]})
+                  if parent is not None:
+                      combined.append(parent)
+                  return combined
+          
+          
+          def execute_graph(kind: str, names: tuple[str, ...], asynchronous: bool):
+              REDUCER_INPUTS.clear()
+              node_class = CandidateToolNode if kind == "candidate" else ToolNode
+              tools = node_class([make_tool(n) for n in names], handle_tool_errors=False)
+          
+              child_graph = StateGraph(State)
+              child_graph.add_node("tools", tools)
+              child_graph.add_edge(START, "tools")
+              child_graph.add_edge("tools", END)
+              child = child_graph.compile()
+          
+              parent_graph = StateGraph(State)
+              parent_graph.add_node("child", child, destinations=("worker",))
+              parent_graph.add_node("worker", lambda s: {"visited": [s["job"]]})
+              parent_graph.add_edge(START, "child")
+              parent_graph.add_edge("worker", END)
+              parent = parent_graph.compile()
+              request = AIMessage(content="", tool_calls=[
+                  {"name": name, "args": {}, "id": "call-" + name, "type": "tool_call"}
+                  for name in names
+              ])
+              initial = {"messages": [request], "total": 0, "best": [], "visited": []}
+              config = {"recursion_limit": 12, "max_concurrency": 2}
+              result = (asyncio.run(parent.ainvoke(initial, config)) if asynchronous
+                        else parent.invoke(initial, config))
+              ids = [m.tool_call_id for m in result["messages"] if isinstance(m, ToolMessage)]
+              incoming = list(REDUCER_INPUTS)
+              expected = {"total": sum(VALUES[n][0] for n in names),
+                          "best": list(max((VALUES[n][1] for n in names), key=len)),
+                          "ids": ["call-" + n for n in names],
+                          "visited": sorted(names)}
+              actual = {"total": result["total"], "best": result["best"],
+                        "ids": ids, "visited": sorted(result["visited"])}
+              # Distinct updates must be observed as distinct incoming reducer operands.
+              reducer_ok = all(tuple(VALUES[n][1]) in incoming for n in names)
+              combined_batch_detected = len(names) > 1 and tuple(
+                  x for n in names for x in VALUES[n][1]) in incoming
+              preserved = (actual == expected and reducer_ok and not combined_batch_detected)
+              return {"variant": kind, "names": list(names), "api": "async" if asynchronous else "sync",
+                      "actual": actual, "expected": expected,
+                      "reducer_inputs": [list(x) for x in incoming],
+                      "reducer_received_both_separately": reducer_ok and not combined_batch_detected,
+                      "compiled_parent_preserved_all": preserved}
+          
+          
+          def main():
+              import importlib.metadata as meta
+              import langgraph.prebuilt.tool_node as module
+          
+              source = Path(inspect.getfile(module.ToolNode)).resolve()
+              print("SOURCE", source)
+              print("SOURCE_SHA256", hashlib.sha256(source.read_bytes()).hexdigest())
+              for package in ("langgraph", "langgraph-prebuilt", "langchain-core"):
+                  print("PACKAGE", package, meta.version(package))
+              rows = []
+              for kind in ("original", "candidate"):
+                  for names in (("alpha",), ("alpha", "beta"), ("beta", "alpha")):
+                      for async_mode in (False, True):
+                          row = execute_graph(kind, names, async_mode)
+                          rows.append(row)
+                          print("ATLAS_CASE", json.dumps(row, sort_keys=True), flush=True)
+              original = [r for r in rows if r["variant"] == "original"]
+              patched = [r for r in rows if r["variant"] == "candidate"]
+              # An already fixed baseline must NOT be misrepresented as red.
+              assert any(not r["compiled_parent_preserved_all"] for r in original), "ORIGINAL_NOT_RED: update fixture/version"
+              assert all(r["compiled_parent_preserved_all"] for r in patched), "CANDIDATE_NOT_GREEN: examine cases"
+              assert all(r["compiled_parent_preserved_all"] for r in original if len(r["names"]) == 1) is False, "Unexpected original single-handoff control"
+              print("ATLAS_RESULT BASELINE_RED_CANDIDATE_GREEN; compiled parent; two same-key updates; custom reducer; both Sends; sync+async")
+          
+          
+          if __name__ == "__main__":
+              main()
+          ATLAS_PY
+          python /tmp/atlas_5062_probe.py | tee atlas_5062_result.log
+      - name: Upload evidence log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: atlas-5062-parent-reducer-${{ matrix.label }}
+          path: atlas_5062_result.log
+          if-no-files-found: warn
