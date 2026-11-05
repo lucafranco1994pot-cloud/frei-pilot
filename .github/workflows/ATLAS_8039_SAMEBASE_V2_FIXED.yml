@@ -1,0 +1,159 @@
+name: ATLAS 8039 | SAME BASE v2 - corrected 20x3
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  compare:
+    name: compare (${{ matrix.variant }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - variant: baseline
+            patch: none
+          - variant: pr8055_samebase
+            patch: pr8055
+          - variant: fork_samebase
+            patch: fork
+    env:
+      BASE_SHA: 93307d6a427d7f15bcba3264f3774d07af7d7dca
+      PR_SHA: 1c2cf39b406f9207ab96b8ffca5e96abf75a4920
+      FORK_SHA: 0a74dca05bd324236d74e67f5d7c9a3ae6e83f57
+      VARIANT: ${{ matrix.variant }}
+      PATCH_KIND: ${{ matrix.patch }}
+      PIP_DISABLE_PIP_VERSION_CHECK: '1'
+    steps:
+      - name: Check out frozen ATLAS test harness
+        uses: actions/checkout@v4
+        with:
+          # This commit contains the original published workflow.
+          ref: 38599dbbd853d2bce3992c7102a1f3d66a91cd49
+          persist-credentials: false
+
+      - name: Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Run original 8039 test steps with one corrected output path
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install 'PyYAML==6.0.2'
+          python - <<'PY'
+          import hashlib
+          import os
+          from pathlib import Path
+          import subprocess
+          import sys
+          import yaml
+
+          path = Path('.github/workflows/ATLAS_8039_SAMEBASE_ISOLATED.yml')
+          original = path.read_text(encoding='utf-8')
+          before = 'repository=args.repository,output=str(destination.parent),trials=20,delay=0.12)'
+          after  = 'repository=args.repository,output=str(destination),trials=20,delay=0.12)'
+          if original.count(before) != 1 or original.count(after) != 0:
+              sys.exit('BLOCKED: Original 8039 workflow did not match frozen expected harness')
+          corrected = original.replace(before, after)
+          expected = (
+              'Fetch PR8055 HEAD and verify SAME parent base',
+              "Apply ONLY selected author's runtime patch (no edits to it)",
+              'Install actual monorepo code from the SAME base and selected patch',
+              'Create IDENTICAL integration test and 20x3 repeat harness',
+              'Run REAL 20x SIGKILL + 20x write exception + 20x control',
+          )
+          job = yaml.safe_load(corrected)['jobs']['compare']
+          scripts = {s['name']: s['run'] for s in job['steps'] if 'run' in s}
+          if not all(name in scripts for name in expected):
+              sys.exit('BLOCKED: Missing a required original test step')
+          proof = Path('proof') / os.environ['VARIANT']
+          proof.mkdir(parents=True, exist_ok=True)
+          (proof / 'harness_identity.txt').write_text(
+              'original_sha256=' + hashlib.sha256(original.encode()).hexdigest() + '\n'
+              + 'corrected_sha256=' + hashlib.sha256(corrected.encode()).hexdigest() + '\n'
+              + 'correction=' + before + ' -> ' + after + '\n', encoding='utf-8')
+          for i, name in enumerate(expected, 1):
+              print(f'ATLAS_STEP {i}/{len(expected)}: {name}', flush=True)
+              script = Path('.atlas_step.sh')
+              script.write_text(scripts[name], encoding='utf-8')
+              subprocess.run(['bash', '--noprofile', '--norc', '-e', '-o', 'pipefail', str(script.resolve())], check=True)
+          print('ATLAS_V2_COMPLETE', os.environ['VARIANT'], flush=True)
+          PY
+
+      - name: Generate proof checksums
+        if: always()
+        shell: bash
+        run: |
+          if [ -d "proof/$VARIANT" ]; then
+            (cd "proof/$VARIANT" && find . -type f ! -name SHA256SUMS.txt -print0 | sort -z | xargs -0 sha256sum > SHA256SUMS.txt)
+          fi
+
+      - name: Upload evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: atlas8039-v2-${{ matrix.variant }}
+          path: proof/${{ matrix.variant }}/
+          if-no-files-found: warn
+          retention-days: 21
+
+  report:
+    name: summarize all three variants
+    needs: compare
+    if: always()
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Download proof artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: atlas8039-v2-*
+          path: evidence
+
+      - name: Create result table without inventing missing tests
+        shell: bash
+        run: |
+          python - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+          variants = ['baseline', 'pr8055_samebase', 'fork_samebase']
+          rows = [
+              '| Variant | SIGKILL ×20 | Failed writes ×20 | Normal ×20 |',
+              '|---|---|---|---|',
+          ]
+          for name in variants:
+              folder = Path('evidence') / ('atlas8039-v2-' + name)
+              file = folder / 'suite20_results.json'
+              if not file.exists():
+                  row = [name, 'BLOCKED (no suite results)', 'BLOCKED', 'BLOCKED']
+              else:
+                  data = json.loads(file.read_text())
+                  crash = data['crash']
+                  wf = data['write_failure']
+                  ctl = data['control']
+                  row = [name,
+                         f"{crash['verdict']} ({crash['passing_trials']}/20 pass; {crash['duplicates']} duplicates)",
+                         f"{wf['verdict']} ({wf['passed']}/20 pass)",
+                         f"{ctl['verdict']} ({ctl['passed']}/20 pass)"]
+              rows.append('| ' + ' | '.join(row) + ' |')
+          table = '\n'.join(rows) + '\n'
+          print(table)
+          Path('ATLAS_8039_V2_RESULTS.md').write_text(table)
+          with open(os.environ['GITHUB_STEP_SUMMARY'], 'a') as f:
+              f.write(table)
+          PY
+
+      - name: Upload combined summary
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: atlas8039-v2-combined
+          path: ATLAS_8039_V2_RESULTS.md
+          if-no-files-found: warn
+          retention-days: 21
