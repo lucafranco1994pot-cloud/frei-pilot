@@ -1,0 +1,130 @@
+name: ATLAS CCXT 30876 MINCORE
+
+'on':
+  workflow_dispatch:
+  push:
+    paths:
+      - '.github/workflows/ATLAS_CCXT_30876_MINCORE.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install pinned real CCXT
+        run: python -m pip install 'ccxt==4.5.88'
+      - name: Test old vs 1-line vs on_error against installed implementation
+        shell: bash
+        run: |
+          cat > probe.py <<'PY'
+          import asyncio
+          import inspect
+          import json
+          import textwrap
+          import types
+          import ccxt
+          import ccxt.pro
+          from ccxt.async_support.base.ws.client import Client
+
+          OLD = '''        client.reject(error, messageHash)
+                  if client.error is None:
+                      client.error = error  # on_close must not treat this as a server disconnect
+                  asyncio.ensure_future(client.close())
+                  if self.clients.get(client.url) is client:
+                      del self.clients[client.url]
+          '''
+
+          def patch(ex, variant):
+              if variant == 'old':
+                  return
+              f = ex.load_order_book.__func__
+              original = textwrap.dedent(inspect.getsource(f))
+              assert original.count(OLD) == 1, 'SOURCE_DRIFT: pinned function has changed'
+              if variant == 'mincore':
+                  new = OLD.replace('        client.reject(error, messageHash)\n',
+                      '        client.reject(error, messageHash)\n        client.reject(error)  # notify remaining watchers\n', 1)
+              else:
+                  new = '        client.reject(error, messageHash)\n        client.on_error(error)\n'
+              ns = {}
+              exec(compile(original.replace(OLD, new, 1), '<CCXT installed + candidate>', 'exec'), f.__globals__, ns)
+              ex.load_order_book = types.MethodType(ns['load_order_book'], ex)
+
+          def result(f):
+              if f.cancelled():
+                  return 'CANCELLED'
+              if not f.done():
+                  return 'PENDING'
+              e = f.exception()  # consume error to avoid unobserved-future warnings
+              return type(e).__name__ if e else 'RESOLVED'
+
+          async def run_case(variant, successor):
+              ex = ccxt.pro.kucoinfutures()
+              url = 'wss://atlas.invalid/shared'
+              sym = 'A/USDT:USDT'
+              old = Client(url, None, ex.on_error, ex.on_close, ex.on_connected)
+              old.asyncio_loop = asyncio.get_running_loop()
+              ex.clients[url] = old
+              ex.orderbooks[sym] = ex.order_book({})
+              fa = old.future('orderbook:' + sym)
+              fb = old.future('orderbook:B/USDT:USDT')
+              close_count = 0
+              orig_close = old.close
+              async def close_probe(*args, **kw):
+                  nonlocal close_count
+                  close_count += 1
+                  return await orig_close(*args, **kw)
+              old.close = close_probe
+              newer = None
+              if successor != 'none':
+                  newer = Client(url, None, ex.on_error, ex.on_close, ex.on_connected)
+                  newer.asyncio_loop = asyncio.get_running_loop()
+                  if successor == 'errored':
+                      newer.error = ccxt.NetworkError('successor has an independent error')
+              async def snapshot_failure(*args, **kwargs):
+                  if newer:
+                      ex.clients[url] = newer
+                  raise ccxt.RateLimitExceeded('injected HTTP 429')
+              ex.fetch_rest_order_book_safe = snapshot_failure
+              patch(ex, variant)
+              try:
+                  await ex.load_order_book(old, 'orderbook:' + sym, sym)
+                  await asyncio.sleep(0.05)
+                  curr = ex.clients.get(url)
+                  actual = {
+                      'variant': variant,
+                      'successor': successor,
+                      'A': result(fa),
+                      'B': result(fb),
+                      'close_scheduled': close_count > 0,
+                      'registry': 'newer' if curr is newer and newer else 'old' if curr is old else 'none',
+                  }
+                  return actual
+              finally:
+                  await ex.close()
+
+          async def main():
+              assert ccxt.__version__ == '4.5.88', ccxt.__version__
+              results = []
+              for successor in ('none', 'healthy', 'errored'):
+                  for variant in ('old', 'on_error', 'mincore'):
+                      x = await run_case(variant, successor)
+                      results.append(x)
+                      print(json.dumps(x, sort_keys=True), flush=True)
+                      assert x['A'] == 'RateLimitExceeded', x
+                      assert x['close_scheduled'], x
+                      assert x['B'] == ('CANCELLED' if variant == 'old' else 'RateLimitExceeded'), x
+                      registry_expected = ('none' if successor == 'none' or
+                                           (variant == 'on_error' and successor == 'errored') else 'newer')
+                      assert x['registry'] == registry_expected, x
+              print('PASS: 9/9 expected A/B/C outcomes against installed CCXT 4.5.88', flush=True)
+              print('SCOPE: offline snapshot failure; mock socket; no RSS or live reconnect claim', flush=True)
+
+          asyncio.run(main())
+          PY
+          python probe.py
