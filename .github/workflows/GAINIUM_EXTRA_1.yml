@@ -1,0 +1,212 @@
+name: ATLAS Gainium 221 Neighbors 1 - Native Regression Checks
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/GAINIUM_EXTRA_1.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  neighbor-regression:
+    name: 32 native adjacent tests on ALT and FIX
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      ALT: 20f604b43a61de5e74d4cea6fe4964efa6775edf
+      FIX: 35173c4bb92c3a217e132ae3071e0ea62d9797fb
+      HUSKY: '0'
+      CI: 'true'
+      NODE_ENV: testing
+      TS_NODE_TRANSPILE_ONLY: 'true'
+
+    steps:
+      - name: Checkout manufacturer ALT
+        uses: actions/checkout@v4
+        with:
+          repository: Gainium/main-app-sh
+          ref: 20f604b43a61de5e74d4cea6fe4964efa6775edf
+          path: gainium/ALT
+          persist-credentials: false
+
+      - name: Checkout manufacturer FIX
+        uses: actions/checkout@v4
+        with:
+          repository: Gainium/main-app-sh
+          ref: 35173c4bb92c3a217e132ae3071e0ea62d9797fb
+          path: gainium/FIX
+          persist-credentials: false
+
+      - name: Node 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Verify identity and identical manufacturer test files
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p evidence
+          test "$(git -C gainium/ALT rev-parse HEAD)" = "$ALT"
+          test "$(git -C gainium/FIX rev-parse HEAD)" = "$FIX"
+          {
+            printf 'ALT=%s\nFIX=%s\n' "$ALT" "$FIX"
+            node --version
+            npm --version
+            echo 'Native tests are unmodified and byte-identical on ALT and FIX.'
+            echo 'Type-check bypass: ts-node/register/transpile-only (runtime assertions remain active).'
+          } > evidence/identity.txt
+          for spec in \
+            src/bot/restartDealBalanceCooldown.spec.ts \
+            src/bot/dca/spentLevelIdPlacement.harness.spec.ts \
+            src/bot/duplicateClientOrderId.spec.ts \
+            src/bot/cancelDuringPlacement.spec.ts; do
+            cmp "gainium/ALT/$spec" "gainium/FIX/$spec"
+            sha256sum "gainium/ALT/$spec" "gainium/FIX/$spec" >> evidence/native-specs.sha256
+          done
+          test -z "$(git -C gainium/ALT status --porcelain)"
+          test -z "$(git -C gainium/FIX status --porcelain)"
+
+      - name: Install once per version and run four suites on both
+        shell: bash
+        run: |
+          # Native test failures are results to classify, not a reason to skip the next suite.
+          set +e
+          set -uo pipefail
+          mkdir -p evidence
+          git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
+          for label in ALT FIX; do
+            (cd "gainium/$label" && timeout 12m npm install \
+              --legacy-peer-deps --no-audit --no-fund) \
+              > "evidence/${label}.install.stdout" 2> "evidence/${label}.install.stderr"
+            install_rc=$?
+            echo "$install_rc" > "evidence/${label}.install.exitcode"
+            echo "INSTALL $label: $install_rc"
+            git -C "gainium/$label" diff -- package.json package-lock.json \
+              > "evidence/${label}.dependency-diff.txt"
+            for key in restart level duplicate cancel; do
+              case "$key" in
+                restart) spec=src/bot/restartDealBalanceCooldown.spec.ts ;;
+                level) spec=src/bot/dca/spentLevelIdPlacement.harness.spec.ts ;;
+                duplicate) spec=src/bot/duplicateClientOrderId.spec.ts ;;
+                cancel) spec=src/bot/cancelDuringPlacement.spec.ts ;;
+              esac
+              if [ "$install_rc" -eq 0 ]; then
+                (cd "gainium/$label" && timeout 3m env \
+                  NODE_ENV=testing TS_NODE_TRANSPILE_ONLY=true NODE_NO_WARNINGS=1 \
+                  ./node_modules/.bin/mocha --timeout 20000 --exit \
+                  -r ts-node/register/transpile-only --extension ts \
+                  --reporter json "$spec") \
+                  > "evidence/${label}.${key}.stdout" \
+                  2> "evidence/${label}.${key}.stderr"
+                test_rc=$?
+              else
+                echo 'NOT_EXECUTED: installation failed' > "evidence/${label}.${key}.stdout"
+                : > "evidence/${label}.${key}.stderr"
+                test_rc=125
+              fi
+              echo "$test_rc" > "evidence/${label}.${key}.exitcode"
+              echo "TEST $label $key: $test_rc"
+              tail -n 12 "evidence/${label}.${key}.stderr" || true
+            done
+          done
+
+      - name: Classify each suite conservatively
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+          E = Path('evidence')
+          counts = {'restart':4, 'level':5, 'duplicate':12, 'cancel':11}
+          report = {
+            'purpose':'adjacent native regression protection for Coinbase fix 221',
+            'alt':'20f604b43a61de5e74d4cea6fe4964efa6775edf',
+            'fix':'35173c4bb92c3a217e132ae3071e0ea62d9797fb',
+            'expected_per_version':sum(counts.values()),
+            'typechecking':'bypassed for runtime test harness only',
+            'coverage_limits':[
+              'No full process restart plus persisted database recovery test',
+              'No lost venue response exactly after accepted placement test',
+              'No cleanup of already orphaned pre-fix venue orders',
+              'No live exchange transactions',
+            ],
+            'suites':{},
+          }
+          def rc(path):
+            try: return int(path.read_text().strip())
+            except Exception: return None
+          def mocha_result(path):
+            try: src=path.read_text(errors='replace')
+            except Exception: return None
+            decoder=json.JSONDecoder()
+            for n,c in enumerate(src):
+              if c!='{': continue
+              try: obj,_=decoder.raw_decode(src[n:])
+              except Exception: continue
+              if isinstance(obj,dict) and all(k in obj for k in
+                ('stats','tests','passes','failures','pending')):
+                return obj
+            return None
+          overall='PASS'
+          for key,expected in counts.items():
+            entry={'expected_count':expected,'by_version':{}}
+            for label in ('ALT','FIX'):
+              install=rc(E/f'{label}.install.exitcode')
+              result_rc=rc(E/f'{label}.{key}.exitcode')
+              doc=mocha_result(E/f'{label}.{key}.stdout')
+              item={'install_rc':install, 'test_rc':result_rc,
+                    'executed':len(doc['tests']) if doc else None,
+                    'passed':len(doc['passes']) if doc else None,
+                    'failed':len(doc['failures']) if doc else None,
+                    'pending':len(doc['pending']) if doc else None,
+                    'test_titles':[x.get('fullTitle') or x.get('title')
+                      for x in doc['tests']] if doc else []}
+              if install!=0 or doc is None:
+                item['verdict']='BLOCKED'
+              elif result_rc!=0 or doc['failures']:
+                item['verdict']='FAIL'
+              elif (len(doc['tests'])!=expected or
+                    len(doc['passes'])!=expected or doc['pending']):
+                item['verdict']='UNKNOWN'
+              else:
+                item['verdict']='PASS'
+              entry['by_version'][label]=item
+              if item['verdict']!='PASS' and overall=='PASS':
+                overall=item['verdict']
+              print(f'{label} {key}: {item["verdict"]}; '
+                f'{item["passed"]}/{expected} passing, '
+                f'{item["pending"]} pending; rc={result_rc}')
+            a=entry['by_version']['ALT']['test_titles']
+            f=entry['by_version']['FIX']['test_titles']
+            entry['identical_test_identities']=(a==f and len(a)==expected)
+            if not entry['identical_test_identities'] and overall=='PASS':
+              overall='UNKNOWN'
+            report['suites'][key]=entry
+          report['verdict']=overall
+          (E/'NEIGHBOR_VERDICT.json').write_text(
+            json.dumps(report,indent=2,ensure_ascii=False))
+          print(f'NEIGHBOR VERDICT={overall} | '
+            '32 defined tests x 2 commits; outcomes only as above')
+          with open(Path(__import__('os').environ['GITHUB_STEP_SUMMARY']),'a') as f:
+            f.write(f'## Gainium Coinbase 221: adjacent suites **{overall}**\n\n')
+            f.write('32 manufacturer tests per commit (64 total executions expected).\n\n')
+            f.write('These are existing regression checks, NOT the missing '
+                    'end-to-end restart / lost-response scenarios.\n')
+          if overall!='PASS':
+            raise SystemExit(1)
+          PY
+
+      - name: Upload evidence even on failed or blocked suites
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: gainium-221-neighbors-1-evidence
+          path: evidence/
+          if-no-files-found: warn
+          retention-days: 30
