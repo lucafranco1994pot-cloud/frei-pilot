@@ -1,0 +1,203 @@
+name: ATLAS 4152 Phase C - default config two fills overnight
+'on':
+  workflow_dispatch: {}
+permissions:
+  contents: read
+jobs:
+  phase-c:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+    - name: Checkout pinned upstream original
+      uses: actions/checkout@v4
+      with:
+        repository: nautechsystems/nautilus_trader
+        ref: 6c843bc7f9f72941eeddb22df502b520c97a8987
+        path: original
+        persist-credentials: false
+    - name: Verify original and baseline source
+      shell: bash
+      run: 'set -euo pipefail
+
+        sha="$(git -C original rev-parse HEAD)"
+
+        test "$sha" = ''6c843bc7f9f72941eeddb22df502b520c97a8987''
+
+        echo "ATLAS_C_ORIGINAL_SHA=$sha"
+
+        sha256sum original/crates/live/src/execution/manager.rs original/crates/live/tests/integration/manager.rs'
+    - name: Install pinned Rust and build prerequisites
+      uses: dtolnay/rust-toolchain@master
+      with:
+        toolchain: 1.99.1
+    - name: Install build packages
+      shell: bash
+      run: 'set -euo pipefail
+
+        sudo apt-get update
+
+        sudo apt-get install -y pkg-config libssl-dev libclang-dev'
+    - name: Initialize evidence files
+      shell: bash
+      run: 'set -euo pipefail
+
+        touch "$RUNNER_TEMP/atlas4152-baseline.log" "$RUNNER_TEMP/atlas4152-phase-c.log" "$RUNNER_TEMP/atlas4152-integrity.log"'
+    - name: Run neutral original pending baseline
+      shell: bash
+      working-directory: original
+      run: 'set -euo pipefail
+
+        cargo test -p nautilus-live --test integration test_inflight_pending_ -- --nocapture --test-threads=1 > "$RUNNER_TEMP/atlas4152-baseline.log"
+        2>&1 || { cat "$RUNNER_TEMP/atlas4152-baseline.log"; echo ''BLOCKED: upstream baseline failed''; exit 1; }
+
+        cat "$RUNNER_TEMP/atlas4152-baseline.log"
+
+        grep -Eq ''test result: ok\. 4 passed; 0 failed'' "$RUNNER_TEMP/atlas4152-baseline.log" || { echo ''BLOCKED: expected four original
+        baseline cases''; exit 1; }
+
+        echo ''ATLAS_C_ORIGINAL_BASELINE_PASS'''
+    - name: Append precisely one parameterized integration test
+      shell: bash
+      run: 'set -euo pipefail
+
+        python3 - <<''PY''
+
+        from pathlib import Path
+
+        p=Path(''original/crates/live/tests/integration/manager.rs'')
+
+        source=p.read_text()
+
+        assert ''test_atlas_4152_phase_c_default_late_two_fills'' not in source
+
+        assert ''fn test_inflight_pending_cancel_generates_canceled'' in source
+
+        assert ''fn test_reconcile_mass_status_deduplicates_fills'' in source
+
+        addition = ''\n\n// ATLAS-4152 Phase C - original engine/manager integration, no runtime fix.\n// Original policy can generate
+        synthetic cancel; do not assert early.\n#[rstest]\n#[case::pending_cancel(OrderStatus::PendingCancel)]\n#[case::pending_update(OrderStatus::PendingUpdate)]\n#[cfg_attr(not(all(feature
+        = "simulation", madsim)), tokio::test(start_paused = true))]\n#[cfg_attr(all(feature = "simulation", madsim), madsim::test)]\nasync
+        fn test_atlas_4152_phase_c_default_late_two_fills(#[case] pending: OrderStatus) {\n    let mut ctx = TestContext::new(); //
+        The pinned ORIGINAL manager defaults (5s, 5 retries).\n    let instrument = test_instrument();\n    let instrument_id = instrument.id();\n    let
+        client_order_id = ClientOrderId::from("ATLAS-C-O-1");\n    let venue_order_id = VenueOrderId::from("ATLAS-C-V-1");\n    let
+        expected_total = Quantity::from("1.0");\n    let expected_fee = Money::from("0.50 USDT");\n    ctx.add_instrument(instrument);\n    ctx.exec_engine.borrow_mut().register_oms_type(StrategyId::from("S-001"),
+        OmsType::Netting);\n    let order = match pending {\n        OrderStatus::PendingCancel => create_pending_cancel_order(\n            client_order_id.as_str(),
+        instrument_id, OrderSide::Buy,\n            "1.0", "3000.00", venue_order_id,\n        ),\n        OrderStatus::PendingUpdate
+        => create_pending_update_order(\n            client_order_id.as_str(), instrument_id, OrderSide::Buy,\n            "1.0", "3000.00",
+        venue_order_id,\n        ),\n        _ => unreachable!(),\n    };\n    ctx.add_order(order);\n    ctx.manager.register_inflight(client_order_id,
+        UUID4::new());\n\n    // Venue-side truth is modeled independently: A=0.4 and B=0.6 are distinct trades.\n    // They are withheld
+        until manager recovery is exhausted. This is not a full Lighter adapter run.\n    let a = FillReport::new(\n        test_account_id(),
+        instrument_id, venue_order_id, TradeId::from("ATLAS-C-FILL-A"),\n        OrderSide::Buy, Quantity::from("0.4"), Price::from("3000.00"),\n        Money::from("0.20
+        USDT"), LiquiditySide::Maker,\n        Some(client_order_id), None,\n        UnixNanos::from(1_000_000), UnixNanos::from(1_000_000),
+        None,\n    );\n    let b = FillReport::new(\n        test_account_id(), instrument_id, venue_order_id, TradeId::from("ATLAS-C-FILL-B"),\n        OrderSide::Buy,
+        Quantity::from("0.6"), Price::from("3000.00"),\n        Money::from("0.30 USDT"), LiquiditySide::Maker,\n        Some(client_order_id),
+        None,\n        UnixNanos::from(2_000_000), UnixNanos::from(2_000_000), None,\n    );\n\n    // 5 configured checks at >5s simulated
+        intervals: 4 queries then exhaustion.\n    let mut query_count = 0usize;\n    let mut terminal_events = Vec::new();\n    for
+        turn in 1..=5 {\n        ctx.advance_both(dst::time::Duration::from_millis(5_010)).await;\n        let result = ctx.manager.check_inflight_orders();\n        query_count
+        += result.queries.len();\n        println!("ATLAS_C_STEP pending={pending:?} phase=budget step={turn} queries={} terminals={}",
+        result.queries.len(), result.events.len());\n        terminal_events.extend(result.events);\n    }\n    let timeout_false_cancel
+        = terminal_events.iter().any(|e| matches!(e, OrderEventAny::Canceled(_)));\n    for event in &terminal_events {\n        //
+        Real unmodified engine consumes the manager\''s reconciliation event.\n        ctx.exec_engine.borrow_mut().process(event);\n    }\n    let
+        at_timeout = ctx.get_order(&client_order_id).expect("cache order still present at timeout");\n    let gate_proxy_closed = at_timeout.is_closed();\n    println!("ATLAS_C_STEP
+        pending={pending:?} phase=exhausted order_status={:?} gate_proxy_closed={} false_cancel={} query_count={}",\n        at_timeout.status(),
+        gate_proxy_closed, timeout_false_cancel, query_count);\n\n    // Independent observer: native cache state following each original
+        engine report ingestion.\n    let observe = |ctx: &TestContext, phase: &str| {\n        let cache = ctx.cache.borrow();\n        let
+        order = cache.order(&client_order_id).expect("order retained in cache");\n        let position = cache.position_id(&client_order_id).and_then(|id|
+        cache.position(id));\n        let pos_qty = position.map(|p| p.quantity);\n        let pos_fee = position.map(|p| format!("{:?}",
+        p.commissions()));\n        let order_fee = order.commissions().get(&Currency::USDT()).cloned();\n        println!("ATLAS_C_STEP
+        pending={pending:?} phase={phase} status={:?} order_qty={:?} pos_qty={pos_qty:?} trade_ids={} order_fee={order_fee:?} pos_fee={pos_fee:?}",\n            order.status(),
+        order.filled_qty(), order.trade_ids().len());\n        (order.status(), order.filled_qty(), pos_qty, order.trade_ids().len(),
+        order_fee, pos_fee)\n    };\n    let before = observe(&ctx, "before_fill");\n    let deliver = |ctx: &mut TestContext, fill:
+        &FillReport| {\n        ctx.manager.observe_execution_report(&ExecutionReport::Fill(fill.clone()));\n        ctx.exec_engine.borrow_mut().reconcile_fill_report(fill);\n    };\n    deliver(&mut
+        ctx, &a);\n    let after_a = observe(&ctx, "fill_a");\n    deliver(&mut ctx, &a);\n    let after_a_duplicate = observe(&ctx,
+        "fill_a_duplicate");\n    deliver(&mut ctx, &b);\n    let after_b = observe(&ctx, "fill_b");\n    deliver(&mut ctx, &b);\n    let
+        after_b_duplicate = observe(&ctx, "fill_b_duplicate");\n\n    ctx.advance_both(dst::time::Duration::from_millis(5_010)).await;\n    let
+        extra = ctx.manager.check_inflight_orders();\n    println!("ATLAS_C_STEP pending={pending:?} phase=after_reconciliation queries={}
+        terminal_count={}", extra.queries.len(), extra.events.len());\n    // Each result is derived from actual engine/cache state,
+        not just deliveries.\n    let false_qty = after_b.1 != expected_total;\n    let false_position = after_b.2 != Some(expected_total);\n    let
+        false_fee = after_b.4 != Some(expected_fee);\n    let repeated_a_effect = after_a != after_a_duplicate;\n    let repeated_b_effect
+        = after_b != after_b_duplicate;\n    let missed_second_fill = after_a.1 == after_b.1 || after_b.3 != 2;\n    let unbounded_polling
+        = query_count != 4 || !extra.queries.is_empty();\n    let late_terminal = !extra.events.is_empty();\n    // Explicitly NOT a
+        real strategy consumer; cannot infer an actual follow-up order.\n    println!("ATLAS_C_RESULT pending={pending:?} false_cancel={}
+        false_qty={} expected_qty={expected_total:?} actual_qty={:?} false_position={} expected_position={expected_total:?} actual_position={:?}
+        false_fee={} expected_fee={expected_fee:?} actual_fee={:?} duplicate_a_effect={} duplicate_b_effect={} missed_second_fill={}
+        unbounded_polling={} late_terminal={} gate_proxy_closed={} actual_strategy_release=UNKNOWN_NOT_TESTED before_fill={before:?}",\n        timeout_false_cancel,
+        false_qty, after_b.1, false_position, after_b.2,\n        false_fee, after_b.4, repeated_a_effect, repeated_b_effect,\n        missed_second_fill,
+        unbounded_polling, late_terminal, gate_proxy_closed);\n    // Failing the contract happens after ALL observations; original
+        failure is expected.\n    let violations = [\n        ("UNPROVEN_CANCEL", timeout_false_cancel),\n        ("WRONG_QTY", false_qty),\n        ("WRONG_POSITION",
+        false_position),\n        ("WRONG_FEE", false_fee),\n        ("DUPLICATE_A", repeated_a_effect),\n        ("DUPLICATE_B", repeated_b_effect),\n        ("SECOND_FILL_LOST",
+        missed_second_fill),\n        ("UNBOUNDED_POLLING", unbounded_polling),\n        ("LATE_TERMINAL", late_terminal),\n    ];\n    let
+        failed: Vec<&str> = violations.iter().filter(|(_, bad)| *bad).map(|(name, _)| *name).collect();\n    if failed.is_empty() {\n        println!("ATLAS_C_CONTRACT_PASS
+        pending={pending:?}");\n    } else {\n        panic!("ATLAS_C_CONTRACT_VIOLATIONS pending={pending:?}: {}", failed.join(","));\n    }\n}\n\n''
+
+        p.write_text(source+addition)
+
+        assert p.read_text()==source+addition
+
+        print(''ATLAS_C_APPEND_ONLY_TEST_CODE'')
+
+        PY'
+    - name: Verify append only - original production bytes unchanged
+      shell: bash
+      working-directory: original
+      run: 'set -euo pipefail
+
+        python3 - <<''PY'' > "$RUNNER_TEMP/atlas4152-integrity.log"
+
+        import subprocess, pathlib
+
+        path=''crates/live/tests/integration/manager.rs''
+
+        original=subprocess.check_output([''git'',''show'',''HEAD:''+path])
+
+        actual=pathlib.Path(path).read_bytes()
+
+        assert actual.startswith(original), ''Original tests overwritten or modified''
+
+        assert actual.count(b''test_atlas_4152_phase_c_default_late_two_fills'')==1
+
+        changed=subprocess.check_output([''git'',''diff'',''--name-only''], text=True).strip().splitlines()
+
+        assert changed==[path], f''unexpected modified paths: {changed}''
+
+        import hashlib
+
+        print(''ATLAS_C_APPEND_ONLY_VERIFIED'')
+
+        print(''ORIGINAL_TEST_SHA256=''+hashlib.sha256(original).hexdigest())
+
+        print(''ORIGINAL_PRODUCTION_SHA256=''+hashlib.sha256(pathlib.Path(''crates/live/src/execution/manager.rs'').read_bytes()).hexdigest())
+
+        print(''TEST_APPEND_SHA256=''+hashlib.sha256(actual[len(original):]).hexdigest())
+
+        PY
+
+        cat "$RUNNER_TEMP/atlas4152-integrity.log"'
+    - name: Execute BOTH complete variants, classify results
+      shell: bash
+      working-directory: original
+      run: "set +e\ncargo test -p nautilus-live --test integration test_atlas_4152_phase_c_default_late_two_fills -- --nocapture --test-threads=1\
+        \ > \"$RUNNER_TEMP/atlas4152-phase-c.log\" 2>&1\nrc=$?\nset -e\ncat \"$RUNNER_TEMP/atlas4152-phase-c.log\"\npython3 - \"$RUNNER_TEMP/atlas4152-phase-c.log\"\
+        \ \"$rc\" <<'PY'\nfrom pathlib import Path\nimport re,sys\nlog=Path(sys.argv[1]).read_text(errors='replace')\nrc=int(sys.argv[2])\n\
+        cases=('PendingCancel','PendingUpdate')\nphases=('budget','exhausted','before_fill','fill_a','fill_a_duplicate','fill_b','fill_b_duplicate','after_reconciliation')\n\
+        valid=True\nfor case in cases:\n    found=re.search(r'ATLAS_C_RESULT pending='+case+r' (.*)$',log,re.M)\n    for phase in phases:\n\
+        \        n=len(re.findall(r'ATLAS_C_STEP pending='+case+r' phase='+phase+r'\\b',log,re.M))\n        expected=5 if phase=='budget'\
+        \ else 1\n        if n!=expected:\n            print(f'BLOCKED: {case} phase={phase} count={n} expected={expected}')\n     \
+        \       valid=False\n    if found:\n        print('ATLAS_C_SUMMARY '+case+' '+found.group(1))\n    else:\n        print('BLOCKED:\
+        \ missing independent phase summary for '+case)\n        valid=False\nif not valid:\n    print('ATLAS_C_STATUS=BLOCKED_INCOMPLETE_NOT_PROOF')\n\
+        \    sys.exit(1)\nif rc==0:\n    print('ATLAS_C_STATUS=ORIGINAL_CONTRACT_PASS_UNEXPECTED_REVIEW')\n    sys.exit(0)\nif len(re.findall(r'ATLAS_C_CONTRACT_VIOLATIONS\
+        \ pending=',log))!=2:\n    print('ATLAS_C_STATUS=BLOCKED_MISSING_FINAL_ASSERTIONS')\n    sys.exit(1)\nif not re.search(r'test\
+        \ result: FAILED\\. 0 passed; 2 failed',log):\n    print('ATLAS_C_STATUS=BLOCKED_UNEXPECTED_TEST_RESULT')\n    sys.exit(1)\n\
+        print('ATLAS_C_STATUS=COMPLETE_ORIGINAL_OBSERVATION_WITH_CONTRACT_VIOLATIONS')\nprint('NOTE: false release of an actual strategy\
+        \ cannot be inferred from gate proxy.')\nPY"
+    - name: Publish required evidence logs
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: ATLAS-4152-PHASE-C-OVERNIGHT-EVIDENCE
+        path: '${{ runner.temp }}/atlas4152-baseline.log
+
+          ${{ runner.temp }}/atlas4152-phase-c.log
+
+          ${{ runner.temp }}/atlas4152-integrity.log'
+        if-no-files-found: error
