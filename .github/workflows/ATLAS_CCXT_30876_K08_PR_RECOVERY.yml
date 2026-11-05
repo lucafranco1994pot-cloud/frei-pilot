@@ -1,0 +1,391 @@
+name: ATLAS CCXT 30876 K08 PR recovery
+
+'on':
+  workflow_dispatch:
+  push:
+    paths:
+      - '.github/workflows/ATLAS_CCXT_30876_K08_PR_RECOVERY.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  compare:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install pinned real CCXT and record dependencies
+        run: |
+          python -m pip install 'ccxt==4.5.88'
+          python -m pip freeze > k08_requirements_resolved.txt
+      - name: Execute source-anchored 12-cell matrix and local websocket recovery
+        shell: bash
+        run: |
+          cat > test_k08.py <<'ATLAS_K08_PYTHON'
+          #!/usr/bin/env python3
+          """ATLAS K08: CCXT Pro #30876. Offline failure + localhost WebSocket resume.
+          
+          Runs against INSTALLED ccxt==4.5.88. It does not use external exchange endpoints.
+          PR #30889 head pinned for provenance: 42b1063c667351cd1fb81296507fc049c8f0b83c.
+          The Python PR's executable delta is precisely client.close() schedule -> client.on_error(error),
+          retaining the original client identity guard. Test instruments that exact delta.
+          """
+          import asyncio
+          import hashlib
+          import inspect
+          import json
+          import os
+          import platform
+          import sys
+          import textwrap
+          import traceback
+          import types
+          from collections import Counter
+          from pathlib import Path
+          
+          import aiohttp
+          from aiohttp import web, WSMsgType
+          import ccxt
+          import ccxt.pro
+          from ccxt.async_support.base.ws.client import Client
+          
+          PINNED = '4.5.88'
+          PR = 'ccxt/ccxt#30889@42b1063c667351cd1fb81296507fc049c8f0b83c'
+          VARIANTS = ('original', 'simplified_on_error', 'pr30889_exact', 'atlas_one_line')
+          SUCCESSORS = ('none', 'healthy', 'already_errored')
+          SYMBOL_A = 'A/USDT:USDT'
+          SYMBOL_B = 'B/USDT:USDT'
+          OLD_BLOCK = '''        client.reject(error, messageHash)
+                  if client.error is None:
+                      client.error = error  # on_close must not treat this as a server disconnect
+                  asyncio.ensure_future(client.close())
+                  if self.clients.get(client.url) is client:
+                      del self.clients[client.url]
+          '''
+          
+          
+          def apply_variant(ex, variant):
+              """Modify only bound instance function from installed CCXT; no fake Exchange implementation."""
+              f = ex.load_order_book.__func__
+              src = inspect.getsource(f)
+              assert src.count(OLD_BLOCK) == 1, 'SOURCE_DRIFT: baseline no longer matches CCXT 4.5.88'
+              source_sha = hashlib.sha256(src.encode('utf-8')).hexdigest()
+              if variant == 'original':
+                  return source_sha, source_sha
+              if variant == 'atlas_one_line':
+                  old = '        client.reject(error, messageHash)\n'
+                  new = old + '        client.reject(error)  # ATLAS K08: reject remaining watchers before close\n'
+                  src = src.replace(old, new, 1)
+              elif variant == 'simplified_on_error':
+                  src = src.replace(OLD_BLOCK,
+                                    '        client.reject(error, messageHash)\n        client.on_error(error)\n', 1)
+              elif variant == 'pr30889_exact':
+                  # Exact executable Python delta from PR #30889; the PR also adds comments.
+                  src = src.replace('        asyncio.ensure_future(client.close())\n',
+                                    '        client.on_error(error)\n', 1)
+              else:
+                  raise ValueError(variant)
+              ns = {}
+              exec(compile(textwrap.dedent(src), '<installed CCXT + ' + variant + '>', 'exec'), f.__globals__, ns)
+              ex.load_order_book = types.MethodType(ns['load_order_book'], ex)
+              return source_sha, hashlib.sha256(src.encode('utf-8')).hexdigest()
+          
+          
+          class FakeSocket:
+              """Only for the old client's teardown; recovery uses actual aiohttp WS."""
+              def __init__(self):
+                  self.closed = False
+                  self.closed_event = asyncio.Event()
+          
+              async def close(self):
+                  self.closed = True
+                  self.closed_event.set()
+          
+          
+          async def outcome(f):
+              try:
+                  return ('DATA', await f)
+              except asyncio.CancelledError:
+                  return ('CANCELLED', None)
+              except Exception as e:
+                  return (type(e).__name__, str(e))
+          
+          
+          async def create_failed_client(ex, url):
+              ex.open()
+              client = Client(url, None, ex.on_error, ex.on_close, ex.on_connected)
+              client.asyncio_loop = asyncio.get_running_loop()
+              client.connection = FakeSocket()
+              ex.clients[url] = client
+              ex.orderbooks[SYMBOL_A] = ex.order_book({})
+              return client
+          
+          
+          async def fire_failure(ex, old, successor=None):
+              async def snapshot(*args, **kwargs):
+                  if successor is not None:
+                      ex.clients[old.url] = successor
+                  raise ccxt.RateLimitExceeded('injected HTTP 429')
+              ex.fetch_rest_order_book_safe = snapshot
+              await asyncio.wait_for(ex.load_order_book(old, 'orderbook:' + SYMBOL_A, SYMBOL_A), 4)
+          
+          
+          async def case_matrix(variant, successor_state):
+              ex = ccxt.pro.kucoinfutures({'enableRateLimit': False})
+              url = 'ws://atlas.invalid/shared'
+              old = await create_failed_client(ex, url)
+              a = asyncio.create_task(outcome(old.future('orderbook:' + SYMBOL_A)))
+              b = asyncio.create_task(outcome(old.future('orderbook:' + SYMBOL_B)))
+              successor = None
+              if successor_state != 'none':
+                  successor = Client(url, None, ex.on_error, ex.on_close, ex.on_connected)
+                  successor.asyncio_loop = asyncio.get_running_loop()
+                  successor.connection = FakeSocket()
+                  if successor_state == 'already_errored':
+                      successor.error = ccxt.NetworkError('independent error on successor')
+              baseline_sha, variant_sha = apply_variant(ex, variant)
+              try:
+                  await fire_failure(ex, old, successor)
+                  a_result, b_result = await asyncio.wait_for(asyncio.gather(a, b), 4)
+                  await asyncio.wait_for(old.connection.closed_event.wait(), 4)
+                  current = ex.clients.get(url)
+                  registry = 'successor' if successor is not None and current is successor else ('old' if current is old else 'none')
+                  return {
+                      'variant': variant, 'successor': successor_state,
+                      'A': a_result[0], 'B': b_result[0],
+                      'old_socket_closed': old.connection.closed,
+                      'registry': registry,
+                      'source_sha256': baseline_sha,
+                      'variant_sha256': variant_sha,
+                  }
+              finally:
+                  # A/B should be consumed by outcome; do not swallow failures silently.
+                  if not a.done(): a.cancel()
+                  if not b.done(): b.cancel()
+                  await asyncio.wait_for(ex.close(), 6)
+          
+          
+          async def local_server():
+              subscriptions = []
+              frames = []
+              sockets = []
+          
+              async def handler(request):
+                  ws = web.WebSocketResponse()
+                  await ws.prepare(request)
+                  sockets.append(ws)
+                  async for msg in ws:
+                      if msg.type == WSMsgType.TEXT:
+                          data = json.loads(msg.data)
+                          if data.get('op') != 'subscribe':
+                              continue
+                          symbol = data['symbol']
+                          subscriptions.append(symbol)
+                          # Fresh test data arrive as real websocket frames, not client.resolve() calls.
+                          book = {'symbol': symbol, 'bid': [[101, 2]], 'ask': [[102, 3]], 'seq': 41}
+                          frame = {'kind': 'orderbook', 'symbol': symbol, 'book': book}
+                          frames.append(frame)
+                          await ws.send_json(frame)
+                  return ws
+          
+              app = web.Application()
+              app.router.add_get('/books', handler)
+              runner = web.AppRunner(app)
+              await runner.setup()
+              site = web.TCPSite(runner, '127.0.0.1', 0)
+              await site.start()
+              url = 'ws://127.0.0.1:' + str(site._server.sockets[0].getsockname()[1]) + '/books'
+              return runner, url, subscriptions, frames, sockets
+          
+          
+          def clean_report(E):
+              return {k: ('PASS' if bool(v) else 'FAIL') for k, v in E.items()}
+          
+          
+          async def resume_variant(variant):
+              """Three real awaiters on old Client; only catchable outcomes trigger resubscribe.
+          
+              Fresh subscriptions use installed Exchange.watch -> Client.send -> aiohttp socket ->
+              local aiohttp server -> Client.receive_loop -> patched handle_message -> Client.resolve.
+              Exchange-specific KuCoin message decoding is intentionally not claimed.
+              """
+              runner, url, subs, frames, sockets = await local_server()
+              ex = ccxt.pro.kucoinfutures({'enableRateLimit': False})
+              received = []
+              fresh_futures = {}
+          
+              def handle_message(client, msg):
+                  if isinstance(msg, dict) and msg.get('kind') == 'orderbook':
+                      received.append(msg)
+                      client.resolve(msg['book'], 'orderbook:' + msg['symbol'])
+          
+              # Must be set before the *new* client is constructed (callback capture).
+              ex.handle_message = handle_message
+              old = await create_failed_client(ex, url)
+              old_b_future = old.future('orderbook:' + SYMBOL_B)
+              prior = {
+                  'A': asyncio.create_task(outcome(old.future('orderbook:' + SYMBOL_A))),
+                  'B': asyncio.create_task(outcome(old_b_future)),
+                  'C': asyncio.create_task(outcome(old_b_future)),
+              }
+              apply_variant(ex, variant)
+              E = {key: False for key in ['E1', 'E2', 'E3', 'E4', 'E5', 'E6']}
+              observed = {}
+              try:
+                  await fire_failure(ex, old)
+                  before = await asyncio.wait_for(asyncio.gather(*prior.values()), 4)
+                  result = dict(zip(prior.keys(), before))
+                  observed['initial'] = {k: val[0] for k, val in result.items()}
+                  E['E1'] = all(val[0] == 'RateLimitExceeded' for val in result.values())
+                  await asyncio.wait_for(old.connection.closed_event.wait(), 4)
+                  E['E2'] = old.connection.closed
+          
+                  async def subscribe_after_error(name, symbol):
+                      previous = result[name]
+                      # Typical real application: CancelledError signals caller shutdown;
+                      # catchable Exception permits retry. Do NOT silently recover cancellation.
+                      if previous[0] == 'CANCELLED':
+                          return ('NO_RETRY', None)
+                      message_hash = 'orderbook:' + symbol
+                      future = ex.watch(url, message_hash,
+                                        {'op': 'subscribe', 'symbol': symbol},
+                                        subscribe_hash=message_hash)
+                      fresh_futures[name] = future
+                      return await outcome(future)
+          
+                  # These three tasks start together on the same event loop; B/C target same hash.
+                  tasks = {
+                      'A': asyncio.create_task(subscribe_after_error('A', SYMBOL_A)),
+                      'B': asyncio.create_task(subscribe_after_error('B', SYMBOL_B)),
+                      'C': asyncio.create_task(subscribe_after_error('C', SYMBOL_B)),
+                  }
+                  renewed = await asyncio.wait_for(asyncio.gather(*tasks.values()), 8)
+                  post = dict(zip(tasks.keys(), renewed))
+                  observed['post'] = {k: val[0] for k, val in post.items()}
+                  observed['subscriptions'] = dict(Counter(subs))
+                  observed['received_frames'] = len(received)
+                  count = Counter(subs)
+                  E['E3'] = (count[SYMBOL_B] == 1 and count[SYMBOL_A] == 1 and
+                             sum(count.values()) == 2 and
+                             fresh_futures.get('B') is not None and
+                             fresh_futures.get('B') is fresh_futures.get('C'))
+                  expected_a = {'symbol': SYMBOL_A, 'bid': [[101, 2]], 'ask': [[102, 3]], 'seq': 41}
+                  expected_b = {'symbol': SYMBOL_B, 'bid': [[101, 2]], 'ask': [[102, 3]], 'seq': 41}
+                  E['E4'] = (post['B'] == ('DATA', expected_b) and
+                             post['C'] == ('DATA', expected_b) and count[SYMBOL_B] == 1)
+                  E['E5'] = post['A'] == ('DATA', expected_a)
+                  active = ex.clients.get(url)
+                  # Active socket remains alive; its pending future dictionary is empty.
+                  before_close_clean = (active is not None and active is not old and
+                                        not active.closed() and not active.futures and
+                                        list(ex.clients.keys()) == [url])
+                  observed['new_client_active'] = bool(before_close_clean)
+                  await asyncio.wait_for(ex.close(), 6)
+                  E['E6'] = before_close_clean and (not ex.clients)
+                  return {'variant': variant, 'E': clean_report(E), 'observed': observed}
+              finally:
+                  for task in prior.values():
+                      if not task.done():
+                          task.cancel()
+                  try:
+                      await asyncio.wait_for(ex.close(), 6)
+                  finally:
+                      await runner.cleanup()
+          
+          
+          async def intentional_cancel_control():
+              from ccxt.async_support.base.ws.future import Future
+              f = Future()
+              async def wait():
+                  await f
+              task = asyncio.create_task(wait())
+              await asyncio.sleep(0)
+              task.cancel()
+              try:
+                  await task
+                  return False
+              except asyncio.CancelledError:
+                  return f.cancelled()
+          
+          
+          async def main():
+              assert ccxt.__version__ == PINNED, ('wrong CCXT version', ccxt.__version__)
+              result = {
+                  'case': 'ATLAS-CCXT-K08-30876', 'status': 'UNKNOWN',
+                  'ccxt': ccxt.__version__, 'python': platform.python_version(),
+                  'platform': platform.platform(), 'pr': PR,
+                  'github_sha': os.environ.get('GITHUB_SHA'), 'matrix': [], 'resume': [],
+              }
+              errors = []
+              try:
+                  for variant in VARIANTS:
+                      for successor in SUCCESSORS:
+                          try:
+                              row = await asyncio.wait_for(case_matrix(variant, successor), 8)
+                              result['matrix'].append(row)
+                              print('MATRIX', json.dumps(row, sort_keys=True), flush=True)
+                          except Exception as e:
+                              errors.append('matrix ' + variant + '/' + successor + ': ' + repr(e))
+                              print('ERROR matrix', variant, successor, repr(e), flush=True)
+                  for variant in VARIANTS:
+                      try:
+                          row = await asyncio.wait_for(resume_variant(variant), 15)
+                          result['resume'].append(row)
+                          print('RESUME', json.dumps(row, sort_keys=True), flush=True)
+                      except Exception as e:
+                          errors.append('resume ' + variant + ': ' + repr(e))
+                          print('ERROR resume', variant, repr(e), flush=True)
+                  result['intentional_task_cancel'] = await intentional_cancel_control()
+                  if not result['intentional_task_cancel']:
+                      errors.append('intentional cancellation control failed')
+                  # The original must be red on E1; this is our positive test sensitivity control.
+                  original = next((r for r in result['resume'] if r['variant'] == 'original'), None)
+                  if original is None or original['E']['E1'] != 'FAIL':
+                      errors.append('original did not reproduce E1 violation')
+                  atlas = next((r for r in result['resume'] if r['variant'] == 'atlas_one_line'), None)
+                  if atlas is None or any(v != 'PASS' for v in atlas['E'].values()):
+                      errors.append('ATLAS candidate did not satisfy all E1-E6')
+                  # It is okay if PR passes; we must report that fairly and not fail the workflow.
+              finally:
+                  result['errors'] = errors
+                  result['status'] = 'PASS' if not errors else 'FAIL'
+                  Path('k08_results.json').write_text(json.dumps(result, indent=2, sort_keys=True))
+                  cols = ['Variant', 'E1', 'E2', 'E3', 'E4', 'E5', 'E6']
+                  lines = ['# ATLAS K08 – CCXT #30876',
+                           '', 'PR (head at inspection): ' + PR,
+                           '', 'Scope: Installed CCXT Python base watch + real localhost aiohttp WS; exchange-specific KuCoin orderbook decoder not exercised.',
+                           '', '| ' + ' | '.join(cols) + ' |', '|' + '|'.join(['---']*len(cols)) + '|']
+                  for row in result['resume']:
+                      lines.append('| ' + ' | '.join([row['variant']] + [row['E'][x] for x in cols[1:]]) + ' |')
+                  lines.extend(['', 'E1 catchable errors for all three; E2 old socket closed; E3 exactly one subscribe per unique symbol; E4 B and C receive data; E5 A receives data; E6 registry/futures clean.',
+                                '', '## Matrix (12 variants × successor states)',
+                                '', '| Variant | Successor | A | B | Old socket closed | Registry |',
+                                '|---|---|---|---|---|---|'])
+                  for r in result['matrix']:
+                      lines.append('| ' + ' | '.join(str(r[k]) for k in ('variant','successor','A','B','old_socket_closed','registry')) + ' |')
+                  lines.extend(['', '## End state', '', result['status'], '', 'Errors: ' + (repr(errors) if errors else 'none'),
+                                '', 'Limitations: Local server has a synthetic orderbook message handler; does not establish true KuCoin snapshot orderbook correctness, live market data reliability, memory usage, or production suitability.'])
+                  Path('k08_results.md').write_text('\n'.join(lines) + '\n')
+                  print('FINAL', result['status'], 'errors=', errors, flush=True)
+              if errors:
+                  raise AssertionError('; '.join(errors))
+          
+          
+          if __name__ == '__main__':
+              asyncio.run(main())
+          ATLAS_K08_PYTHON
+          python test_k08.py
+      - name: Upload evidence even when a test fails
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ATLAS_CCXT_30876_K08_evidence
+          path: |
+            test_k08.py
+            k08_results.json
+            k08_results.md
+            k08_requirements_resolved.txt
+          if-no-files-found: warn
