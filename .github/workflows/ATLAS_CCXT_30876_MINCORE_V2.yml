@@ -5,6 +5,7 @@ name: ATLAS CCXT 30876 MINCORE V2
   push:
     paths:
       - '.github/workflows/ATLAS_CCXT_30876_MINCORE_V2.yml'
+      - 'tests/test_atlas_ccxt_30876_resubscribe.py'
 
 permissions:
   contents: read
@@ -137,3 +138,62 @@ jobs:
           asyncio.run(main())
           PY
           python probe.py
+
+  resubscribe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install pinned real CCXT
+        run: python -m pip install 'ccxt==4.5.88'
+      - name: Compare original and exact one-line fix
+        shell: bash
+        run: |
+          set +e
+          python tests/test_atlas_ccxt_30876_resubscribe.py --variant original
+          original_status=$?
+          python tests/test_atlas_ccxt_30876_resubscribe.py --variant one-line
+          fixed_status=$?
+          set -e
+          # A crash or setup failure cannot count as the expected original red.
+          python - <<'PY'
+          import json
+          from pathlib import Path
+          rows = [json.loads(Path('results', name + '.json').read_text())
+                  for name in ('original', 'one-line')]
+          assert all(set(row['expectations']) == {'E1', 'E2', 'E3', 'E4'} for row in rows)
+          assert rows[0]['expectations']['E1'] is False, rows[0]
+          print('ORIGINAL (recorded, not asserted):', rows[0]['expectations'], flush=True)
+          assert all(rows[1]['expectations'].values()), rows[1]
+          PY
+          test "$original_status" -eq 1
+          test "$fixed_status" -eq 0
+      - name: Publish expectation table and run link
+        if: always()
+        shell: bash
+        run: |
+          {
+            echo '## CCXT #30876: resubscribe after snapshot error'
+            echo '| Variant | E1 | E2 | E3 | E4 |'
+            echo '|---|---|---|---|---|'
+            for variant in original one-line; do
+              if [ -f "results/$variant.md" ]; then
+                cat "results/$variant.md"
+              else
+                echo "| $variant | NOT RUN | NOT RUN | NOT RUN | NOT RUN |"
+              fi
+            done
+            echo
+            echo "Run: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+            echo
+            echo 'Synthetic transport/book protocol; real CCXT watch/client lifecycle. No live exchange claim.'
+          } >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: atlas-ccxt-30876-resubscribe-results
+          path: results/
+          if-no-files-found: error
