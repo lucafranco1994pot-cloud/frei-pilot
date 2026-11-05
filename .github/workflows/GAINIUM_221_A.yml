@@ -1,0 +1,178 @@
+name: ATLAS Gainium Coinbase 221 V3 - Test A
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/GAINIUM_221_A.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  red-green:
+    name: Pinned manufacturer code – one identical native harness
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      ALT: 20f604b43a61de5e74d4cea6fe4964efa6775edf
+      FIX: 35173c4bb92c3a217e132ae3071e0ea62d9797fb
+      HARNESS: src/bot/dca/writtenOffLevelId.harness.spec.ts
+      CI: 'true'
+      HUSKY: '0'
+      NODE_ENV: testing
+      TS_NODE_TRANSPILE_ONLY: 'true'
+    steps:
+      - name: Get original manufacturer ALT
+        uses: actions/checkout@v4
+        with:
+          repository: Gainium/main-app-sh
+          ref: 20f604b43a61de5e74d4cea6fe4964efa6775edf
+          path: gainium/ALT
+          persist-credentials: false
+
+      - name: Get manufacturer FIX
+        uses: actions/checkout@v4
+        with:
+          repository: Gainium/main-app-sh
+          ref: 35173c4bb92c3a217e132ae3071e0ea62d9797fb
+          path: gainium/FIX
+          persist-credentials: false
+
+      - name: Node 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Pin commits and copy ONLY manufacturer test to ALT
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p evidence
+          test "$(git -C gainium/ALT rev-parse HEAD)" = "$ALT"
+          test "$(git -C gainium/FIX rev-parse HEAD)" = "$FIX"
+          test ! -e "gainium/ALT/$HARNESS"
+          cp "gainium/FIX/$HARNESS" "gainium/ALT/$HARNESS"
+          cmp "gainium/ALT/$HARNESS" "gainium/FIX/$HARNESS"
+          sha256sum "gainium/ALT/$HARNESS" "gainium/FIX/$HARNESS" > evidence/harness.sha256
+          printf 'ALT=%s\nFIX=%s\n' "$ALT" "$FIX" > evidence/versions.txt
+          node --version >> evidence/versions.txt
+          npm --version >> evidence/versions.txt
+          git -C gainium/ALT status --porcelain > evidence/ALT.before-install.status
+          git -C gainium/FIX status --porcelain > evidence/FIX.before-install.status
+          test "$(wc -l < evidence/ALT.before-install.status)" -eq 1
+          test ! -s evidence/FIX.before-install.status
+
+      - name: Install and run real Mocha harness – both commits
+        shell: bash
+        run: |
+          # GitHub wraps bash steps in -e. Expected ALT red MUST NOT abort FIX.
+          set +e
+          set -uo pipefail
+          mkdir -p evidence
+          git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
+          for label in ALT FIX; do
+            (cd "gainium/$label" && timeout 12m npm install --legacy-peer-deps --no-audit --no-fund) \
+              > "evidence/${label}.install.stdout" 2> "evidence/${label}.install.stderr"
+            install_rc=$?
+            printf '%s\n' "$install_rc" > "evidence/${label}.install.exitcode"
+            echo "INSTALL $label exit=$install_rc"
+            git -C "gainium/$label" status --porcelain > "evidence/${label}.after-install.status"
+            git -C "gainium/$label" diff -- package.json package-lock.json > "evidence/${label}.dependencies.diff"
+            if [ "$install_rc" -eq 0 ]; then
+              (cd "gainium/$label" && timeout 5m env \
+                TS_NODE_TRANSPILE_ONLY=true NODE_ENV=testing NODE_NO_WARNINGS=1 \
+                ./node_modules/.bin/mocha --timeout 20000 --exit \
+                -r ts-node/register/transpile-only --extension ts \
+                --reporter json "$HARNESS") \
+                > "evidence/${label}.test.stdout" 2> "evidence/${label}.test.stderr"
+              test_rc=$?
+            else
+              printf '%s\n' 'NOT EXECUTED: dependency installation failed' > "evidence/${label}.test.stdout"
+              : > "evidence/${label}.test.stderr"
+              test_rc=125
+            fi
+            echo "$test_rc" > "evidence/${label}.test.exitcode"
+            echo "TEST $label exit=$test_rc"
+            tail -n 30 "evidence/${label}.test.stderr" || true
+          done
+
+      - name: Classify actual behavioral RED / GREEN – never promote build failure
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p evidence
+          python3 - <<'PY'
+          import json, os
+          from pathlib import Path
+          E = Path('evidence')
+          def read_rc(name):
+              try: return int((E / name).read_text().strip())
+              except Exception: return None
+          def read_json(label):
+              try: raw=(E/f'{label}.test.stdout').read_text()
+              except Exception as exc: return None, str(exc)
+              dec=json.JSONDecoder()
+              for pos, char in enumerate(raw):
+                  if char != '{': continue
+                  try: obj, _=dec.raw_decode(raw[pos:])
+                  except Exception: continue
+                  if isinstance(obj,dict) and all(k in obj for k in ('tests','passes','failures','pending','stats')):
+                      return obj, ''
+              return None, 'No Mocha JSON reporter result (import / compilation / runtime failure)'
+          def case_id(t):
+              title=str(t.get('fullTitle') or t.get('title') or '')
+              return next((key for key in ('§4.1','§4.2','§4.3','§1.2') if key in title),'OTHER')
+          ai,fi=read_rc('ALT.install.exitcode'),read_rc('FIX.install.exitcode')
+          at,ft=read_rc('ALT.test.exitcode'),read_rc('FIX.test.exitcode')
+          a,aerr=read_json('ALT'); f,ferr=read_json('FIX')
+          verdict='BLOCKED'; reason='Missing or non-semantic test evidence'
+          expected={'§4.1','§4.2','§4.3','§1.2'}
+          if ai!=0 or fi!=0:
+              reason=f'Install failed: ALT={ai} FIX={fi}'
+          elif aerr or ferr:
+              reason=' | '.join(x for x in (aerr,ferr) if x)
+          elif not (len(a['tests'])==len(f['tests'])==4 and
+                    {case_id(t) for t in a['tests']}==expected and
+                    {case_id(t) for t in f['tests']}==expected and
+                    not a['pending'] and not f['pending']):
+              verdict='UNKNOWN';reason='Required four tests not executed symmetrically'
+          elif not (at!=0 and ft==0):
+              verdict='FAIL';reason=f'Unexpected process results ALT={at} FIX={ft}'
+          elif len(f['passes'])!=4 or f['failures']:
+              verdict='FAIL';reason='FIX did not pass all four original tests'
+          else:
+              failures=a['failures']
+              sem=[t for t in failures if case_id(t) in ('§4.1','§4.2') and
+                   'AssertionError' in (str(t.get('err',{}).get('name','')) + str(t.get('err',{}).get('stack','')))]
+              wrong=[t for t in failures if case_id(t) not in ('§4.1','§4.2')]
+              if sem and not wrong and all(case_id(t) in ('§4.3','§1.2') for t in a['passes']):
+                  verdict='PASS'; reason='Original ALT behavioral assertions RED, FIX four tests GREEN'
+              else:
+                  verdict='UNKNOWN';reason='ALT failure cannot be classified as expected functional regression'
+          evidence={
+              'verdict':verdict,'reason':reason,
+              'alt_commit':os.environ.get('ALT'),'fix_commit':os.environ.get('FIX'),
+              'alt_install_rc':ai,'fix_install_rc':fi,'alt_test_rc':at,'fix_test_rc':ft,
+              'alt_fail_cases':[case_id(t) for t in a['failures']] if a else [],
+              'fix_pass_cases':[case_id(t) for t in f['passes']] if f else [],
+              'neighbors':{'restart_during_inflight':'NOT_TESTED','lost_venue_response':'NOT_TESTED'}
+          }
+          (E/'verdict.json').write_text(json.dumps(evidence,indent=2))
+          print(json.dumps(evidence,indent=2))
+          with open(os.environ['GITHUB_STEP_SUMMARY'],'a') as out:
+              out.write(f"## Gainium 221 proof: **{verdict}**\n\n{reason}\n\n")
+              out.write('Neighboring restart-inflight and lost-response cases: **NOT TESTED**.\n')
+          if verdict!='PASS': raise SystemExit(1)
+          PY
+
+      - name: Store complete evidence even when blocked
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: gainium-coinbase-221-v3-evidence
+          path: evidence/
+          if-no-files-found: warn
+          retention-days: 30
