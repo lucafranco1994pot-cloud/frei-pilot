@@ -1,0 +1,554 @@
+name: ATLAS 8039 | real-code SIGKILL / SQLite proof
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  matrix_test:
+    name: "Real source: ${{ matrix.variant }}"
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - variant: main
+            repo: langchain-ai/langgraph
+            sha: 9412cb7aef68f2799303757f028eed6b611be7a3
+            fetch_ref: refs/heads/main
+          - variant: pr8055
+            repo: langchain-ai/langgraph
+            sha: 1c2cf39b406f9207ab96b8ffca5e96abf75a4920
+            fetch_ref: refs/pull/8055/head
+          - variant: fork
+            repo: bigboateng/langgraph
+            sha: 0a74dca05bd324236d74e67f5d7c9a3ae6e83f57
+            fetch_ref: refs/pull/1/head
+    env:
+      LG_SHA: ${{ matrix.sha }}
+      LG_REPO: ${{ matrix.repo }}
+      LG_REF: ${{ matrix.fetch_ref }}
+      VARIANT: ${{ matrix.variant }}
+      PIP_DISABLE_PIP_VERSION_CHECK: '1'
+    steps:
+      - name: Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Fetch EXACT upstream commit (no substitutions)
+        shell: bash
+        run: |
+          set -euo pipefail
+          git init -q langgraph-src
+          git -C langgraph-src remote add origin "https://github.com/${LG_REPO}.git"
+          if ! git -C langgraph-src fetch --no-tags --depth=1 origin "$LG_SHA"; then
+            echo "Direct SHA fetch unavailable; fetching its advertised PR/branch ref."
+            git -C langgraph-src fetch --no-tags origin "$LG_REF"
+          fi
+          git -C langgraph-src checkout --quiet --detach "$LG_SHA"
+          test "$(git -C langgraph-src rev-parse HEAD)" = "$LG_SHA"
+          echo "PINNED_REPOSITORY=$LG_REPO"
+          echo "PINNED_COMMIT=$(git -C langgraph-src rev-parse HEAD)"
+          git -C langgraph-src log -1 --format='commit=%H%ncommitted=%cI%nsubject=%s'
+      - name: Install MONOREPO packages from this checked-out Git commit
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade pip
+          python -m pip install \
+            -e ./langgraph-src/libs/checkpoint \
+            -e ./langgraph-src/libs/prebuilt \
+            -e ./langgraph-src/libs/sdk-py \
+            -e ./langgraph-src/libs/checkpoint-sqlite \
+            -e ./langgraph-src/libs/langgraph
+          python -m pip check
+          python -m pip freeze | tee installed_packages.txt
+      - name: Create the SAME test script for every matrix variant
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > atlas_8039_real.py <<'ATLAS_8039_REAL_PY'
+          #!/usr/bin/env python3
+          """Issue #8039: real installed LangGraph crash/recovery + write-failure probes.
+          
+          This file contains ZERO variant-based behavior. The Git checkout decides the code.
+          The crash scenario is derived from the reporter's original probe_race.py.
+          Only harmless, fsynced local JSONL effects are used; no network/API calls.
+          """
+          
+          from __future__ import annotations
+          
+          import argparse
+          from collections import Counter
+          import hashlib
+          import importlib.metadata as metadata
+          import inspect
+          import json
+          import os
+          from pathlib import Path
+          import platform
+          import signal
+          import sqlite3
+          import subprocess
+          import sys
+          import time
+          import traceback
+          from typing import TypedDict
+          
+          STEPS = ("step1", "step2", "step3")
+          FAILURE_MESSAGE = "ATLAS_8039_INJECTED_PUT_WRITES_FAILURE"
+          
+          
+          def write_json(path: Path, value: object) -> None:
+              path.parent.mkdir(parents=True, exist_ok=True)
+              path.write_text(json.dumps(value, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+          
+          
+          def read_json(path: Path) -> dict:
+              return json.loads(path.read_text(encoding="utf-8"))
+          
+          
+          def append_fsynced(path: Path, value: dict) -> None:
+              payload = (json.dumps(value, sort_keys=True) + "\n").encode()
+              fd = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o644)
+              try:
+                  os.write(fd, payload)
+                  os.fsync(fd)
+              finally:
+                  os.close(fd)
+          
+          
+          def jsonl(path: Path) -> list[dict]:
+              if not path.exists():
+                  return []
+              return [json.loads(line) for line in path.read_text().splitlines() if line.strip()]
+          
+          
+          def checkpoint_rows(db: Path) -> list[dict]:
+              if not db.exists():
+                  return []
+              with sqlite3.connect(str(db), timeout=10) as conn:
+                  tables = {row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+                  if "checkpoints" not in tables:
+                      return []
+                  columns = {row[1] for row in conn.execute("PRAGMA table_info(checkpoints)")}
+                  required = {"checkpoint_id", "parent_checkpoint_id"}
+                  if not required <= columns:
+                      raise RuntimeError(f"Unexpected checkpointer schema: {sorted(columns)}")
+                  return [
+                      {"checkpoint_id": row[0], "parent_checkpoint_id": row[1]}
+                      for row in conn.execute("SELECT checkpoint_id, parent_checkpoint_id FROM checkpoints")
+                  ]
+          
+          
+          def pending_write_count(db: Path) -> int:
+              if not db.exists():
+                  return 0
+              with sqlite3.connect(str(db), timeout=10) as conn:
+                  tables = {row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+                  if "writes" not in tables:
+                      return 0
+                  return conn.execute("SELECT count(*) FROM writes").fetchone()[0]
+          
+          
+          def child(workdir: Path, phase: str, delay: float) -> None:
+              # IMPORTS ARE FROM THE ACTUAL GIT-CHECKED-OUT AND INSTALLED PACKAGES.
+              from langgraph.graph import StateGraph, START, END
+              from langgraph.checkpoint.sqlite import SqliteSaver
+          
+              workdir.mkdir(parents=True, exist_ok=True)
+              sink = workdir / "effects.jsonl"
+              events = workdir / "saver_events.jsonl"
+          
+              class State(TypedDict):
+                  sent: int
+          
+              class InjectedWriteFailure(RuntimeError):
+                  pass
+          
+              def worker(state: State) -> State:
+                  idx = state["sent"]
+                  if idx not in range(len(STEPS)):
+                      raise AssertionError(f"Worker called with invalid sent={idx}")
+                  append_fsynced(sink, {"step": STEPS[idx]})
+                  return {"sent": idx + 1}
+          
+              class ProbeSaver(SqliteSaver):
+                  def put_writes(self, config, writes, task_id, task_path=""):
+                      if phase == "start":
+                          # The original issue's 'writes-delay' interleaving, applied
+                          # IDENTICALLY to all three installed source versions.
+                          time.sleep(delay)
+                      if phase == "failure" and any(ch == "sent" for ch, _ in writes):
+                          append_fsynced(
+                              events,
+                              {"event": "INJECT_FAILURE", "parent": config["configurable"].get("checkpoint_id")},
+                          )
+                          time.sleep(delay)
+                          raise InjectedWriteFailure(FAILURE_MESSAGE)
+                      return super().put_writes(config, writes, task_id, task_path)
+          
+                  def put(self, config, checkpoint, meta, new_versions):
+                      parent = config["configurable"].get("checkpoint_id")
+                      child_id = checkpoint["id"]
+                      append_fsynced(
+                          events,
+                          {"event": "PUT_ENTER", "parent": parent, "checkpoint": child_id,
+                           "sent": checkpoint.get("channel_values", {}).get("sent")},
+                      )
+                      if phase == "start" and checkpoint.get("channel_values", {}).get("sent") == 2:
+                          append_fsynced(events, {"event": "SIGKILL_AT_PUT_ENTER", "parent": parent})
+                          os.kill(os.getpid(), signal.SIGKILL)
+                          raise AssertionError("unreachable after SIGKILL")
+                      value = super().put(config, checkpoint, meta, new_versions)
+                      append_fsynced(events, {"event": "PUT_SAVED", "parent": parent, "checkpoint": child_id})
+                      return value
+          
+              connection = sqlite3.connect(str(workdir / "state.db"), check_same_thread=False, timeout=10)
+              graph_builder = StateGraph(State)
+              graph_builder.add_node("worker", worker)
+              graph_builder.add_edge(START, "worker")
+              graph_builder.add_conditional_edges(
+                  "worker", lambda state: "worker" if state["sent"] < len(STEPS) else END
+              )
+              graph = graph_builder.compile(checkpointer=ProbeSaver(connection))
+              config = {"configurable": {"thread_id": "atlas-8039"}}
+              try:
+                  if phase == "resume":
+                      result = graph.invoke(None, config, durability="sync")
+                  elif phase == "failure":
+                      exception = None
+                      result = None
+                      try:
+                          result = graph.invoke({"sent": 0}, config, durability="sync")
+                      except Exception as exc:
+                          exception = {"type": type(exc).__name__, "message": str(exc),
+                                       "traceback": traceback.format_exc()[-3500:]}
+                      # The background executor has unwound before inspecting the DB.
+                      injections = [e for e in jsonl(events) if e["event"] == "INJECT_FAILURE"]
+                      rows = checkpoint_rows(workdir / "state.db")
+                      failed_parents = [e["parent"] for e in injections]
+                      saved_after_failure = [r for r in rows if r["parent_checkpoint_id"] in failed_parents]
+                      report = {
+                          "injections": injections,
+                          "exception": exception,
+                          "returned": result,
+                          "failed_parent_exists": bool(failed_parents) and all(
+                              any(r["checkpoint_id"] == parent for r in rows) for parent in failed_parents
+                          ),
+                          "saved_after_failed_write": saved_after_failure,
+                          "checkpoint_count": len(rows),
+                      }
+                      write_json(workdir / "failure_report.json", report)
+                      print(json.dumps({"child_phase": phase, "report": report}, default=str))
+                      return
+                  else:
+                      result = graph.invoke({"sent": 0}, config, durability="sync")
+                  write_json(workdir / f"{phase}_report.json", {"result": result})
+                  print(json.dumps({"child_phase": phase, "result": result}))
+              finally:
+                  connection.close()
+          
+          
+          def installation_identity(source: Path, expected_sha: str, expected_repo: str) -> dict:
+              actual_sha = subprocess.check_output(
+                  ["git", "-C", str(source), "rev-parse", "HEAD"], text=True
+              ).strip()
+              if actual_sha != expected_sha:
+                  raise AssertionError(f"Git mismatch expected={expected_sha} actual={actual_sha}")
+              actual_remote = subprocess.check_output(
+                  ["git", "-C", str(source), "remote", "get-url", "origin"], text=True
+              ).strip()
+              if expected_repo not in actual_remote:
+                  raise AssertionError(f"Unexpected remote: {actual_remote}")
+          
+              import langgraph.pregel._loop as loop
+              import langgraph.checkpoint.sqlite as sqlite_module
+              files = {"langgraph_runtime": Path(inspect.getfile(loop)).resolve(),
+                       "sqlite_saver": Path(inspect.getfile(sqlite_module)).resolve()}
+              for label, path in files.items():
+                  if not path.is_relative_to(source):
+                      raise AssertionError(f"{label} is not imported from git checkout: {path}")
+          
+              return {
+                  "source_repo": expected_repo,
+                  "source_git_commit": actual_sha,
+                  "remote": actual_remote,
+                  "python": platform.python_version(),
+                  "platform": platform.platform(),
+                  "package_versions": {
+                      k: metadata.version(k) for k in (
+                          "langgraph", "langgraph-checkpoint", "langgraph-checkpoint-sqlite",
+                          "langgraph-prebuilt", "langgraph-sdk"
+                      )
+                  },
+                  "import_paths": {k: str(v) for k, v in files.items()},
+                  "source_sha256": {
+                      k: hashlib.sha256(v.read_bytes()).hexdigest() for k, v in files.items()
+                  },
+              }
+          
+          
+          def invoke_child(script: Path, phase: str, workdir: Path, delay: float) -> dict:
+              cmd = [sys.executable, str(script), "--child", phase, "--workdir", str(workdir),
+                     "--delay", str(delay)]
+              try:
+                  process = subprocess.run(cmd, capture_output=True, text=True, timeout=45)
+                  rc = process.returncode
+                  out, err = process.stdout, process.stderr
+              except subprocess.TimeoutExpired as exc:
+                  rc = "TIMEOUT"
+                  out = (exc.stdout or b"").decode(errors="replace") if isinstance(exc.stdout, bytes) else exc.stdout or ""
+                  err = (exc.stderr or b"").decode(errors="replace") if isinstance(exc.stderr, bytes) else exc.stderr or ""
+              workdir.mkdir(parents=True, exist_ok=True)
+              (workdir / f"{phase}_stdout.txt").write_text(out, encoding="utf-8")
+              (workdir / f"{phase}_stderr.txt").write_text(err, encoding="utf-8")
+              return {"phase": phase, "returncode": rc, "stdout": out[-800:], "stderr": err[-1200:]}
+          
+          
+          def verdict(ok: bool, evaluable: bool = True) -> str:
+              return "PASS" if ok else "FAIL" if evaluable else "BLOCKED"
+          
+          
+          def run_supervisor(args: argparse.Namespace) -> None:
+              dest = Path(args.output).resolve()
+              dest.mkdir(parents=True, exist_ok=True)
+              identity = installation_identity(Path(args.source).resolve(), args.sha, args.repository)
+              write_json(dest / "installation.json", identity)
+              print("PINNED_INSTALLATION", json.dumps(identity, sort_keys=True), flush=True)
+          
+              script = Path(__file__).resolve()
+              crash_trials = []
+              for i in range(1, args.trials + 1):
+                  wd = dest / "crash" / f"trial_{i:02d}"
+                  wd.mkdir(parents=True, exist_ok=True)
+                  initial = invoke_child(script, "start", wd, args.delay)
+                  crashed = initial["returncode"] == -signal.SIGKILL
+                  # Snapshot durable SQLite state BEFORE opening a fresh process for resume.
+                  crash_snapshot = None
+                  if crashed:
+                      try:
+                          crash_snapshot = {
+                              "checkpoint_count": len(checkpoint_rows(wd / "state.db")),
+                              "pending_write_rows": pending_write_count(wd / "state.db"),
+                          }
+                      except Exception as exc:
+                          crash_snapshot = {"inspection_error": repr(exc)}
+                  # Only resume after the expected actual SIGKILL.
+                  resumed = invoke_child(script, "resume", wd, args.delay) if crashed else None
+                  counts = Counter(row["step"] for row in jsonl(wd / "effects.jsonl"))
+                  duplicates = sum(max(c - 1, 0) for c in counts.values())
+                  complete = all(counts.get(step, 0) == 1 for step in STEPS)
+                  evaluable = crashed and resumed is not None and resumed["returncode"] == 0
+                  row = {
+                      "trial": i,
+                      "start": initial,
+                      "resume": resumed,
+                      "sigkill_observed": crashed,
+                      "durable_state_at_crash": crash_snapshot,
+                      "effects": dict(counts),
+                      "duplicates": duplicates,
+                      "verdict": verdict(complete, evaluable),
+                  }
+                  if crashed and (crash_snapshot is None or "inspection_error" in crash_snapshot):
+                      row["verdict"] = "BLOCKED"
+                  crash_trials.append(row)
+                  write_json(wd / "trial.json", row)
+                  print("CRASH_TRIAL", json.dumps({"trial": i, "verdict": row["verdict"],
+                                                "duplicates": duplicates, "effects": dict(counts),
+                                                "sigkill": crashed}), flush=True)
+          
+              # A write failure is injected into the actual SqliteSaver.put_writes override.
+              wd_fail = dest / "write_failure"
+              wd_fail.mkdir(exist_ok=True)
+              failed_process = invoke_child(script, "failure", wd_fail, args.delay)
+              failure_data = read_json(wd_fail / "failure_report.json") if (wd_fail / "failure_report.json").exists() else None
+              if failed_process["returncode"] != 0 or failure_data is None:
+                  failure_verdict = "BLOCKED"
+              elif not failure_data["injections"] or not failure_data["failed_parent_exists"]:
+                  failure_verdict = "BLOCKED"
+              else:
+                  exc = failure_data["exception"]
+                  correct_exception = (
+                      exc is not None and FAILURE_MESSAGE in exc["message"] and
+                      exc["type"] == "InjectedWriteFailure"
+                  )
+                  no_advanced_checkpoint = not failure_data["saved_after_failed_write"]
+                  failure_verdict = verdict(correct_exception and no_advanced_checkpoint)
+          
+              wd_control = dest / "control"
+              wd_control.mkdir(exist_ok=True)
+              control_process = invoke_child(script, "normal", wd_control, 0)
+              control_data = read_json(wd_control / "normal_report.json") if (wd_control / "normal_report.json").exists() else None
+              control_effects = Counter(e["step"] for e in jsonl(wd_control / "effects.jsonl"))
+              if control_process["returncode"] != 0 or control_data is None:
+                  control_verdict = "BLOCKED"
+              else:
+                  control_verdict = verdict(
+                      control_data["result"] == {"sent": len(STEPS)}
+                      and all(control_effects.get(step, 0) == 1 for step in STEPS)
+                      and sum(control_effects.values()) == len(STEPS)
+                  )
+          
+              crashed_n = sum(r["sigkill_observed"] for r in crash_trials)
+              observed_dups = sum(r["duplicates"] for r in crash_trials)
+              if all(r["verdict"] == "PASS" for r in crash_trials):
+                  crash_verdict = "PASS"
+              elif any(r["verdict"] == "FAIL" for r in crash_trials):
+                  crash_verdict = "FAIL"
+              else:
+                  crash_verdict = "BLOCKED"
+              result = {
+                  "variant": args.variant,
+                  "installation": identity,
+                  "crash": {"verdict": crash_verdict, "trials": args.trials,
+                            "observed_sigkill": crashed_n, "duplicates": observed_dups,
+                            "passing_trials": sum(r["verdict"] == "PASS" for r in crash_trials),
+                            "failing_trials": sum(r["verdict"] == "FAIL" for r in crash_trials),
+                            "blocked_trials": sum(r["verdict"] == "BLOCKED" for r in crash_trials)},
+                  "write_failure": {"verdict": failure_verdict, "process": failed_process,
+                                    "evidence": failure_data},
+                  "control": {"verdict": control_verdict, "process": control_process,
+                              "effects": dict(control_effects), "result": control_data},
+              }
+              write_json(dest / "results.json", result)
+              md = (
+                  f"| `{args.variant}` | `{identity['source_git_commit'][:12]}` | "
+                  f"{crash_verdict} ({args.trials} runs, {observed_dups} duplicates) | "
+                  f"{failure_verdict} | {control_verdict} |\n"
+              )
+              (dest / "table_row.md").write_text(md)
+              print("ATLAS_8039_RESULTS", json.dumps({
+                  "variant": args.variant, "git_sha": identity["source_git_commit"],
+                  "crash": result["crash"], "write_failure": failure_verdict,
+                  "control": control_verdict
+              }), flush=True)
+          
+          
+          def main() -> None:
+              parser = argparse.ArgumentParser()
+              parser.add_argument("--child", choices=("start", "resume", "failure", "normal"))
+              parser.add_argument("--workdir")
+              parser.add_argument("--delay", type=float, default=0.12)
+              parser.add_argument("--output", default="proof")
+              parser.add_argument("--source")
+              parser.add_argument("--sha")
+              parser.add_argument("--repository")
+              parser.add_argument("--variant")
+              parser.add_argument("--trials", type=int, default=20)
+              args = parser.parse_args()
+              if args.child:
+                  if not args.workdir:
+                      parser.error("--workdir required for child")
+                  child(Path(args.workdir).resolve(), args.child, args.delay)
+              else:
+                  for name in ("source", "sha", "repository", "variant"):
+                      if not getattr(args, name):
+                          parser.error(f"--{name} required")
+                  if args.trials != 20:
+                      parser.error("This proof requires exactly 20 crash/restart trials per variant")
+                  run_supervisor(args)
+          
+          
+          if __name__ == "__main__":
+              main()
+          ATLAS_8039_REAL_PY
+          python -m py_compile atlas_8039_real.py
+          sha256sum atlas_8039_real.py
+      - name: Run 20 REAL SIGKILL/restart trials + exception + control
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "proof/$VARIANT"
+          cp atlas_8039_real.py "proof/$VARIANT/test_script.py"
+          cp installed_packages.txt "proof/$VARIANT/installed_packages.txt"
+          python atlas_8039_real.py \
+            --variant "$VARIANT" \
+            --repository "$LG_REPO" \
+            --sha "$LG_SHA" \
+            --source "$GITHUB_WORKSPACE/langgraph-src" \
+            --output "proof/$VARIANT" \
+            --trials 20 --delay 0.12
+      - name: Write SHA-256 manifest
+        if: always()
+        shell: bash
+        run: |
+          if [ -d "proof/$VARIANT" ]; then
+            (cd "proof/$VARIANT" && find . -type f ! -name SHA256SUMS.txt -print0 | sort -z | xargs -0 sha256sum > SHA256SUMS.txt)
+          fi
+      - name: Show per-variant verdict in job summary
+        if: always()
+        shell: bash
+        run: |
+          echo '| Variant | Git SHA | SIGKILL/restart | Failed put_writes | Normal control |' >> "$GITHUB_STEP_SUMMARY"
+          echo '|---|---|---|---|---|' >> "$GITHUB_STEP_SUMMARY"
+          if [ -f "proof/$VARIANT/table_row.md" ]; then
+            cat "proof/$VARIANT/table_row.md" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "| $VARIANT | $LG_SHA | BLOCKED | BLOCKED | BLOCKED |" >> "$GITHUB_STEP_SUMMARY"
+          fi
+      - name: Upload full evidence for this variant
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: atlas8039-${{ matrix.variant }}
+          path: proof/${{ matrix.variant }}/
+          retention-days: 21
+          if-no-files-found: warn
+
+  report:
+    name: Combined table / JSON
+    needs: matrix_test
+    if: always()
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - name: Retrieve three evidence artifacts
+        uses: actions/download-artifact@v4
+        continue-on-error: true
+        with:
+          pattern: atlas8039-*
+          path: downloaded
+      - name: Build variant x criterion table (never invent results)
+        shell: bash
+        run: |
+          python - <<'ATLAS_8039_REPORT_PY'
+          import json
+          from pathlib import Path
+          names = ['main', 'pr8055', 'fork']
+          rows = []
+          combined = {}
+          for name in names:
+              path = Path('downloaded') / f'atlas8039-{name}' / 'results.json'
+              if not path.exists():
+                  combined[name] = {'status': 'UNTESTED', 'reason': 'Missing artifact / failed setup'}
+                  rows.append(f'| {name} | UNTESTED | UNTESTED | UNTESTED | UNTESTED |')
+                  continue
+              data = json.loads(path.read_text())
+              combined[name] = data
+              sha = data['installation']['source_git_commit'][:12]
+              crash = data['crash']
+              rows.append(f"| {name} | `{sha}` | {crash['verdict']} ({crash['trials']} trials; {crash['duplicates']} duplicates) | {data['write_failure']['verdict']} | {data['control']['verdict']} |")
+          table = ('## LangGraph #8039: actual installed Git code\n\n'
+                   '| Variant | Git commit | SIGKILL/restart | Write failure | No-fault control |\n'
+                   '|---|---|---|---|---|\n'
+                   + '\n'.join(rows) + '\n\n'
+                   'PASS/FAIL comes from subprocess runs; BLOCKED/UNTESTED is not a pass. '                   'External side effects are local fsynced JSONL lines, not payments/API calls.\n')
+          Path('combined_results.json').write_text(json.dumps(combined, indent=2) + '\n')
+          Path('combined_table.md').write_text(table)
+          print(table)
+          with open(__import__('os').environ['GITHUB_STEP_SUMMARY'], 'a') as f:
+              f.write(table)
+          ATLAS_8039_REPORT_PY
+      - name: Upload combined verdict
+        uses: actions/upload-artifact@v4
+        with:
+          name: atlas8039-combined
+          path: |
+            combined_results.json
+            combined_table.md
+          retention-days: 21
