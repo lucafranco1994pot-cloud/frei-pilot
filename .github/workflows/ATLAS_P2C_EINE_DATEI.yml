@@ -21,20 +21,22 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: openai/openai-agents-python
-          ref: 0f87da2
+          ref: 0f87da2bf16b6b1fbc8dd3d8f36f57d298475a5d
           path: pinned_sdk
           persist-credentials: false
 
       - name: Install and verify pinned SDK
         shell: bash
         run: |
-          python -m pip install './pinned_sdk[encrypt]'
-          test "$(git -C pinned_sdk rev-parse --short=7 HEAD)" = '0f87da2'
+          set -euo pipefail
+          test "$(git -C pinned_sdk rev-parse HEAD)" = '0f87da2bf16b6b1fbc8dd3d8f36f57d298475a5d'
           git -C pinned_sdk rev-parse HEAD | tee ATLAS_P2C_COMMIT.txt
+          python -m pip install './pinned_sdk[encrypt]'
 
       - name: Run isolated four-case evidence (no bug verdict)
         shell: bash
         run: |
+          set -euo pipefail
           cat > /tmp/atlas_p2c.py <<'PY'
           import asyncio
           import json
@@ -48,75 +50,117 @@ jobs:
           from agents.extensions.memory import EncryptedSession
           from agents.memory import OpenAIResponsesCompactionSession
 
-          SID = 'atlas-p2c'
-          RIGHT = 'atlas-p2c-correct-key'
-          WRONG = 'atlas-p2c-wrong-key'
-          ITEMS = [{'role':'user','content':'original-1'},
-                   {'role':'assistant','content':'original-2'}]
+          SID = "atlas-p2c"
+          RIGHT = "atlas-p2c-correct-key"
+          WRONG = "atlas-p2c-wrong-key"
+          ITEMS = [
+              {"role": "user", "content": "original-1"},
+              {"role": "assistant", "content": "original-2"},
+          ]
 
           def raw(path):
               with sqlite3.connect(path) as conn:
                   return conn.execute(
-                      'SELECT id, message_data FROM agent_messages '
-                      'WHERE session_id=? ORDER BY id', (SID,)
+                      "SELECT id, message_data FROM agent_messages "
+                      "WHERE session_id=? ORDER BY id", (SID,)
                   ).fetchall()
 
           async def run_one(order, key):
               with tempfile.TemporaryDirectory() as tmp:
-                  path = Path(tmp) / 'history.db'
+                  path = Path(tmp) / "history.db"
                   db = SQLiteSession(SID, str(path))
                   try:
                       original = EncryptedSession(SID, db, RIGHT, ttl=3600)
                       await original.add_items(ITEMS)
                       before = raw(path)
                       assert await original.get_items() == ITEMS
+
                       api = MagicMock()
-                      api.responses.compact = AsyncMock(return_value=SimpleNamespace(
-                          output=[{'type':'compaction','id':'cmp-p2c',
-                                   'encrypted_content':'synthetic-summary'}]))
-                      if order == 'compaction_outer':
-                          enc = EncryptedSession(SID, db, key, ttl=3600)
+                      api.responses.compact = AsyncMock(
+                          return_value=SimpleNamespace(
+                              output=[{
+                                  "type": "compaction",
+                                  "id": "cmp-p2c",
+                                  "encrypted_content": "synthetic-summary",
+                              }]
+                          )
+                      )
+
+                      if order == "compaction_outer":
+                          encrypted = EncryptedSession(
+                              SID, db, key, ttl=3600
+                          )
                           session = OpenAIResponsesCompactionSession(
-                              SID, enc, client=api, compaction_mode='input')
+                              SID, encrypted,
+                              client=api,
+                              compaction_mode="input",
+                          )
                       else:
                           compact = OpenAIResponsesCompactionSession(
-                              SID, db, client=api, compaction_mode='input')
-                          session = EncryptedSession(SID, compact, key, ttl=3600)
+                              SID, db,
+                              client=api,
+                              compaction_mode="input",
+                          )
+                          session = EncryptedSession(
+                              SID, compact, key, ttl=3600
+                          )
+
                       visible_count = len(await session.get_items())
                       error = None
+
                       try:
-                          await session.run_compaction({'force':True, 'compaction_mode':'input'})
+                          await session.run_compaction({
+                              "force": True,
+                              "compaction_mode": "input",
+                          })
                       except Exception as exc:
-                          error = type(exc).__name__ + ': ' + str(exc)
+                          error = type(exc).__name__ + ": " + str(exc)
+
                       after = raw(path)
                       readable = await original.get_items()
+
                       return {
-                          'order': order, 'key': 'correct' if key == RIGHT else 'wrong',
-                          'visible_before_count': visible_count,
-                          'api_calls': api.responses.compact.await_count,
-                          'error': error, 'raw_before': before, 'raw_after': after,
-                          'original_rows_unchanged': before == after,
-                          'original_ciphertexts_retained': all(x[1] in [y[1] for y in after] for x in before),
-                          'original_history_readable_after': all(x in readable for x in ITEMS)
+                          "order": order,
+                          "key": "correct" if key == RIGHT else "wrong",
+                          "visible_before_count": visible_count,
+                          "api_calls": api.responses.compact.await_count,
+                          "error": error,
+                          "raw_before": before,
+                          "raw_after": after,
+                          "original_rows_unchanged": before == after,
+                          "original_ciphertexts_retained": all(
+                              x[1] in [y[1] for y in after]
+                              for x in before
+                          ),
+                          "original_history_readable_after": all(
+                              x in readable for x in ITEMS
+                          ),
                       }
                   finally:
                       db.close()
 
           async def main():
-              results = [await run_one(order, key)
-                         for order in ('compaction_outer', 'encryption_outer')
-                         for key in (RIGHT, WRONG)]
-              with open('ATLAS_P2C_RESULTS.json','w') as f:
-                  json.dump(results, f, indent=2, ensure_ascii=False)
+              results = [
+                  await run_one(order, key)
+                  for order in ("compaction_outer", "encryption_outer")
+                  for key in (RIGHT, WRONG)
+              ]
+
+              Path("ATLAS_P2C_RESULTS.json").write_text(
+                  json.dumps(results, indent=2, ensure_ascii=False)
+              )
+
               assert len(results) == 4
               print(json.dumps(results, indent=2, ensure_ascii=False))
-              print('FOUR CASES OBSERVED; NOT A BUG VERDICT')
+              print("FOUR CASES OBSERVED; NOT A BUG VERDICT")
 
-          if __name__ == '__main__':
+          if __name__ == "__main__":
               asyncio.run(main())
           PY
-          python /tmp/atlas_p2c.py
+
+          python -m py_compile /tmp/atlas_p2c.py
           sha256sum /tmp/atlas_p2c.py > ATLAS_P2C_SCRIPT_SHA256.txt
+          python /tmp/atlas_p2c.py
           sha256sum ATLAS_P2C_RESULTS.json > ATLAS_P2C_RESULTS_SHA256.txt
 
       - name: Upload evidence, even on failure
