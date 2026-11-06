@@ -1,0 +1,262 @@
+name: "ATLAS 8039 – PR8055 + 3-Zeilen-Fix"
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: PR8055 plus published 3-line fix (20x3)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      BASE_SHA: 93307d6a427d7f15bcba3264f3774d07af7d7dca
+      PR_SHA: 1c2cf39b406f9207ab96b8ffca5e96abf75a4920
+      FIX_SHA: fc0e1c9ffdf92bc5bfd17811b3543fefd475d267
+      VARIANT: pr8055_plus_3line
+      PATCH_KIND: pr8055
+      PIP_DISABLE_PIP_VERSION_CHECK: '1'
+
+    steps:
+      - name: Check out the same frozen ATLAS test harness as V2
+        uses: actions/checkout@v4
+        with:
+          ref: 38599dbbd853d2bce3992c7102a1f3d66a91cd49
+          persist-credentials: false
+
+      - name: Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Run unchanged V2 tests with PR8055 plus published runtime fix
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install 'PyYAML==6.0.2'
+          python - <<'PY'
+          import hashlib
+          import os
+          from pathlib import Path
+          import subprocess
+          import sys
+          import yaml
+
+          path = Path('.github/workflows/ATLAS_8039_SAMEBASE_ISOLATED.yml')
+          original = path.read_text(encoding='utf-8')
+          before = 'repository=args.repository,output=str(destination.parent),trials=20,delay=0.12)'
+          after  = 'repository=args.repository,output=str(destination),trials=20,delay=0.12)'
+          if original.count(before) != 1 or original.count(after) != 0:
+              sys.exit('BLOCKED: Original 8039 workflow did not match frozen expected harness')
+          corrected = original.replace(before, after)
+          expected = (
+              'Fetch PR8055 HEAD and verify SAME parent base',
+              "Apply ONLY selected author's runtime patch (no edits to it)",
+              'Install actual monorepo code from the SAME base and selected patch',
+              'Create IDENTICAL integration test and 20x3 repeat harness',
+              'Run REAL 20x SIGKILL + 20x write exception + 20x control',
+          )
+          job = yaml.safe_load(corrected)['jobs']['compare']
+          scripts = {s['name']: s['run'] for s in job['steps'] if 'run' in s}
+          if not all(name in scripts for name in expected):
+              sys.exit('BLOCKED: Missing a required original test step')
+
+          proof = Path('proof') / os.environ['VARIANT']
+          proof.mkdir(parents=True, exist_ok=True)
+          (proof / 'harness_identity.txt').write_text(
+              'original_sha256=' + hashlib.sha256(original.encode()).hexdigest() + '\n'
+              + 'corrected_sha256=' + hashlib.sha256(corrected.encode()).hexdigest() + '\n'
+              + 'correction=' + before + ' -> ' + after + '\n',
+              encoding='utf-8',
+          )
+
+          def git(*args):
+              return subprocess.check_output(
+                  ['git', '-C', 'langgraph-src', *args], text=True
+              ).strip()
+
+          def apply_published_three_line_fix():
+              runtime = 'libs/langgraph/langgraph/pregel/_loop.py'
+              fix_sha = os.environ['FIX_SHA']
+              pr_sha = os.environ['PR_SHA']
+              source = Path('langgraph-src')
+
+              # The V2 step has applied only the original PR8055 runtime patch.
+              actual = (source / runtime).read_bytes()
+              expected_pr = subprocess.check_output(
+                  ['git', '-C', str(source), 'show', f'{pr_sha}:{runtime}']
+              )
+              if actual != expected_pr:
+                  sys.exit('BLOCKED: Runtime after V2 patch is not byte-identical to pinned PR8055')
+
+              subprocess.run(
+                  ['git', '-C', str(source), 'remote', 'add',
+                   'mstevens843', 'https://github.com/mstevens843/langgraph.git'],
+                  check=True,
+              )
+              subprocess.run(
+                  ['git', '-C', str(source), 'fetch', '--no-tags', '--depth=2',
+                   'mstevens843', fix_sha],
+                  check=True,
+              )
+              if git('rev-parse', 'FETCH_HEAD') != fix_sha:
+                  sys.exit('BLOCKED: Unexpected published fix commit')
+
+              parent = git('rev-parse', f'{fix_sha}^')
+              parent_runtime = subprocess.check_output(
+                  ['git', '-C', str(source), 'show', f'{parent}:{runtime}']
+              )
+              if parent_runtime != expected_pr:
+                  sys.exit('BLOCKED: Published fix parent runtime differs from pinned PR8055')
+
+              numstat = git('diff', '--numstat', parent, fix_sha, '--', runtime)
+              if numstat != f'3\t0\t{runtime}':
+                  sys.exit('BLOCKED: Published runtime correction is not exactly three added lines')
+
+              patch = subprocess.check_output(
+                  ['git', '-C', str(source), 'diff', '--binary',
+                   parent, fix_sha, '--', runtime]
+              )
+              patch_path = (proof / 'published_three_line_runtime.patch').resolve()
+              patch_path.write_bytes(patch)
+              subprocess.run(
+                  ['git', '-C', str(source), 'apply', '--check', str(patch_path)],
+                  check=True,
+              )
+              subprocess.run(
+                  ['git', '-C', str(source), 'apply', str(patch_path)],
+                  check=True,
+              )
+
+              fixed_runtime = subprocess.check_output(
+                  ['git', '-C', str(source), 'show', f'{fix_sha}:{runtime}']
+              )
+              if (source / runtime).read_bytes() != fixed_runtime:
+                  sys.exit('BLOCKED: Final runtime differs from published corrected runtime')
+              if git('diff', 'HEAD', '--name-only') != runtime:
+                  sys.exit('BLOCKED: Unexpected source files changed')
+              subprocess.run(
+                  ['git', '-C', str(source), 'diff', 'HEAD', '--check'],
+                  check=True,
+              )
+
+              (proof / 'applied_runtime.patch').write_bytes(
+                  subprocess.check_output(
+                      ['git', '-C', str(source), 'diff', 'HEAD', '--', runtime]
+                  )
+              )
+              (proof / 'changed_files.txt').write_text(runtime + '\n')
+              (proof / 'diff_stat.txt').write_text(git('diff', 'HEAD', '--stat') + '\n')
+              (proof / 'diff_numstat.txt').write_text(git('diff', 'HEAD', '--numstat') + '\n')
+              (proof / 'git_status.txt').write_text(git('status', '--short') + '\n')
+              (proof / 'runtime_sha256.txt').write_text(
+                  hashlib.sha256(fixed_runtime).hexdigest() + '  ' + runtime + '\n'
+              )
+              (proof / 'three_line_fix_identity.txt').write_text(
+                  'source=https://github.com/mstevens843/langgraph/commit/' + fix_sha + '\n'
+                  + 'fix_sha=' + fix_sha + '\n'
+                  + 'fix_parent_sha=' + parent + '\n'
+                  + 'runtime_numstat=' + numstat + '\n'
+                  + 'patch_sha256=' + hashlib.sha256(patch).hexdigest() + '\n'
+                  + 'pr_runtime_byte_identity=PASS\n'
+                  + 'fixed_runtime_byte_identity=PASS\n',
+                  encoding='utf-8',
+              )
+              with (proof / 'git_identity.txt').open('a', encoding='utf-8') as f:
+                  f.write('additional_runtime_fix=' + fix_sha + '\n')
+
+          for i, name in enumerate(expected, 1):
+              print(f'ATLAS_STEP {i}/{len(expected)}: {name}', flush=True)
+              script = Path('.atlas_step.sh')
+              script.write_text(scripts[name], encoding='utf-8')
+              subprocess.run(
+                  ['bash', '--noprofile', '--norc', '-e', '-o', 'pipefail',
+                   str(script.resolve())],
+                  check=True,
+              )
+              if i == 2:
+                  apply_published_three_line_fix()
+
+          print('ATLAS_PR8055_PLUS_3LINE_COMPLETE', os.environ['VARIANT'], flush=True)
+          PY
+
+      - name: Generate proof checksums
+        if: always()
+        shell: bash
+        run: |
+          if [ -d "proof/$VARIANT" ]; then
+            (cd "proof/$VARIANT" && find . -type f ! -name SHA256SUMS.txt -print0 | sort -z | xargs -0 sha256sum > SHA256SUMS.txt)
+          fi
+
+      - name: Upload evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: atlas8039-pr8055-plus-3line
+          path: proof/pr8055_plus_3line/
+          if-no-files-found: warn
+          retention-days: 21
+
+  report:
+    name: Summarize PR8055 plus 3-line fix
+    needs: test
+    if: always()
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Download proof artifact
+        if: needs.test.result == 'success' || needs.test.result == 'failure'
+        continue-on-error: true
+        uses: actions/download-artifact@v4
+        with:
+          name: atlas8039-pr8055-plus-3line
+          path: evidence
+
+      - name: Create result table without inventing missing tests
+        shell: bash
+        run: |
+          python - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          rows = [
+              '| Variant | SIGKILL ×20 | Failed writes ×20 | Normal ×20 |',
+              '|---|---|---|---|',
+          ]
+          file = Path('evidence/suite20_results.json')
+          if not file.exists():
+              row = [
+                  'pr8055_plus_3line',
+                  'BLOCKED (no suite results)',
+                  'BLOCKED',
+                  'BLOCKED',
+              ]
+          else:
+              data = json.loads(file.read_text())
+              crash = data['crash']
+              wf = data['write_failure']
+              ctl = data['control']
+              row = [
+                  'pr8055_plus_3line',
+                  f"{crash['verdict']} ({crash['passing_trials']}/20 pass; {crash['duplicates']} duplicates)",
+                  f"{wf['verdict']} ({wf['passed']}/20 pass)",
+                  f"{ctl['verdict']} ({ctl['passed']}/20 pass)",
+              ]
+          rows.append('| ' + ' | '.join(row) + ' |')
+          table = '\n'.join(rows) + '\n'
+          print(table)
+          Path('ATLAS_8039_PR8055_PLUS_3LINE_RESULTS.md').write_text(table)
+          with open(os.environ['GITHUB_STEP_SUMMARY'], 'a') as f:
+              f.write(table)
+          PY
+
+      - name: Upload summary
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: atlas8039-pr8055-plus-3line-summary
+          path: ATLAS_8039_PR8055_PLUS_3LINE_RESULTS.md
+          if-no-files-found: warn
+          retention-days: 21
