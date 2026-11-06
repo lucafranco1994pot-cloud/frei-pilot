@@ -1,0 +1,465 @@
+name: ATLAS FS008 R3 - SDK Validation One-File Test
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  sdk_comparison:
+    name: ${{ matrix.strategy }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - strategy: original_base
+            repository: openai/openai-agents-python
+            ref: cd26bbbc52847845fde73b9952b51e62e2bcbdc0
+          - strategy: contributor_patch
+            repository: Lahari25/openai-agents-python
+            ref: a4d5954fe793390f3d15b7a241998f9d9fe231ff
+    steps:
+      - name: Download exact SDK source code
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ matrix.repository }}
+          ref: ${{ matrix.ref }}
+          path: sdk_under_test
+          persist-credentials: false
+
+      - name: Setup Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Verify commit and install SDK with pinned Pydantic
+        shell: bash
+        env:
+          EXPECTED_SHA: ${{ matrix.ref }}
+        run: |
+          set -euo pipefail
+          test "$(git -C sdk_under_test rev-parse HEAD)" = "$EXPECTED_SHA"
+          python -m pip install -e ./sdk_under_test
+          python -m pip install 'pydantic==2.12.3' 'pydantic-core==2.41.4'
+          python -m pip check
+
+      - name: Create the self-contained ATLAS test script
+        shell: bash
+        run: |
+          cat > atlas_5448_sdk_probe.py <<'ATLAS_PROBE_PY'
+          #!/usr/bin/env python3
+          """ATLAS-FS-20261106-008 — SDK integration probe (NOT locally executed).
+          
+          This probe must run with an actual checkout of openai-agents-python and its dependencies.
+          It uses the public Runner.run entrypoint and agents.testing.ScriptedModel; no SDK
+          monkeypatches, network model calls, user data, or application-side mutations.
+          
+          A process runs exactly one case. Invoke with --all to create three fresh subprocesses
+          for each case, and collect JSON lines. Each child is subject to a hard 15-second timeout.
+          Source refs must be pinned by the caller (see companion workflow).
+          """
+          import argparse
+          import asyncio
+          import datetime
+          import enum
+          import hashlib
+          import importlib.metadata
+          import json
+          import os
+          from pathlib import Path
+          import subprocess
+          import sys
+          from decimal import Decimal
+          from typing import Annotated
+          
+          os.environ.setdefault("OPENAI_AGENTS_DISABLE_TRACING", "1")
+          os.environ.setdefault("OPENAI_AGENTS_DONT_LOG_TOOL_DATA", "1")
+          
+          from pydantic import BaseModel, ConfigDict, Field, field_validator
+          from agents import Agent, Runner, function_tool
+          from agents.testing import ScriptedModel, assistant_message, function_call
+          
+          
+          EVENTS = []
+          BODY = []
+          
+          class Priority(enum.Enum):
+              LOW = "low"
+              HIGH = "high"
+          
+          class StrictTicket(BaseModel):
+              model_config = ConfigDict(strict=True)
+              # Place observer first, so Python validation visits it before Enum/date fail.
+              note: str
+              priority: Priority
+              due: datetime.date
+          
+              @field_validator("note", mode="before")
+              @classmethod
+              def observe(cls, v, info):
+                  EVENTS.append({
+                      "field": info.field_name,
+                      "mode": info.mode,
+                      "validator": "StrictTicket.observe",
+                      "type": type(v).__name__,
+                      "value": repr(v),
+                  })
+                  return v
+          
+          class StrictNumber(BaseModel):
+              model_config = ConfigDict(strict=True)
+              note: str
+              count: Annotated[int, Field(strict=True)]
+          
+              @field_validator("note", mode="before")
+              @classmethod
+              def observe(cls, v, info):
+                  EVENTS.append({
+                      "field": info.field_name,
+                      "mode": info.mode,
+                      "validator": "StrictNumber.observe",
+                      "type": type(v).__name__,
+                      "value": repr(v),
+                  })
+                  return v
+          
+          VALID_TICKET = {"note": "probe", "priority": "high", "due": "2026-11-01"}
+          INVALID_TICKET = {"note": "probe", "priority": "unknown", "due": "2026-11-01"}
+          VALID_NUMBER = {"note": "probe", "count": 5}
+          INVALID_NUMBER = {"note": "probe", "count": "5"}
+          
+          CASES = (
+              "function_valid_ticket",
+              "function_invalid_ticket",
+              "function_valid_int",
+              "function_invalid_int",
+              "function_compat_values",
+              "nested_valid_ticket",
+              "nested_invalid_ticket",
+          )
+          
+          
+          def snapshot_files():
+              import agents
+              root = Path(agents.__file__).resolve().parent
+              rows = {}
+              for name in ("tool.py", "agent.py"):
+                  p = root / name
+                  rows[name] = {"sha256": hashlib.sha256(p.read_bytes()).hexdigest(), "path": str(p)}
+              return rows
+          
+          
+          def package_version(name):
+              try:
+                  return importlib.metadata.version(name)
+              except importlib.metadata.PackageNotFoundError:
+                  return None
+          
+          
+          def arguments_for(case):
+              if case in ("function_valid_ticket", "nested_valid_ticket"):
+                  return {"ticket": VALID_TICKET} if case.startswith("function_") else VALID_TICKET
+              if case in ("function_invalid_ticket", "nested_invalid_ticket"):
+                  return {"ticket": INVALID_TICKET} if case.startswith("function_") else INVALID_TICKET
+              if case == "function_valid_int":
+                  return {"item": VALID_NUMBER}
+              if case == "function_invalid_int":
+                  return {"item": INVALID_NUMBER}
+              if case == "function_compat_values":
+                  return {"path": "notes.txt", "amount": 5.0}
+              raise ValueError(case)
+          
+          
+          async def run_case(case):
+              EVENTS.clear()
+              BODY.clear()
+              raw = json.dumps(arguments_for(case), sort_keys=True)
+              child_model = None
+          
+              if case.startswith("nested_"):
+                  child_model = ScriptedModel([[assistant_message("child-ok")]])
+                  child_agent = Agent(name="child", model=child_model)
+                  tool = child_agent.as_tool(
+                      tool_name="ticket_child",
+                      tool_description="Process a synthetic ticket",
+                      parameters=StrictTicket,
+                  )
+              elif case.startswith("function_"):
+                  if case.endswith("ticket"):
+                      @function_tool
+                      def create_ticket(ticket: StrictTicket) -> str:
+                          BODY.append({
+                              "type": type(ticket).__name__,
+                              "priority_type": type(ticket.priority).__name__,
+                              "due_type": type(ticket.due).__name__,
+                              "priority": ticket.priority.value,
+                              "due": ticket.due.isoformat(),
+                          })
+                          return "ticket-created"
+                      tool = create_ticket
+                  elif case.endswith("int"):
+                      @function_tool
+                      def count_item(item: StrictNumber) -> str:
+                          BODY.append({"type": type(item.count).__name__, "count": item.count})
+                          return "number-counted"
+                      tool = count_item
+                  elif case == "function_compat_values":
+                      @function_tool
+                      def save_values(path: Path | str, amount: Decimal) -> str:
+                          BODY.append({
+                              "path_type": type(path).__name__,
+                              "path_value": str(path),
+                              "decimal_type": type(amount).__name__,
+                              "decimal_repr": repr(amount),
+                              "decimal_tuple": {
+                                  "sign": amount.as_tuple().sign,
+                                  "digits": list(amount.as_tuple().digits),
+                                  "exponent": amount.as_tuple().exponent,
+                              },
+                          })
+                          return "values-saved"
+                      tool = save_values
+                  else:
+                      raise ValueError(case)
+              else:
+                  raise ValueError(case)
+          
+              outer_model = ScriptedModel([
+                  [function_call(tool.name, json.loads(raw), call_id="call-1")],
+                  [assistant_message("outer-ok")],
+              ])
+              outer_agent = Agent(name="outer", model=outer_model, tools=[tool])
+              final_output = None
+              public_exception = None
+              outputs = []
+              try:
+                  result = await Runner.run(outer_agent, "synthetic offline test")
+                  final_output = repr(result.final_output)
+                  outputs = [str(i.output) for i in result.new_items if i.type == "tool_call_output_item"]
+              except Exception as exc:
+                  public_exception = {"type": type(exc).__name__, "message": str(exc)[:500]}
+              return {
+                  "case": case,
+                  "original_json": raw,
+                  "validation_events": list(EVENTS),
+                  "tool_body_calls": len(BODY),
+                  "tool_arguments": list(BODY),
+                  "outer_model_calls": len(outer_model.calls),
+                  "outer_steps_left": outer_model.remaining_steps,
+                  "child_model_calls": len(child_model.calls) if child_model is not None else None,
+                  "child_steps_left": child_model.remaining_steps if child_model is not None else None,
+                  "tool_outputs": outputs,
+                  "exception": public_exception,
+                  "final_output": final_output,
+                  # SDK-specific acceptance MUST use body/child calls, not final_output alone.
+                  "executed": len(BODY) > 0 if child_model is None else len(child_model.calls) > 0,
+              }
+          
+          
+          def child_main(case, repetition):
+              out = {
+                  "case": case,
+                  "repetition": repetition,
+                  "strategy": os.environ.get("ATLAS_STRATEGY", "not_set"),
+                  "sdk_ref": os.environ.get("ATLAS_SDK_REF", "not_set"),
+                  "sdk_version": package_version("openai-agents"),
+                  "python": sys.version.split()[0],
+                  "pydantic_version": package_version("pydantic"),
+                  "pydantic_core_version": package_version("pydantic-core"),
+                  "source_locations": snapshot_files(),
+              }
+              try:
+                  out.update(asyncio.run(run_case(case)))
+                  out["harness_status"] = "completed"
+              except BaseException as exc:
+                  out["harness_status"] = "failed"
+                  out["harness_exception"] = {"type": type(exc).__name__, "message": str(exc)[:500]}
+              print(json.dumps(out, ensure_ascii=False, sort_keys=True, default=str), flush=True)
+              return 0 if out["harness_status"] == "completed" else 2
+          
+          
+          def run_all():
+              import time
+              bad = 0
+              for case in CASES:
+                  for repetition in (1, 2, 3):
+                      cmd = [sys.executable, str(Path(__file__).resolve()), "--case", case, "--repetition", str(repetition)]
+                      start = time.monotonic()
+                      try:
+                          proc = subprocess.run(cmd, capture_output=True, text=True, timeout=15, check=False)
+                          if proc.stderr:
+                              # Reserve stderr for diagnostics, never mix it with JSONL stdout.
+                              sys.stderr.write(f"CASE {case} REP {repetition} STDERR:\n{proc.stderr}\n")
+                          try:
+                              d = json.loads(proc.stdout.strip())
+                              d["exit_code"] = proc.returncode
+                              if proc.returncode != 0:
+                                  bad += 1
+                          except Exception as exc:
+                              d = {"case": case, "repetition": repetition,
+                                   "harness_status": "failed_json_output", "exit_code": proc.returncode,
+                                   "parse_error": str(exc), "stdout": proc.stdout[:800]}
+                              bad += 1
+                      except subprocess.TimeoutExpired:
+                          d = {"case": case, "repetition": repetition,
+                               "harness_status": "TIMEOUT_NOT_A_BUG_PROOF", "timeout_seconds": 15}
+                          bad += 1
+                      d["wall_seconds"] = round(time.monotonic() - start, 3)
+                      print(json.dumps(d, sort_keys=True, ensure_ascii=False), flush=True)
+              return 0 if bad == 0 else 1
+          
+          
+          if __name__ == "__main__":
+              parser = argparse.ArgumentParser()
+              parser.add_argument("--all", action="store_true")
+              parser.add_argument("--case", choices=CASES)
+              parser.add_argument("--repetition", type=int, default=1)
+              args = parser.parse_args()
+              if args.all:
+                  sys.exit(run_all())
+              if not args.case:
+                  parser.error("Select --all or --case NAME")
+              sys.exit(child_main(args.case, args.repetition))
+          ATLAS_PROBE_PY
+
+      - name: Run 21 isolated test processes
+        shell: bash
+        env:
+          OPENAI_AGENTS_DISABLE_TRACING: '1'
+          OPENAI_AGENTS_DONT_LOG_TOOL_DATA: '1'
+          ATLAS_STRATEGY: ${{ matrix.strategy }}
+          ATLAS_SDK_REF: ${{ matrix.ref }}
+        run: |
+          set -euo pipefail
+          mkdir -p atlas_5448_evidence
+          python -V > atlas_5448_evidence/versions.txt
+          python -m pip show openai-agents pydantic pydantic-core >> atlas_5448_evidence/versions.txt
+          git -C sdk_under_test rev-parse HEAD > atlas_5448_evidence/sdk_commit.txt
+          sha256sum sdk_under_test/src/agents/tool.py sdk_under_test/src/agents/agent.py atlas_5448_sdk_probe.py > atlas_5448_evidence/sha256.txt
+          python atlas_5448_sdk_probe.py --all > atlas_5448_evidence/results.jsonl 2> atlas_5448_evidence/stderr.txt
+
+      - name: Preserve all evidence, including incomplete runs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: atlas-5448-r3-${{ matrix.strategy }}
+          path: atlas_5448_evidence/
+          if-no-files-found: warn
+
+  verify_evidence:
+    name: Compare original versus patch
+    needs: sdk_comparison
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Download both evidence artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: atlas-5448-r3-*
+          path: paired_results
+
+      - name: Create offline verdict checker
+        shell: bash
+        run: |
+          cat > atlas_5448_verify.py <<'ATLAS_VERIFY_PY'
+          #!/usr/bin/env python3
+          """Classify paired ATLAS-FS-008 SDK evidence; missing/invalid data never count as PASS."""
+          import argparse, json, pathlib, sys
+          
+          CASES = ['function_valid_ticket','function_invalid_ticket','function_valid_int',
+                   'function_invalid_int','function_compat_values','nested_valid_ticket','nested_invalid_ticket']
+          
+          def load(path):
+              rows={}; problems=[]
+              for n,line in enumerate(pathlib.Path(path).read_text().splitlines(),1):
+                  try: v=json.loads(line)
+                  except Exception as e: problems.append(f'{path}:{n}: invalid JSON {e}');continue
+                  key=(v.get('case'),v.get('repetition'))
+                  if key in rows: problems.append(f'{path}:{n}: duplicate {key}')
+                  rows[key]=v
+              for c in CASES:
+                  for rep in (1,2,3):
+                      if (c,rep) not in rows: problems.append(f'{path}: missing {(c,rep)}')
+              return rows,problems
+          
+          def mode_events(r):
+              return [v.get('mode') for v in r.get('validation_events',[])]
+          
+          def execute_count(r):
+              if r['case'].startswith('nested_'): return r.get('child_model_calls')
+              return r.get('tool_body_calls')
+          
+          def check_pair(a,b):
+              problems=[]; observations=[]
+              for c in CASES:
+                for rep in (1,2,3):
+                  x,y=a.get((c,rep)),b.get((c,rep))
+                  if x is None or y is None: continue
+                  for tag,r in [('S0',x),('S1',y)]:
+                    if r.get('harness_status')!='completed' or r.get('exit_code')!=0:
+                      problems.append(f'{c}/{rep} {tag}: harness not completed')
+                    if r.get('exception'):
+                      problems.append(f'{c}/{rep} {tag}: public exception {r["exception"]}')
+                    if r.get('outer_model_calls')!=2:
+                      problems.append(f'{c}/{rep} {tag}: expected 2 outer model calls')
+                    if r.get('outer_steps_left')!=0:
+                      problems.append(f'{c}/{rep} {tag}: model steps remain')
+                  count0,count1=execute_count(x),execute_count(y)
+                  expectation={
+                    'function_valid_ticket':(0,1), 'function_invalid_ticket':(0,0),
+                    'function_valid_int':(1,1), 'function_invalid_int':(0,0),
+                    'function_compat_values':(1,1), 'nested_valid_ticket':(0,1),
+                    'nested_invalid_ticket':(0,0)
+                  }[c]
+                  if (count0,count1)!=expectation:
+                    problems.append(f'{c}/{rep}: executions {(count0,count1)} != {expectation}')
+                  if c in ('function_valid_ticket','function_invalid_ticket','nested_valid_ticket','nested_invalid_ticket'):
+                    modes0,modes1=mode_events(x),mode_events(y)
+                    if modes0!=['python'] or modes1!=['python','json']:
+                      problems.append(f'{c}/{rep}: modes {modes0}/{modes1} != [python]/[python,json]')
+                  if c=='function_compat_values':
+                    if x.get('tool_arguments') != y.get('tool_arguments'):
+                      problems.append(f'{c}/{rep}: converted arguments changed')
+                    if not x.get('tool_arguments') or x['tool_arguments'][0].get('decimal_tuple') != {'sign':0,'digits':[5,0],'exponent':-1}:
+                      problems.append(f'{c}/{rep}: Decimal precision baseline not retained')
+                  observations.append({'case':c,'repetition':rep,'original_execution':count0,
+                                       'patch_execution':count1,'original_modes':mode_events(x),
+                                       'patch_modes':mode_events(y)})
+              return problems,observations
+          
+          def main():
+              p=argparse.ArgumentParser();p.add_argument('original');p.add_argument('patch');p.add_argument('--output',default='atlas_5448_verdict.json'); args=p.parse_args()
+              a,pa=load(args.original);b,pb=load(args.patch)
+              errors,observations=check_pair(a,b)
+              issues=pa+pb+errors
+              verdict='NOT_DECIDABLE' if issues else 'B_PATCH_WITH_OBSERVED_VALIDATOR_DOUBLE_EXECUTION_NO_CONTRACT_BREACH_ESTABLISHED'
+              out={'verdict':verdict,'validated_repetitions':len(observations),'issues':issues,'observations':observations,
+                   'limitations':['No security bypass demonstrated','Validator single execution not established as documented contract',
+                                  'Pydantic behavior and application effects must be interpreted separately']}
+              pathlib.Path(args.output).write_text(json.dumps(out,indent=2,ensure_ascii=False)+'\n')
+              print(json.dumps({'verdict':verdict,'issues':issues,'validated_repetitions':len(observations)},ensure_ascii=False))
+              return 0 if not issues else 1
+          if __name__=='__main__':sys.exit(main())
+          ATLAS_VERIFY_PY
+
+      - name: Evaluate the two sets of evidence
+        shell: bash
+        run: |
+          set -euo pipefail
+          python atlas_5448_verify.py \
+            paired_results/atlas-5448-r3-original_base/results.jsonl \
+            paired_results/atlas-5448-r3-contributor_patch/results.jsonl \
+            --output atlas_5448_verdict.json
+          cat atlas_5448_verdict.json
+
+      - name: Preserve verdict even if the check failed
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: atlas-5448-r3-verdict
+          path: atlas_5448_verdict.json
+          if-no-files-found: warn
