@@ -1,0 +1,90 @@
+name: ATLAS P2-A Redis Pop Evidence
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  p2a:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - uses: actions/checkout@v4
+        with:
+          repository: openai/openai-agents-python
+          ref: 0f87da2bf16b6b1fbc8dd3d8f36f57d298475a5d
+          path: pinned_sdk
+          persist-credentials: false
+      - name: Verify and install pinned SDK
+        run: |
+          test "$(git -C pinned_sdk rev-parse HEAD)" = '0f87da2bf16b6b1fbc8dd3d8f36f57d298475a5d'
+          git -C pinned_sdk rev-parse HEAD > ATLAS_P2A_COMMIT.txt
+          python -m pip install './pinned_sdk[encrypt,redis]' 'fakeredis>=2.31.3'
+      - name: Run two isolated Redis cases
+        run: |
+          cat > /tmp/atlas_p2a.py <<'PY'
+          import asyncio, hashlib, json
+          from agents.extensions.memory import EncryptedSession
+          from agents.extensions.memory.redis_session import RedisSession
+          import fakeredis.aioredis
+
+          SID = "atlas-p2a"
+          RIGHT, WRONG = "atlas-p2a-right-key", "atlas-p2a-wrong-key"
+          ITEMS = [{"role": "user", "content": "original-1"}, {"role": "assistant", "content": "original-2"}]
+
+          def fingerprints(rows):
+              return [hashlib.sha256(x if isinstance(x, bytes) else x.encode()).hexdigest() for x in rows]
+
+          async def case(key):
+              client = fakeredis.aioredis.FakeRedis()
+              backend = RedisSession(SID, redis_client=client, key_prefix="atlas:p2a")
+              try:
+                  original = EncryptedSession(SID, backend, RIGHT, ttl=3600)
+                  await original.add_items(ITEMS)
+                  before = await client.lrange(backend._messages_key, 0, -1)
+                  assert await original.get_items() == ITEMS
+                  trial = EncryptedSession(SID, backend, key, ttl=3600)
+                  error = None
+                  try:
+                      popped = await trial.pop_item()
+                  except Exception as exc:
+                      error = type(exc).__name__ + ": " + str(exc)
+                      popped = None
+                  after = await client.lrange(backend._messages_key, 0, -1)
+                  recovered = await original.get_items()
+                  return dict(key="right" if key == RIGHT else "wrong",
+                              error=error, popped=popped,
+                              raw_count_before=len(before), raw_count_after=len(after),
+                              before_sha256=fingerprints(before), after_sha256=fingerprints(after),
+                              raw_identical=(before == after),
+                              originals_readable_after=recovered)
+              finally:
+                  await backend.close()
+                  await client.aclose()
+
+          async def main():
+              results = [await case(k) for k in (RIGHT, WRONG)]
+              with open("ATLAS_P2A_RESULTS.json", "w") as f:
+                  json.dump(results, f, indent=2, ensure_ascii=False)
+              print(json.dumps(results, indent=2, ensure_ascii=False))
+              assert len(results) == 2
+              print("TWO CASES OBSERVED; NOT A BUG VERDICT")
+
+          asyncio.run(main())
+          PY
+          sha256sum /tmp/atlas_p2a.py > ATLAS_P2A_SCRIPT_SHA256.txt
+          python /tmp/atlas_p2a.py
+          sha256sum ATLAS_P2A_RESULTS.json > ATLAS_P2A_RESULTS_SHA256.txt
+      - name: Upload evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: atlas-p2a-evidence
+          path: |
+            ATLAS_P2A_COMMIT.txt
+            ATLAS_P2A_RESULTS.json
+            ATLAS_P2A_RESULTS_SHA256.txt
+            ATLAS_P2A_SCRIPT_SHA256.txt
+          if-no-files-found: warn
