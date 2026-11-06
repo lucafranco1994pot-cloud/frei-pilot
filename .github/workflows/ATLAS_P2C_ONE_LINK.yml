@@ -1,0 +1,63 @@
+name: ATLAS P2C one-link check
+on: workflow_dispatch
+permissions: {contents: read}
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with: {repository: openai/openai-agents-python, ref: 0f87da2, path: sdk, persist-credentials: false}
+      - uses: actions/setup-python@v5
+        with: {python-version: '3.13'}
+      - run: pip install './sdk[encrypt]'
+      - name: Four controlled cases
+        run: |
+          git -C sdk rev-parse HEAD > commit.txt
+          python - <<'PYCODE'
+          import asyncio, json, sqlite3, tempfile
+          from pathlib import Path
+          from types import SimpleNamespace
+          from unittest.mock import MagicMock, AsyncMock
+          from agents import SQLiteSession
+          from agents.extensions.memory import EncryptedSession
+          from agents.memory import OpenAIResponsesCompactionSession
+          sid='atlas-p2c'; right='original-key'; wrong='wrong-key'
+          items=[{'role':'user','content':'alpha'},{'role':'assistant','content':'beta'}]
+          def raw(p):
+              with sqlite3.connect(p) as c:
+                  return c.execute('SELECT id,message_data FROM agent_messages WHERE session_id=? ORDER BY id',(sid,)).fetchall()
+          async def case(outer,key):
+              with tempfile.TemporaryDirectory() as d:
+                  p=Path(d)/'db.sqlite'; db=SQLiteSession(sid,str(p))
+                  try:
+                      original=EncryptedSession(sid,db,right,ttl=3600)
+                      await original.add_items(items)
+                      before=raw(p)
+                      assert await original.get_items()==items
+                      api=MagicMock(); api.responses.compact=AsyncMock(return_value=SimpleNamespace(output=[{'type':'compaction','id':'cmp','encrypted_content':'summary'}]))
+                      if outer=='compaction':
+                          s=OpenAIResponsesCompactionSession(sid,EncryptedSession(sid,db,key,ttl=3600),client=api,compaction_mode='input')
+                      else:
+                          s=EncryptedSession(sid,OpenAIResponsesCompactionSession(sid,db,client=api,compaction_mode='input'),key,ttl=3600)
+                      visible=len(await s.get_items()); error=None
+                      try: await s.run_compaction({'force':True,'compaction_mode':'input'})
+                      except Exception as exc: error=repr(exc)
+                      after=raw(p); restored=await original.get_items()
+                      return dict(order=outer,key='right' if key==right else 'wrong',visible=visible,error=error,api_calls=api.responses.compact.await_count,before=before,after=after,identical=before==after,originals_readable=all(i in restored for i in items))
+                  finally: db.close()
+          async def main():
+              results=[await case(o,k) for o in ('compaction','encryption') for k in (right,wrong)]
+              Path('results.json').write_text(json.dumps(results,indent=2))
+              print(json.dumps(results,indent=2))
+              assert len(results)==4
+          asyncio.run(main())
+          PYCODE
+          sha256sum results.json > results.sha256
+      - if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: atlas-p2c-code-evidence
+          path: |
+            commit.txt
+            results.json
+            results.sha256
