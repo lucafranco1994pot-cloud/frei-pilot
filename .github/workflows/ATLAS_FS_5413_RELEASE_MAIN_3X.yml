@@ -1,0 +1,104 @@
+name: ATLAS FS 5413 - release vs pinned main 3x
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  compare:
+    name: ${{ matrix.variant }} - three independent repeats
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - variant: release-0.24.0
+            install: openai-agents==0.24.0
+          - variant: main-27c75c5
+            install: git+https://github.com/openai/openai-agents-python.git@27c75c5f9c5fd957d28c04fb7e9eeacaad4630a9
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - name: Install SDK variant
+        run: python -m pip install '${{ matrix.install }}'
+      - name: Freeze identities
+        run: |
+          mkdir -p evidence
+          {
+            echo 'case=ATLAS-FS-20261106-003'
+            echo 'variant=${{ matrix.variant }}'
+            echo 'sdk_install=${{ matrix.install }}'
+            echo "atlas_repo_commit=$GITHUB_SHA"
+            echo "github_run_id=$GITHUB_RUN_ID"
+            echo "github_run_attempt=$GITHUB_RUN_ATTEMPT"
+            echo "python=$(python --version)"
+            echo "probe_sha256=$(sha256sum atlas/evidence/ATLAS_FS_5413_probe.py | awk '{print $1}')"
+          } | tee evidence/identity.txt
+          python -m pip show openai-agents | tee evidence/sdk_package.txt
+          python -m pip freeze > evidence/pip_freeze.txt
+      - name: Three isolated probe invocations
+        id: probe
+        shell: bash
+        run: |
+          set -u
+          bad=0
+          for n in 1 2 3; do
+            echo "===== INVOCATION $n ====="
+            set +e
+            python atlas/evidence/ATLAS_FS_5413_probe.py > "evidence/repeat_${n}.log" 2>&1
+            rc=$?
+            set -e
+            printf '%s\n' "$rc" > "evidence/repeat_${n}.exitcode"
+            if test -f ATLAS_FS_5413_results.json; then
+              mv ATLAS_FS_5413_results.json "evidence/repeat_${n}.json"
+            else
+              bad=1
+            fi
+            cat "evidence/repeat_${n}.log"
+            echo "EXIT_CODE=$rc"
+            # 0 = REPRODUCED, 2 = NOT_REPRODUCED; 3/other = harness failure.
+            if test "$rc" -ne 0 && test "$rc" -ne 2; then bad=1; fi
+          done
+          python - <<'PY'
+          import hashlib, json, os, pathlib
+          root = pathlib.Path('evidence')
+          rows = []
+          for i in range(1,4):
+              p = root / f'repeat_{i}.json'
+              rc = int((root / f'repeat_{i}.exitcode').read_text())
+              if p.exists():
+                  raw = p.read_bytes()
+                  obj = json.loads(raw)
+                  status = obj.get('status','MISSING')
+                  digest = hashlib.sha256(raw).hexdigest()
+              else:
+                  status, digest = 'MISSING', None
+              rows.append({'repeat': i, 'exit_code': rc, 'status': status, 'sha256': digest})
+          result = {'variant': os.environ.get('VARIANT',''), 'runs': rows,
+                    'stable': len({x['status'] for x in rows}) == 1,
+                    'complete': all(x['status'] in ('REPRODUCED','NOT_REPRODUCED') for x in rows)}
+          (root/'summary.json').write_text(json.dumps(result, indent=2)+'\n')
+          print(json.dumps(result, indent=2))
+          PY
+          if test "$bad" -ne 0; then exit 3; fi
+          python - <<'PY'
+          import json
+          s=json.load(open('evidence/summary.json'))
+          if not s['complete'] or not s['stable']: raise SystemExit('BLOCKED: incomplete or unstable results')
+          PY
+        env:
+          VARIANT: ${{ matrix.variant }}
+      - name: Upload original per-run evidence even on failure
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ATLAS-FS-5413-${{ matrix.variant }}-${{ github.run_id }}
+          path: evidence/
+          if-no-files-found: error
+          retention-days: 90
