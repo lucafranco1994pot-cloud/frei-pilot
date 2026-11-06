@@ -1,0 +1,28 @@
+name: ATLAS CPython 93122 H4
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  h4:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ['3.13', '3.14']
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Run isolated BASE and H4 probes
+        run: python -u atlas_93122_h4.py --out atlas-h4-logs
+      - name: Upload all evidence even after failed checks
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ATLAS-93122-H4-python-${{ matrix.python }}
+          path: atlas-h4-logs/
+          if-no-files-found: error
+          retention-days: 30
