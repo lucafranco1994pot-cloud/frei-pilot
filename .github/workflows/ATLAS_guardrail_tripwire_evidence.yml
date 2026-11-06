@@ -1,0 +1,32 @@
+name: ATLAS guardrail tripwire evidence v2
+
+'on':
+  workflow_dispatch:
+  push:
+    paths:
+      - 'atlas/evidence/ATLAS_guardrail_tripwire_snapshot.py'
+      - '.github/workflows/ATLAS_guardrail_tripwire_evidence.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  reproduce:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - name: Install pinned SDK
+        run: python -m pip install --no-cache-dir 'openai-agents==0.24.0'
+      - name: Run evidence
+        run: python atlas/evidence/ATLAS_guardrail_tripwire_snapshot.py
+      - name: Upload evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: atlas-guardrail-evidence
+          path: ATLAS_guardrail_tripwire_results.json
+          if-no-files-found: error
