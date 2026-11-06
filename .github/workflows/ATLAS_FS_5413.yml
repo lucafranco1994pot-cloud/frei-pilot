@@ -1,0 +1,33 @@
+name: ATLAS FS 5413 - stale approval isolation
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  offline-probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - name: Install pinned published SDK
+        run: python -m pip install 'openai-agents==0.24.0'
+      - name: Capture script identity and SDK version
+        run: |
+          sha256sum atlas/evidence/ATLAS_FS_5413_probe.py
+          python -m pip show openai-agents
+      - name: Run offline probe and retain its log
+        run: |
+          set -o pipefail
+          python atlas/evidence/ATLAS_FS_5413_probe.py 2>&1 | tee ATLAS_FS_5413_run.log
+      - name: Upload observations and log on success or failure
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ATLAS-FS-5413-results
+          path: |
+            ATLAS_FS_5413_results.json
+            ATLAS_FS_5413_run.log
+          if-no-files-found: warn
