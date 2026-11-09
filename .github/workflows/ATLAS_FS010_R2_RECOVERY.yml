@@ -1,0 +1,54 @@
+name: ATLAS FS010 R2 Canonical Recovery Offline
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  recovery:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - name: Unpack and verify embedded tests
+        run: |
+          set -euo pipefail
+          mkdir -p evidence
+          python - <<'PYCODE'
+          import gzip,base64,hashlib,pathlib
+          data=gzip.decompress(base64.b64decode('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'))
+          expected='85249cc98633bff8ff060596dfd96b689522aaf8172039f0a0c22061564cf7c3'
+          assert hashlib.sha256(data).hexdigest()==expected, 'Embedded tests checksum mismatch'
+          pathlib.Path('test_fs010_r2.py').write_bytes(data)
+          pathlib.Path('evidence/TEST_SOURCE_SHA256.txt').write_text(expected+'  test_fs010_r2.py\n')
+          PYCODE
+          python -m py_compile test_fs010_r2.py
+      - name: Install verified OpenAI alpha7 wheel
+        run: |
+          set -euo pipefail
+          curl -fLsS --retry 3 -O https://github.com/openai/openai-agents-python/releases/download/v0.24.0-alpha.7/openai_agents-0.24.0a7-cp310-abi3-manylinux_2_39_x86_64.whl
+          curl -fLsS --retry 3 -O https://github.com/openai/openai-agents-python/releases/download/v0.24.0-alpha.7/SHA256SUMS
+          sha256sum -c SHA256SUMS --ignore-missing | tee evidence/WHEEL_VERIFY.txt
+          python -m pip install -q pytest ./openai_agents-0.24.0a7-cp310-abi3-manylinux_2_39_x86_64.whl
+          python -c "from importlib.metadata import version; import agents._native; print(version('openai-agents'))" | tee evidence/SDK_VERSION.txt
+      - name: Test recovery boundaries
+        env:
+          NO_PROXY: 127.0.0.1,localhost
+          OPENAI_AGENTS_DISABLE_TRACING: '1'
+        run: |
+          set -o pipefail
+          python -m pytest -vv -s test_fs010_r2.py 2>&1 | tee evidence/PYTEST_R2.txt
+      - name: Save forensic identity
+        if: always()
+        run: |
+          mkdir -p evidence
+          python --version > evidence/PYTHON.txt 2>&1 || true
+          echo 'release=v0.24.0-alpha.7 commit=c27b24cc6c4fa7e89ab54fa9f795ef4f2d4d5fb9' > evidence/TARGET.txt
+          (cd evidence && sha256sum *.txt > SHA256SUMS.txt) || true
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: ATLAS-FS010-R2-recovery-evidence
+          path: evidence/
+          retention-days: 90
