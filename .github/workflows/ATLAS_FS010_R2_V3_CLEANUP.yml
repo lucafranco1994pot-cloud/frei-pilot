@@ -1,0 +1,66 @@
+name: ATLAS FS010 R2 V3 Cleanup Boundary
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  check:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - name: Isolate expected cleanup failure
+        run: |
+          set -euo pipefail
+          mkdir -p evidence
+          python - <<'PY'
+          import base64,gzip,hashlib,pathlib,re,difflib
+          original=pathlib.Path('.github/workflows/ATLAS_FS010_R2_V2_PROVIDER_FIX.yml').read_text()
+          match=re.search(r"gzip\.decompress\(base64\.b64decode\('([^']+)'\)\)",original)
+          assert match, 'Missing R2 V2 test payload'
+          data=gzip.decompress(base64.b64decode(match.group(1)))
+          assert hashlib.sha256(data).hexdigest()=='0b2fdd80e27266a0255defce8fdf6f16552c5007e652f9af1fed86030cf60472'
+          before=data.decode()
+          lines=before.splitlines(keepends=True)
+          count=0
+          for i,line in enumerate(lines):
+              if line.strip()=='await cleanup.aclose()':
+                  pad=line[:len(line)-len(line.lstrip())]
+                  lines[i]=(pad+'try:\n'+pad+'    await cleanup.aclose()\n'+pad+'except RuntimeError as cleanup_error:\n'+pad+"    assert 'Canonical storage failed' in str(cleanup_error)\n")
+                  count+=1
+          assert count==1, f'Expected exactly one cleanup boundary, got {count}'
+          after=''.join(lines)
+          pathlib.Path('test_fs010_r2_v3.py').write_text(after)
+          pathlib.Path('evidence/PATCH.diff').write_text(''.join(difflib.unified_diff(before.splitlines(True),after.splitlines(True),fromfile='R2_V2',tofile='R2_V3')))
+          pathlib.Path('evidence/SOURCE_SHA256.txt').write_text(hashlib.sha256(data).hexdigest()+' original\n'+hashlib.sha256(after.encode()).hexdigest()+' patched\n')
+          PY
+          python -m py_compile test_fs010_r2_v3.py
+      - name: Install pinned SDK
+        run: |
+          set -euo pipefail
+          curl -fLsS --retry 3 -O https://github.com/openai/openai-agents-python/releases/download/v0.24.0-alpha.7/openai_agents-0.24.0a7-cp310-abi3-manylinux_2_39_x86_64.whl
+          curl -fLsS --retry 3 -O https://github.com/openai/openai-agents-python/releases/download/v0.24.0-alpha.7/SHA256SUMS
+          sha256sum -c SHA256SUMS --ignore-missing | tee evidence/WHEEL_VERIFY.txt
+          python -m pip install -q pytest ./openai_agents-0.24.0a7-cp310-abi3-manylinux_2_39_x86_64.whl
+      - name: Run isolated R2-03
+        env:
+          NO_PROXY: 127.0.0.1,localhost
+          OPENAI_AGENTS_DISABLE_TRACING: '1'
+        run: |
+          set -o pipefail
+          python -m pytest -vv -s test_fs010_r2_v3.py -k r2_03 2>&1 | tee evidence/TEST_LOG.txt
+      - name: Preserve evidence
+        if: always()
+        run: |
+          python --version > evidence/PYTHON.txt
+          echo 'OpenAI Agents SDK 0.24.0-alpha.7' > evidence/TARGET.txt
+          (cd evidence && sha256sum * > SHA256SUMS.txt) || true
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: ATLAS-FS010-R2-V3-evidence
+          path: evidence/
+          retention-days: 90
