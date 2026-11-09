@@ -1,0 +1,52 @@
+name: ATLAS FS010 - OpenAI Alpha7 Offline
+on: workflow_dispatch
+permissions: {contents: read}
+jobs:
+  fs010:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/setup-python@v5
+        with: {python-version: '3.13'}
+      - name: Prepare embedded offline tests
+        run: |
+          set -euo pipefail
+          mkdir -p evidence
+          python - <<'PY'
+          import base64,gzip,hashlib,pathlib
+          src=gzip.decompress(base64.b64decode('H4sIAAAAAAAC/+1Z3W/jNhJ/918x0L3IgCIk2xZXGPCh3nbbLu6uLTZ7uIdFINDS2FYjkzqSSmIc+r93hpRkfXmTOE3v5fKS2OQM5+M3v+EwQRCsPv5jdQ3fX19cXl0uQAqb3yH8XKJcvYfVFqU1cP3d3+EyfvNlfCn+CmqzKXKJsMaduMuVFgVYNNbEs9mqKGCvMixAoymVNGhAaAST6ry0mIHYilwaC4VKSaxQqlyL9BbucgHX9Z4PjWQ8+0m1dvzyHkiiMBFpFnyIxEMEIk1VRQZGgA8WtaQVg/ouT5G+UhoKdsUqVZCyjzs06KwptTIlps7PVEmrRWoh3WF6S1JSWcC7PEOZIrkKAjLc0Gagc3Lyq5LxLAiC2UarPSTJprKVxiSBfF8qbUFIUkAhJA9ms+Y7c5BprtrP5YHj5TWUh0yQ4rSRfysM/pMjOPPrwiegXg1nQD8uKRF8X8mUD/pI/kXwXlIAhPvi3UOZa8zeaa10BL+gzHK5/YD/qThLkVPxsdLy2qqybLdtam0JhyuazbvHx2wv6WjMGKUqIgQ8kEksm3CeZrNZWghj4EdVZCu9NWHr2HzhLLjFwwKM1bSTAgwS75Md7XXHh3O4+FvPPy+jkYItews+IvwjxR6XgdOhva9B1C5m6CFIUsvg3yK3sCF4CJ9+VRQMzbIs8tSljg4qi0Pckc9lWdnEHkpcNh4dF1Vl21XyyC/MyTGXeMYPJPbyKiGjKqTwELKKZI1kASYi2+fG0Jne558I195XwtgK/F62zslCbnEP+4oKiGG6xlTtCdL09w51U7kcopgRylo4mrAcRtcteePuc7sb5/MY1U9tSsNBbOG/AeUwWECwCn6LXHUmeeYzcCGC+U3UUULoCNkftS8LpJPa5TnZASWiXrS7HebIaAfzkOlCVy7fZhn8i0qYnIUteSrryg487szS2XoTcX1zAesl642bT/PjAUfP3VkxeVyngIypPxztcSJkj7hn3NTLsanW+5yccmAiyKyCeU+i9GXXytUkEPOHhFIfivbPJqaJ+9NUhQ3nEXzd10fFhFR6ueGAMCzC+oRRhU/KFSgbgVg3G2G5hKve7vVJPz9UEt5CIYhlKOD5JllX5rAMHC4HrnsF69ijN5y0Zx0zTgkw5JFDfW+Ty42nyViLnBE5ZKx5P0HHc0eBXsdbtJ3AftU3aC8scX9GjjN8YvdxFKpPlzeTbjTC5ARX5MgRb1K9K/ZNMQsD6nlS3VNdb7kUehLezs/Bpu/NNEz8erzJqSUmnp842b0SPA0TqpoeRt7UJM35eD6TNS5Q6wyfIj1izjfNXnSNzSTMQ3shK/LNMfUkd7oVyinxI3jBjH5zq699OxLpvqKWTUQKBHbDi8Q//2sa7bPo/2nylWmSwn0eA7Dg56tfNETIN+NlQJ6kQ8ac4LsT97mTtEd2HPmFafqCSCaYP73Ir/pF/uyiG5T5E+RHhf5F4oLTSJYa7/j6maQ0J1Aw+HqTsGsJbvhKPlH237YXpo6ML9/UXc2Ji2+50ktl7IU/BwzhHrzKtuIJPJpKmceNAunqygCtHXzHRjH0Bl84Oa/GLGj0MPYT1eQNSX66cWspaZJVOVpzi9/0LuAdauHYbCuhM8wSj4dQ0QdNLOEu0C4I9PsIDPLh+iCp/nmuqKNApWd3gvouTV63BjzrOo4oVU48QpPOIAKdKFDl204bt/qwmMB5HSlXr53d+JBieSzsNkMOzn09dYBiuoojw7i9/g57JJfI8QAf8kaqCc5RpB4bAnfD58Z3JnH3s+CouzlszN/i4up12LtvxZ/N46uSu+oRVKvJu9+IxRsgeWyMWfsU908x50i6AV4fpWO9pkAsw8tJTqxBxERYV+tgQ41Nt6EDzJuzCfaFZDeg22drG5Hvl40sQU8mkiY2f1Gj2w5Vz9QVy1p+u7FaSJMzGBawokEZNkW+3dmIpgUvH4EzrWHbFa9oFJlherH4apT7OK1mQm5Rq8qcQ6w6N7fdSnAF1u06NUjc6hNY9fMkeh7HTXjPfnP0Exf8cNLJD7TuGMg/05nWZ28G/KoqfmvrOdUYEAXxr9RRwtriOY2KbXFhQVkNpLrwX5xNxMO8PUbFbtPoTeKo7xgP1tQV5ZWL9dRjxtt2kno6zfe4Ysz5SvLAsus8lzbc3xOs+8AwCFEnrTd9iekOcdzzol6xybWxJ/vFd+oPahEGU7rann6eYMg6393L3tunvVGMjHDOnNF1AP5C5NcOlDye7JFSzOPnybvms+Z+7/+Lhv8OZB9tgREEP+zIbvKqLnqxoYGEPt4TELqEXpx4SnBYc0XmTQjbYnLGdFjgyR30i34HfV7HGjTMx4RH/fEr2rT1jbR+NabfewIfgbbuqkluEkp/UsmMjp0aT7zgotcbmsmEpfixQhQcqAO02ntP0688pzzeNGvzkrrTPKFnfuscaWYON4HwyG9UPww719xMDTTmwYmJ5NFGeEZz/aPmg0FkHutKfvcLH3kGw8HAhNeZDly0Pj8gvOpY4J7mXjoZjDmP8nPDPP7ugf85iARoqYD/OeT+Rcljl5AWMT77xv9iBhlQ2Bn65rPfAaDe5V7xHQAA'))
+          assert hashlib.sha256(src).hexdigest()=='0e9ab532c39009a5130744d2d429741814415ae7b8f933a8e2ce8e00acaa3218'
+          pathlib.Path('test_fs010.py').write_bytes(src)
+          PY
+          python -m py_compile test_fs010.py
+          sha256sum test_fs010.py > evidence/TEST_SHA256.txt
+      - name: Install official pinned release
+        run: |
+          set -euo pipefail
+          curl -fLsS --retry 3 -O 'https://github.com/openai/openai-agents-python/releases/download/v0.24.0-alpha.7/openai_agents-0.24.0a7-cp310-abi3-manylinux_2_39_x86_64.whl'
+          curl -fLsS --retry 3 -O 'https://github.com/openai/openai-agents-python/releases/download/v0.24.0-alpha.7/SHA256SUMS'
+          sha256sum -c SHA256SUMS --ignore-missing | tee evidence/WHEEL_VERIFY.txt
+          python -m pip install -q pytest './openai_agents-0.24.0a7-cp310-abi3-manylinux_2_39_x86_64.whl'
+          python -c "from importlib.metadata import version;import agents._native;print(version('openai-agents'))" | tee evidence/SDK.txt
+      - name: Test SDK locally with scripted replies
+        env:
+          NO_PROXY: 127.0.0.1,localhost
+          no_proxy: 127.0.0.1,localhost
+          OPENAI_AGENTS_DISABLE_TRACING: '1'
+        run: |
+          set -o pipefail
+          python -m pytest -vv -s test_fs010.py 2>&1 | tee evidence/TEST_LOG.txt
+      - name: Write forensic metadata
+        if: always()
+        run: |
+          mkdir -p evidence
+          python --version > evidence/PYTHON.txt 2>&1 || true
+          python -m pip freeze > evidence/DEPS.txt 2>&1 || true
+          echo 'release=v0.24.0-alpha.7 source=c27b24cc6c4fa7e89ab54fa9f795ef4f2d4d5fb9' > evidence/TARGET.txt
+          (cd evidence && sha256sum *.txt > SHA256SUMS.txt) || true
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: ATLAS-FS010-alpha7-evidence
+          path: evidence/
+          retention-days: 90
