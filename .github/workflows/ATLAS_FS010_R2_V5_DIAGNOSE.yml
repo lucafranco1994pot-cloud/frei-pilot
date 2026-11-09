@@ -1,0 +1,52 @@
+name: ATLAS FS010 R2 V5 Cleanup Source Diagnosis
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  diagnose:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: Inspect original failure-path source
+        run: |
+          set -euo pipefail
+          mkdir -p evidence
+          python - <<'PY'
+          import base64,gzip,hashlib,pathlib,re,json,ast
+          path=pathlib.Path('.github/workflows/ATLAS_FS010_R2_V2_PROVIDER_FIX.yml')
+          raw=path.read_text()
+          m=re.search(r"gzip\.decompress\(base64\.b64decode\('([^']+)'\)\)",raw)
+          assert m, 'Original payload missing'
+          data=gzip.decompress(base64.b64decode(m.group(1)))
+          sha=hashlib.sha256(data).hexdigest()
+          assert sha=='0b2fdd80e27266a0255defce8fdf6f16552c5007e652f9af1fed86030cf60472'
+          src=data.decode('utf-8')
+          ast.parse(src)
+          lines=src.splitlines()
+          indexes=[i for i,line in enumerate(lines) if 'cleanup.aclose()' in line]
+          assert len(indexes)==2, f'Expected two cleanup sites, found {len(indexes)}'
+          out=[]
+          for i in indexes:
+              start=max(0,i-12)
+              stop=min(len(lines),i+13)
+              out.append('CLEANUP SITE LINE '+str(i+1)+'\n'+'\n'.join(f'{j+1:03d}: {lines[j]}' for j in range(start,stop)))
+          out.append('SCENARIO CONTEXT\n'+'\n'.join(f'{i+1:03d}: {line}' for i,line in enumerate(lines) if 55<=i<=155))
+          report='\n\n'.join(out)
+          print(report)
+          pathlib.Path('evidence/SOURCE_CONTEXT.txt').write_text(report)
+          pathlib.Path('evidence/ORIGINAL_SHA256.txt').write_text(sha+'  original test\n')
+          pathlib.Path('evidence/STATUS.json').write_text(json.dumps({'test':'R2-03','phase':'source-diagnosis','source_sha256':sha,'cleanup_sites':[x+1 for x in indexes],'sdk_executed':False},indent=2))
+          PY
+      - name: Preserve diagnostic evidence
+        if: always()
+        run: |
+          mkdir -p evidence
+          (cd evidence && sha256sum SOURCE_CONTEXT.txt ORIGINAL_SHA256.txt STATUS.json > SHA256SUMS.txt) || true
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: ATLAS-FS010-R2-V5-source-diagnosis
+          path: evidence/
+          retention-days: 90
