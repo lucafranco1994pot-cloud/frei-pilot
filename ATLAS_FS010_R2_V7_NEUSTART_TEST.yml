@@ -1,0 +1,262 @@
+name: ATLAS FS010 R2 V7 Process Restart
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+
+      - name: Prepare frozen test
+        run: |
+          set -euo pipefail
+          mkdir -p evidence work
+          python - <<'PY'
+          import base64
+          import gzip
+          import hashlib
+          import pathlib
+          import re
+
+          p = pathlib.Path(
+              '.github/workflows/ATLAS_FS010_R2_V2_PROVIDER_FIX.yml'
+          )
+
+          m = re.search(
+              r"gzip\.decompress\(base64\.b64decode\('([^']+)'\)\)",
+              p.read_text()
+          )
+          assert m, 'Original test not found'
+
+          original = gzip.decompress(base64.b64decode(m.group(1)))
+          sha = hashlib.sha256(original).hexdigest()
+
+          assert sha == (
+              '0b2fdd80e27266a0255defce8fdf6f16552c5007e652f9af1fed86030cf60472'
+          )
+
+          text = original.decode()
+
+          assert text.count(
+              'with tempfile.TemporaryDirectory(prefix="atlas_fs010_r2_") as t:'
+          ) == 1
+          assert text.count('sid = session.id') == 1
+          assert text.count('effects.append(operation_id)') == 1
+          assert text.count('except Exception as e:') == 1
+
+          text = 'import os,contextlib,pathlib,json\n' + text
+
+          text = text.replace(
+              'with tempfile.TemporaryDirectory(prefix="atlas_fs010_r2_") as t:',
+              'with contextlib.nullcontext(os.environ["ATLAS_DB_DIR"]) as t:'
+          )
+
+          text = text.replace(
+              'sid = session.id',
+              'sid = session.id\n'
+              '                    pathlib.Path(os.environ["ATLAS_SID_FILE"]).write_text(sid)'
+          )
+
+          text = text.replace(
+              'effects.append(operation_id)',
+              'effects.append(operation_id)\n'
+              '            with open(os.environ["ATLAS_EFFECT_FILE"],"a") as f:\n'
+              '                f.write(operation_id+"\\n")\n'
+              '                f.flush()\n'
+              '                os.fsync(f.fileno())'
+          )
+
+          text = text.replace(
+              'except Exception as e:',
+              'except Exception as e:\n'
+              '                pathlib.Path(os.environ["ATLAS_STATUS"]).write_text('
+              'json.dumps({"fired":raw_store.fired,"effects":effects,"error":str(e)}))\n'
+              '                os._exit(0 if raw_store.fired and effects==["ORDER-X"] else 37)'
+          )
+
+          text += (
+              '\nif __name__=="__main__":\n'
+              '    asyncio.run(scenario("before_commit"))\n'
+              '    raise SystemExit("Unexpected normal return")\n'
+          )
+
+          pathlib.Path('work/inject.py').write_text(text)
+
+          pathlib.Path('evidence/SOURCE_SHA256.txt').write_text(
+              sha + ' original\n'
+              + hashlib.sha256(text.encode()).hexdigest()
+              + ' generated\n'
+          )
+          PY
+
+          python -m py_compile work/inject.py
+
+      - name: Install pinned SDK
+        run: |
+          set -euo pipefail
+
+          curl -fLsS --retry 3 -O \
+            https://github.com/openai/openai-agents-python/releases/download/v0.24.0-alpha.7/openai_agents-0.24.0a7-cp310-abi3-manylinux_2_39_x86_64.whl
+
+          curl -fLsS --retry 3 -O \
+            https://github.com/openai/openai-agents-python/releases/download/v0.24.0-alpha.7/SHA256SUMS
+
+          sha256sum -c SHA256SUMS --ignore-missing \
+            | tee evidence/WHEEL_VERIFY.txt
+
+          python -m pip install -q \
+            ./openai_agents-0.24.0a7-cp310-abi3-manylinux_2_39_x86_64.whl
+
+      - name: Execute synthetic action in first process
+        env:
+          NO_PROXY: 127.0.0.1,localhost
+          OPENAI_AGENTS_DISABLE_TRACING: '1'
+          ATLAS_DB_DIR: ${{ github.workspace }}/work
+          ATLAS_SID_FILE: ${{ github.workspace }}/evidence/SESSION_ID.txt
+          ATLAS_EFFECT_FILE: ${{ github.workspace }}/evidence/EFFECTS.txt
+          ATLAS_STATUS: ${{ github.workspace }}/evidence/INJECTION.json
+
+        run: |
+          set -euo pipefail
+
+          python -u work/inject.py > evidence/INJECT_LOG.txt 2>&1
+
+          python - <<'PY'
+          import pathlib
+          import json
+
+          e = pathlib.Path('evidence')
+          s = json.loads((e / 'INJECTION.json').read_text())
+
+          assert s['fired'] is True, s
+          assert s['effects'] == ['ORDER-X'], s
+          assert (e / 'SESSION_ID.txt').read_text().strip()
+          assert (e / 'EFFECTS.txt').read_text().splitlines() == ['ORDER-X']
+
+          print('ORIGINAL_ACTION_CONFIRMED')
+          PY
+
+      - name: Reopen in two independent Python processes
+        env:
+          NO_PROXY: 127.0.0.1,localhost
+          OPENAI_AGENTS_DISABLE_TRACING: '1'
+          ATLAS_DB_PATH: ${{ github.workspace }}/work/canonical.sqlite
+          ATLAS_SID_FILE: ${{ github.workspace }}/evidence/SESSION_ID.txt
+          ATLAS_EFFECT_FILE: ${{ github.workspace }}/evidence/EFFECTS.txt
+
+        run: |
+          set -euo pipefail
+
+          cat > work/reopen.py <<'PY'
+          import asyncio
+          import os
+          import pathlib
+
+          from agents import (
+              Agent,
+              CustomStorage,
+              SQLiteSessionStore,
+              LocalRecoveryRequired,
+              function_tool,
+          )
+          from agents.testing import ScriptedResponses
+
+          @function_tool
+          def synthetic_action(operation_id: str) -> str:
+              """Synthetic action that must not be repeated."""
+              with open(os.environ['ATLAS_EFFECT_FILE'], 'a') as f:
+                  f.write('REPEATED:' + operation_id + '\n')
+              return 'Repeated'
+
+          async def run():
+              sid = pathlib.Path(
+                  os.environ['ATLAS_SID_FILE']
+              ).read_text().strip()
+
+              storage = CustomStorage(
+                  SQLiteSessionStore(
+                      pathlib.Path(os.environ['ATLAS_DB_PATH'])
+                  )
+              )
+
+              async with ScriptedResponses() as peer:
+                  agent = Agent(
+                      instructions='Synthetic test.',
+                      tools=[synthetic_action],
+                      provider=peer.provider,
+                  )
+
+                  try:
+                      async with agent.session(
+                          storage=storage,
+                          resume=sid,
+                      ):
+                          print('UNSAFE_REOPEN', flush=True)
+                          os._exit(31)
+
+                  except LocalRecoveryRequired as e:
+                      print(
+                          'LOCAL_RECOVERY_REQUIRED',
+                          len(e.calls),
+                          flush=True,
+                      )
+                      os._exit(0 if e.calls else 32)
+
+                  except Exception as e:
+                      print(
+                          'OTHER_ERROR',
+                          type(e).__name__,
+                          str(e),
+                          flush=True,
+                      )
+                      os._exit(33)
+
+          asyncio.run(run())
+          PY
+
+          python -m py_compile work/reopen.py
+
+          for n in 1 2; do
+            set +e
+            python -u work/reopen.py > "evidence/REOPEN_${n}.txt" 2>&1
+            rc=$?
+            set -e
+
+            cat "evidence/REOPEN_${n}.txt"
+            echo "$rc" > "evidence/REOPEN_${n}_EXIT.txt"
+
+            test "$rc" -eq 0
+            grep -q '^LOCAL_RECOVERY_REQUIRED ' \
+              "evidence/REOPEN_${n}.txt"
+          done
+
+          test "$(cat evidence/EFFECTS.txt)" = ORDER-X
+
+          echo 'PASS: Both fresh processes blocked unresolved action' \
+            | tee evidence/VERDICT.txt
+
+      - name: Preserve evidence
+        if: always()
+        run: |
+          mkdir -p evidence
+          python --version > evidence/PYTHON.txt
+          echo 'OpenAI Agents SDK 0.24.0-alpha.7' > evidence/TARGET.txt
+          (cd evidence && sha256sum *.txt *.json > SHA256SUMS.txt) || true
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: ATLAS-FS010-R2-V7-evidence
+          path: evidence/
+          retention-days: 90
