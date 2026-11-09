@@ -1,0 +1,59 @@
+name: ATLAS FS010 Alpha7 Offline Fixed
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - name: Recover pinned tests
+        run: |
+          set -euo pipefail
+          mkdir -p evidence
+          python - <<'PY'
+          import re,gzip,base64,hashlib,pathlib
+          p=pathlib.Path('.github/workflows/ATLAS_FS010_ALPHA7_ONEFILE.yml')
+          m=re.search(r"base64\.b64decode\('([^']+)'\)",p.read_text())
+          assert m,'Original test missing'
+          src=gzip.decompress(base64.b64decode(m.group(1)))
+          expected='0e9ab532c39009a5130744d2d429741814415ae7b8f933a8e2ce8e00acaa3218'
+          assert hashlib.sha256(src).hexdigest()==expected,'Test checksum mismatch'
+          pathlib.Path('test_fs010.py').write_bytes(src)
+          PY
+          python -m py_compile test_fs010.py
+          sha256sum test_fs010.py > evidence/TEST_SHA256.txt
+      - name: Install pinned release
+        run: |
+          set -euo pipefail
+          curl -fLsS --retry 3 -O https://github.com/openai/openai-agents-python/releases/download/v0.24.0-alpha.7/openai_agents-0.24.0a7-cp310-abi3-manylinux_2_39_x86_64.whl
+          curl -fLsS --retry 3 -O https://github.com/openai/openai-agents-python/releases/download/v0.24.0-alpha.7/SHA256SUMS
+          sha256sum -c SHA256SUMS --ignore-missing | tee evidence/WHEEL_VERIFY.txt
+          python -m pip install -q pytest ./openai_agents-0.24.0a7-cp310-abi3-manylinux_2_39_x86_64.whl
+          python -c "from importlib.metadata import version;import agents._native;print(version('openai-agents'))" | tee evidence/SDK.txt
+      - name: Run five offline tests
+        env:
+          NO_PROXY: 127.0.0.1,localhost
+          OPENAI_AGENTS_DISABLE_TRACING: '1'
+        run: |
+          set -o pipefail
+          python -m pytest -vv -s test_fs010.py 2>&1 | tee evidence/TEST_LOG.txt
+      - name: Evidence
+        if: always()
+        run: |
+          mkdir -p evidence
+          python --version > evidence/PYTHON.txt 2>&1 || true
+          python -m pip freeze > evidence/DEPS.txt 2>&1 || true
+          echo 'release=v0.24.0-alpha.7' > evidence/TARGET.txt
+          (cd evidence && sha256sum *.txt > SHA256SUMS.txt) || true
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: ATLAS-FS010-fixed-evidence
+          path: evidence/
+          retention-days: 90
